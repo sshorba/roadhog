@@ -1,13 +1,15 @@
 # Roadmap
 
-Development plan; no functionality has been built or tested yet.
+Development plan and prototype bench progress.
 
 ## Phase 1 — Communications prototype
-- [ ] Bring up ESP32-S3 + SIM7600NA-H UART and stable power.
-- [ ] Test US Mobile activation and LTE registration.
-- [ ] Send and receive SMS.
+- [x] Verify ESP32-S3 + SIM7600NA-H UART on the bench.
+- [ ] Validate stable power under automotive conditions.
+- [x] Verify LTE registration on the bench SIM.
+- [ ] Verify US Mobile activation and LTE data connectivity.
+- [x] Send and receive SMS with the bench STATUS command.
 - [ ] Retrieve a validated GNSS fix.
-- [ ] Respond to authenticated LOC/STATUS commands with fix age.
+- [ ] Add production command authentication and fix age.
 - [ ] Measure idle, GNSS and transmit power draw.
 
 ## Phase 2 — Tracking and resilience

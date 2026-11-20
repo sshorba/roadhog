@@ -2,7 +2,7 @@
 
 Open-source, self-hostable vehicle tracking and telemetry platform.
 
-> **Status:** Concept and prototype planning. Hardware and features are provisional until tested.
+> **Status:** ESP32-S3 communications prototype. UART, LTE registration, SMS STATUS, and the Wi-Fi captive portal have passed bench checks.
 
 ## Goals
 
@@ -28,3 +28,13 @@ Proposed only (not finalized): GPLv3 firmware, CERN-OHL-S-2.0 hardware and CC BY
 Start with SMS, GNSS and power monitoring; then MQTT, Wi-Fi/Starlink failover, Home Assistant, configuration portal and OTA, before custom KiCad hardware.
 
 Vehicle-control functions require dedicated, tested safety safeguards and appropriate automotive interfaces.
+
+## Firmware prototype
+
+The ESP-IDF v6.1.1 firmware uses a SIM7600NA-H modem for LTE registration,
+SMS commands, and GPS queries. The local Wi-Fi setup portal can be enabled
+by SMS and is available automatically when LTE registration is unavailable.
+
+- [Modem bring-up](docs/modem.md) covers the component API, build, flash, and UART bench checks.
+- [SMS commands](docs/sms.md) covers handset setup, the command list, and user management.
+- [Wi-Fi setup portal](docs/portal.md) covers DHCP, captive redirects, and AP control.

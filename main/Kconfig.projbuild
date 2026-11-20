@@ -1,0 +1,12 @@
+menu "Road Hog SMS control"
+
+config ROADHOG_SMS_CONTROL
+    bool "Enable SMS commands"
+    default n
+
+config ROADHOG_SMS_OWNER
+    string "Authorized sender and reply destination (E.164)"
+    depends on ROADHOG_SMS_CONTROL
+    default ""
+
+endmenu
