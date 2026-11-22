@@ -124,6 +124,25 @@ available and the serial log calls for a power cycle of both devices.
   inspect it before intentionally removing it. Future diagnostics skip
   an occupied CID.
 
+## Host regression test
+
+After an ESP-IDF build has fetched the pinned esp_modem dependency, run
+the AT response tests from the repository root.
+
+```sh
+c++ -std=c++20 -Wall -Wextra -Werror \
+  -I managed_components/espressif__esp_modem/include \
+  components/cellular_net/tests/at_response_test.cpp \
+  -o /tmp/roadhog-at-response-test
+/tmp/roadhog-at-response-test
+```
+
+The fixture follows esp_modem's UART callback contract. Each callback
+receives the accumulated response, with partial lines retained until
+a newline arrives. The diagnostic processes each complete line once.
+An overlong line or an exhausted response buffer fails the transaction
+so an incomplete context inventory cannot pass preflight.
+
 ## Timeout limits and remaining validation
 
 The AT deadlines bound how long the host waits for a reply. They cannot

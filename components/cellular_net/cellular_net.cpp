@@ -17,6 +17,7 @@ bool cellular_apn_valid(const char *apn)
 
 #ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
 
+#include "at_response.hpp"
 #include "cxx_include/esp_modem_api.hpp"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -42,30 +43,7 @@ static const char *const test_host = "connectivitycheck.gstatic.com";
 // Keep the carrier's existing slots intact. If CID 8 is in use, skip the test.
 static constexpr unsigned diagnostic_cid = 8;
 
-template<typename LineHandler>
-static command_result run_at(DCE &dce, const char *command, uint32_t timeout_ms,
-                             LineHandler handle_line)
-{
-    return dce.command(command, [&](uint8_t *data, size_t size) {
-        string_view response(reinterpret_cast<char *>(data), size);
-        for (size_t end; (end = response.find('\n')) != string_view::npos;) {
-            string_view line = response.substr(0, end);
-            response.remove_prefix(end + 1);
-            if (!line.empty() && line.back() == '\r') {
-                line.remove_suffix(1);
-            }
-            if (line == "ERROR" || line.starts_with("+CME ERROR:") ||
-                line.starts_with("+CMS ERROR:")) {
-                return command_result::FAIL;
-            }
-            command_result result = handle_line(line);
-            if (result != command_result::TIMEOUT) {
-                return result;
-            }
-        }
-        return command_result::TIMEOUT;
-    }, timeout_ms);
-}
+using cellular_net::run_at;
 
 static command_result run_at(DCE &dce, const char *command, uint32_t timeout_ms)
 {
@@ -411,7 +389,7 @@ esp_err_t cellular_net_test(const cellular_net_config_t *config, bool *at_ready)
     }
 
     esp_modem_dte_config_t dte_config = ESP_MODEM_DTE_DEFAULT_CONFIG();
-    dte_config.dte_buffer_size = 4096;
+    dte_config.dte_buffer_size = cellular_net::at_response_capacity;
     dte_config.uart_config.rx_buffer_size = 8192;
     dte_config.uart_config.port_num = config->port;
     dte_config.uart_config.tx_io_num = config->tx_pin;
