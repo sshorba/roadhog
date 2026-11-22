@@ -1,1 +1,1 @@
-idf_component_register(SRCS "main.c" "sms_control.c" "sms_commands.c" "portal.c" EMBED_TXTFILES "portal/index.html" PRIV_REQUIRES modem esp_driver_gpio nvs_flash esp_wifi esp_event esp_netif esp_http_server esp_timer lwip)
+idf_component_register(SRCS "main.c" "sms_control.c" "sms_commands.c" "portal.c" "portal_auth.c" "connection_status.c" "status_led.c" EMBED_TXTFILES "portal/index.html" PRIV_REQUIRES modem esp_driver_gpio nvs_flash esp_wifi esp_event esp_netif esp_http_server esp_timer lwip mbedtls esp_hw_support esp_driver_rmt)

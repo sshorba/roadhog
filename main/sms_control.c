@@ -23,27 +23,6 @@ static bool command_ok(modem_t *modem, const char *command)
            result.final == MODEM_FINAL_OK;
 }
 
-static void start_gps(modem_t *modem)
-{
-    char response[64];
-    modem_result_t result = {0};
-    esp_err_t error = modem_command(modem, "AT+CGPS?", "+CGPS:", 3000,
-                                    response, sizeof(response), &result);
-    if (error == ESP_OK && result.final == MODEM_FINAL_OK &&
-        strncmp(response, "+CGPS:", 6) == 0 &&
-        response[strspn(response + 6, " ") + 6] == '1') {
-        ESP_LOGI(TAG, "GPS session already running");
-        return;
-    }
-    error = modem_command(modem, "AT+CGPS=1", NULL, 5000, NULL, 0, &result);
-    if (error == ESP_OK && result.final == MODEM_FINAL_OK) {
-        ESP_LOGI(TAG, "GPS session started");
-    } else {
-        ESP_LOGW(TAG, "GPS start failed: %s",
-                 error == ESP_OK ? result.final_line : esp_err_to_name(error));
-    }
-}
-
 static int nibble(char c)
 {
     const char *digit = strchr(hex, c);
@@ -171,7 +150,6 @@ void sms_control_start(sms_control_t *sms, modem_t *modem)
             users += sms->users[i][0] != '\0';
         }
         ESP_LOGI(TAG, "SMS commands enabled; loaded %u additional users", users);
-        start_gps(modem);
     } else {
         ESP_LOGE(TAG, "SMS setup failed");
     }

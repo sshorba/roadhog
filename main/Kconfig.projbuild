@@ -10,3 +10,10 @@ config ROADHOG_SMS_OWNER
     default ""
 
 endmenu
+
+config ROADHOG_STATUS_LED_GPIO
+    int "Onboard RGB status LED GPIO"
+    range 0 48
+    default 38
+    help
+        Use GPIO38 for ESP32-S3-DevKitC-1 v1.1, or GPIO48 for the original revision.

@@ -1,9 +1,9 @@
 #include "sms_commands.h"
 #include "portal.h"
+#include "connection_status.h"
 
 #include <math.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "nvs_flash.h"
@@ -105,88 +105,6 @@ static const char *change_user(sms_control_t *sms, const char *sender,
     return add ? "User added" : "User removed";
 }
 
-static bool read_decimal(const char *text, double *value)
-{
-    if (!text || !*text) {
-        return false;
-    }
-    char *end;
-    *value = strtod(text, &end);
-    return !*end && isfinite(*value) && *value >= 0;
-}
-
-static bool coordinate(const char *raw, const char *direction, char positive,
-                       char negative, int limit, double *value)
-{
-    double degrees_minutes;
-    if (!read_decimal(raw, &degrees_minutes) || degrees_minutes > limit * 100.0 ||
-        !direction || !direction[0] || direction[1] ||
-        (direction[0] != positive && direction[0] != negative)) {
-        return false;
-    }
-    int degrees = (int)(degrees_minutes / 100);
-    double minutes = degrees_minutes - degrees * 100;
-    if (minutes >= 60) {
-        return false;
-    }
-    *value = (degrees + minutes / 60) * (direction[0] == negative ? -1 : 1);
-    return true;
-}
-
-typedef enum {
-    GPS_UNAVAILABLE,
-    GPS_NO_FIX,
-    GPS_FIX,
-} gps_status_t;
-
-typedef struct {
-    double latitude;
-    double longitude;
-    double speed_knots;
-} gps_fix_t;
-
-static bool query(modem_t *modem, const char *command, const char *prefix,
-                  char *response, size_t capacity)
-{
-    modem_result_t result;
-    return modem_command(modem, command, prefix, 3000, response, capacity, &result) == ESP_OK &&
-           result.final == MODEM_FINAL_OK;
-}
-
-static gps_status_t read_gps(modem_t *modem, gps_fix_t *fix)
-{
-    char response[MODEM_LINE_CAPACITY];
-    if (!query(modem, "AT+CGPSINFO", "+CGPSINFO:", response, sizeof(response)) || !response[0]) {
-        return GPS_UNAVAILABLE;
-    }
-
-    char *data = response + strlen("+CGPSINFO:");
-    char *fields[9];
-    for (size_t i = 0; i < 9; i++) {
-        fields[i] = strsep(&data, ",\n");
-    }
-    if (!coordinate(fields[0], fields[1], 'N', 'S', 90, &fix->latitude) ||
-        !coordinate(fields[2], fields[3], 'E', 'W', 180, &fix->longitude)) {
-        return GPS_NO_FIX;
-    }
-    if (!read_decimal(fields[7], &fix->speed_knots) || fix->speed_knots >= 10000) {
-        fix->speed_knots = NAN;
-    }
-    return GPS_FIX;
-}
-
-static const char *gps_label(gps_status_t status)
-{
-    switch (status) {
-    case GPS_FIX:
-        return "Fix";
-    case GPS_NO_FIX:
-        return "No fix";
-    default:
-        return "Unavailable";
-    }
-}
-
 static void gps_reply(modem_t *modem, bool map, char reply[SMS_TEXT_CAPACITY])
 {
     gps_fix_t fix;
@@ -213,61 +131,11 @@ static void gps_reply(modem_t *modem, bool map, char reply[SMS_TEXT_CAPACITY])
              speed, fix.latitude, fix.longitude);
 }
 
-static const char *lte_registration(modem_t *modem)
-{
-    char response[MODEM_LINE_CAPACITY];
-    if (!query(modem, "AT+CEREG?", "+CEREG:", response, sizeof(response))) {
-        return "Unknown";
-    }
-    char *remaining = response;
-    for (char *line; (line = strsep(&remaining, "\n")) != NULL;) {
-        unsigned mode, status;
-        int end = 0;
-        if (sscanf(line, "+CEREG: %u , %u %n", &mode, &status, &end) != 2 ||
-            (line[end] && line[end] != ',')) {
-            continue;
-        }
-        switch (status) {
-        case 0: return "Not registered";
-        case 1: return "Registered (home)";
-        case 2: return "Searching";
-        case 3: return "Registration denied";
-        case 5: return "Registered (roaming)";
-        default: return "Unknown";
-        }
-    }
-    return "Unknown";
-}
-
-static const char *lte_data_context(modem_t *modem)
-{
-    char response[MODEM_LINE_CAPACITY];
-    if (!query(modem, "AT+CGACT?", "+CGACT:", response, sizeof(response))) {
-        return "Unknown";
-    }
-    bool malformed = false;
-    char *remaining = response;
-    for (char *line; (line = strsep(&remaining, "\n")) != NULL;) {
-        if (!*line || strcmp(line, "+CGACT:") == 0 || strcmp(line, "+CGACT: ") == 0) {
-            continue;
-        }
-        unsigned context, active;
-        int end = 0;
-        if (sscanf(line, "+CGACT: %u , %u %n", &context, &active, &end) != 2 ||
-            line[end] || context == 0 || active > 1) {
-            malformed = true;
-        } else if (active == 1) {
-            return "Active";
-        }
-    }
-    return malformed ? "Unknown" : "Inactive";
-}
-
 static void status_reply(modem_t *modem, char reply[SMS_TEXT_CAPACITY])
 {
     gps_fix_t fix;
     const char *gps = gps_label(read_gps(modem, &fix));
-    const char *registration = lte_registration(modem);
+    const char *registration = lte_label(read_lte_registration(modem));
     const char *data = lte_data_context(modem);
     snprintf(reply, SMS_TEXT_CAPACITY, "ROAD HOG ONLINE\nGPS: %s\nLTE: %s\nData context: %s",
              gps, registration, data);

@@ -58,10 +58,8 @@ Exit the monitor with Ctrl+].
    startup log and `AT final: OK`.
 2. Watch the read-only status probes repeat at roughly five-second intervals.
    `+CPIN: READY` means the SIM is ready. A PIN or PUK response indicates that
-   the SIM needs attention. In `+CEREG: <n>,<stat>`, status 1 is home network
-   registration, 5 is roaming registration, 2 is searching, and 3 is denied.
-   Status 0 is unregistered and idle, and 4 is unknown. Each query has a
-   separate final result. For `+CSQ:`, 99 means the corresponding signal
+   the SIM needs attention. The `LTE:` log summarizes registration, data
+   context, and GPS fix status. For `+CSQ:`, 99 means the corresponding signal
    measurement is unavailable. With modem echo enabled, echoed commands
    should stay out of the unsolicited log. These observations verify SIM
    readiness and registration. Data service requires its own test.
@@ -78,8 +76,11 @@ Exit the monitor with Ctrl+].
    both devices. Verify the results in step 1 again.
 5. To verify interleaving and late-final handling, substitute a 3.3 V UART
    adapter or scripted modem for the SIM7600 on UART1. Reply to startup probes
-   with `OK\r\n` for `AT`. For each `AT+CPIN?` and `AT+CEREG?` before a timeout, reply
-   with `+CPIN: READY\r\nOK\r\n` and `+CEREG: 0,1\r\nOK\r\n`, respectively. For the first `AT+CSQ`,
+   with `OK\r\n` for `AT`. Use the default build with SMS disabled. Reply to
+   `AT+CGPS?` with `+CGPS: 1,1\r\nOK\r\n`. Reply to the recurring probes with
+   `+CPIN: READY\r\nOK\r\n`, `+CEREG: 0,1\r\nOK\r\n`,
+   `+CGACT: 1,0\r\nOK\r\n`, and `+CGPSINFO: ,,,,,,,,\r\nOK\r\n`.
+   For the first `AT+CSQ`,
    send `+CS`, then `Q: 15,99\r\nRING\r\n`, then `OK\r\n` within two seconds.
    Verify the payload, separate unsolicited `RING`, and final. For the next
    `AT+CSQ`, delay its reply for three seconds. Verify that the call times out,

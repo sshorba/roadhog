@@ -17,8 +17,17 @@ IPv4 address, gateway, and DNS server by DHCP.
 
 Join the network on a phone or laptop. Phones that use HTTP captive network
 checks should offer to open the setup page. If the prompt does not appear,
-open `http://192.168.4.1/` directly. The AP has no internet uplink. The page
-is a landing screen for future settings and exposes no configuration controls.
+open `http://192.168.4.1/` directly. The AP has no internet uplink. The page refreshes LTE registration, modem data context, and GPS fix status
+every five seconds after sign-in. An active data context does not verify
+internet connectivity.
+
+The initial sign-in is username `admin` and password `roadhog`. Under
+**Change password**, enter the current password and confirm the new one.
+The new password must contain 8 to 64 UTF-8 bytes. Saving signs you out
+and stores a salted password hash in NVS so the new password survives a
+restart. The portal accepts one session at a time, for up to 30 minutes.
+The prototype AP is open and the portal uses HTTP, so traffic on the
+local Wi-Fi has no transport encryption.
 
 To check the portal from a connected computer:
 
@@ -27,6 +36,12 @@ To check the portal from a connected computer:
 - Run `nslookup example.com 192.168.4.1` and expect `192.168.4.1`.
 - Run `curl -i http://192.168.4.1/generate_204` and expect HTTP 302 with
   `Location: http://192.168.4.1/`. Open the location to see Road Hog Setup.
+- Run `curl -i http://192.168.4.1/api/status` without a session and expect HTTP
+  401. Sign in through the browser and compare the status fields with SMS
+  `STATUS`.
+- Change the password and confirm the portal signs you out. Try the old
+  password, then sign in with the new one. Reboot, enable the AP again,
+  and confirm the new password still works.
 - Confirm an SMS `STATUS` still works while a client is connected.
 
 To verify the AP policy, start with a registered modem and confirm the SSID

@@ -16,15 +16,174 @@
     h1 { margin: 0 0 1.5rem; font-size: clamp(2rem, 9vw, 3.25rem);
          line-height: 1.05; letter-spacing: -.045em }
     h2 { margin: 1.5rem 0 .25rem; font-size: 1rem; color: #cfed87 }
-    p { margin: .25rem 0; color: #d0d8cb }
+    dl { margin: 0 }
+    dl > div { display: flex; flex-wrap: wrap; justify-content: space-between;
+               gap: .25rem 1rem; padding: .55rem 0; border-bottom: 1px solid #3c473c }
+    dt { color: #d0d8cb }
+    dd { margin: 0; font-weight: 600 }
+    form { display: grid; gap: .75rem }
+    label { display: grid; gap: .25rem }
+    input, button { font: inherit; color: inherit; border: 1px solid #657366; border-radius: .35rem;
+                    padding: .45rem .65rem }
+    input { min-width: 0; background: #141815 }
+    button { justify-self: start; background: #cfed87; color: #141815; font-weight: 600; cursor: pointer }
+    button:disabled { opacity: .6; cursor: wait }
+    details { margin-top: 1.25rem }
+    summary { cursor: pointer; color: #cfed87 }
+    details form { margin-top: .75rem }
+    #logout { margin-top: 1rem; background: transparent; color: inherit }
+    .notice { margin: .75rem 0 0; color: #ffd297 }
   </style>
 </head>
 <body>
   <main>
     <h1>Road Hog Setup</h1>
-    <p>You’re connected directly to the Road Hog device.</p>
-    <h2>Settings</h2>
-    <p>Settings are unavailable in this firmware version.</p>
+    <section id="signin" hidden>
+      <h2>Sign in</h2>
+      <form id="login" method="post" action="/api/login">
+        <label>Username <input name="username" autocomplete="username" required maxlength="64"></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password" required maxlength="64"></label>
+        <button type="submit">Sign in</button>
+      </form>
+    </section>
+    <section id="dashboard" hidden>
+      <h2>Connection status</h2>
+      <dl>
+        <div><dt>LTE registration</dt><dd id="lte">Checking…</dd></div>
+        <div><dt>LTE data context</dt><dd id="data">Checking…</dd></div>
+        <div><dt>GPS fix</dt><dd id="gps">Checking…</dd></div>
+      </dl>
+      <details>
+        <summary>Change password</summary>
+        <form id="password" method="post" action="/api/password">
+          <label>Current password <input name="current" type="password" autocomplete="current-password" required maxlength="64"></label>
+          <label>New password <input name="updated" type="password" autocomplete="new-password" required maxlength="64"></label>
+          <label>Confirm new password <input name="confirm" type="password" autocomplete="new-password" required maxlength="64"></label>
+          <button type="submit">Save password</button>
+        </form>
+      </details>
+      <button id="logout" type="button">Sign out</button>
+    </section>
+    <p id="notice" class="notice" role="status" hidden></p>
+    <noscript>Enable JavaScript to view live connection status.</noscript>
   </main>
+  <script>
+    const signin = document.getElementById('signin');
+    const dashboard = document.getElementById('dashboard');
+    const notice = document.getElementById('notice');
+    const login = document.getElementById('login');
+    const password = document.getElementById('password');
+    const logout = document.getElementById('logout');
+    const fields = ['lte', 'data', 'gps'];
+    let pending = false;
+    let generation = 0;
+
+    function message(text) {
+      notice.textContent = text;
+      notice.hidden = !text;
+    }
+
+    function showSignin() {
+      if (signin.hidden) {
+        password.reset();
+        dashboard.querySelector('details').open = false;
+      }
+      dashboard.hidden = true;
+      signin.hidden = false;
+    }
+
+    async function request(path, options = {}) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        return await fetch(path, { ...options, cache: 'no-store', signal: controller.signal });
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    async function refreshStatus() {
+      if (pending) return;
+      const started = generation;
+      try {
+        const response = await request('/api/status');
+        if (started !== generation) return;
+        if (response.status === 401) {
+          if (!dashboard.hidden) message('Your session ended. Sign in again.');
+          showSignin();
+          return;
+        }
+        if (!response.ok) throw new Error('Status request failed');
+        const status = await response.json();
+        if (started !== generation) return;
+        fields.forEach(field => {
+          document.getElementById(field).textContent = status[field];
+        });
+        if (dashboard.hidden) message('');
+        signin.hidden = true;
+        dashboard.hidden = false;
+      } catch {
+        if (started !== generation) return;
+        fields.forEach(field => {
+          document.getElementById(field).textContent = '—';
+        });
+        if (dashboard.hidden) showSignin();
+        message('Can’t read device status. Check your Wi-Fi connection.');
+      }
+    }
+
+    async function poll() {
+      await refreshStatus();
+      setTimeout(poll, 5000);
+    }
+
+    async function submit(path, body, control) {
+      if (pending) return false;
+      pending = true;
+      generation++;
+      control.disabled = true;
+      message('');
+      try {
+        const response = await request(path, { method: 'POST', body });
+        if (response.ok) return true;
+        if (response.status === 401 && path !== '/api/login') showSignin();
+        message(await response.text());
+      } catch {
+        message('Can’t reach the device. Check your Wi-Fi connection and try again.');
+      } finally {
+        pending = false;
+        control.disabled = false;
+      }
+      return false;
+    }
+
+    login.addEventListener('submit', async event => {
+      event.preventDefault();
+      const { username, password: secret } = login.elements;
+      if (await submit('/api/login', username.value + '\n' + secret.value, event.submitter)) {
+        login.reset();
+        await refreshStatus();
+      }
+    });
+
+    password.addEventListener('submit', async event => {
+      event.preventDefault();
+      const { current, updated, confirm } = password.elements;
+      if (updated.value !== confirm.value) {
+        message('The new passwords do not match.');
+        return;
+      }
+      if (await submit('/api/password', current.value + '\n' + updated.value, event.submitter)) {
+        showSignin();
+        message('Password changed. Sign in with your new password.');
+      }
+    });
+
+    logout.addEventListener('click', async () => {
+      if (await submit('/api/logout', '', logout)) showSignin();
+    });
+
+    poll();
+  </script>
 </body>
 </html>

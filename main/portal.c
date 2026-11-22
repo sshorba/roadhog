@@ -1,4 +1,6 @@
 #include "portal.h"
+#include "portal_auth.h"
+#include "status_led.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -27,7 +29,27 @@ static struct sockaddr_in dns_address;
 static int dns_socket;
 extern const char portal_html_start[] asm("_binary_index_html_start");
 
-static esp_err_t landing_page(httpd_req_t *request)
+static portMUX_TYPE status_lock = portMUX_INITIALIZER_UNLOCKED;
+static lte_status_t lte_status;
+static gps_status_t gps_status;
+static const char *data_status = "Unknown";
+
+static esp_err_t status_response(httpd_req_t *request)
+{
+    portENTER_CRITICAL(&status_lock);
+    lte_status_t lte = lte_status;
+    gps_status_t gps = gps_status;
+    const char *data = data_status;
+    portEXIT_CRITICAL(&status_lock);
+
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"lte\":\"%s\",\"data\":\"%s\",\"gps\":\"%s\"}", lte_label(lte), data, gps_label(gps));
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_sendstr(request, body);
+}
+
+static bool local_host(httpd_req_t *request)
 {
     char host[sizeof("255.255.255.255:80")];
     esp_err_t host_result = httpd_req_get_hdr_value_str(request, "Host", host, sizeof(host));
@@ -36,11 +58,37 @@ static esp_err_t landing_page(httpd_req_t *request)
         host[strlen(host) - 3] = '\0';
     }
 
+    return host_result == ESP_OK && strcmp(host, portal_host) == 0;
+}
+
+static esp_err_t auth_post(httpd_req_t *request)
+{
+    char origin[sizeof("http://255.255.255.255")];
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    httpd_resp_set_type(request, "text/html; charset=utf-8");
-    if ((host_result == ESP_ERR_NOT_FOUND || (host_result == ESP_OK && strcmp(host, portal_host) == 0)) &&
-        (strcmp(request->uri, "/") == 0 || strncmp(request->uri, "/?", 2) == 0)) {
-        return httpd_resp_sendstr(request, portal_html_start);
+    if (!local_host(request) ||
+        httpd_req_get_hdr_value_str(request, "Origin", origin, sizeof(origin)) != ESP_OK ||
+        strncmp(origin, portal_url, strlen(portal_url) - 1) != 0 ||
+        strlen(origin) != strlen(portal_url) - 1) {
+        return httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Open the local setup portal.");
+    }
+    return portal_auth_post(request);
+}
+
+static esp_err_t landing_page(httpd_req_t *request)
+{
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    if (local_host(request) || httpd_req_get_hdr_value_len(request, "Host") == 0) {
+        if (strcmp(request->uri, "/api/status") == 0) {
+            if (!local_host(request) || !portal_authenticated(request)) {
+                httpd_resp_set_status(request, "401 Unauthorized");
+                return httpd_resp_sendstr(request, "Sign in to view device status.");
+            }
+            return status_response(request);
+        }
+        if (strcmp(request->uri, "/") == 0 || strncmp(request->uri, "/?", 2) == 0) {
+            httpd_resp_set_type(request, "text/html; charset=utf-8");
+            return httpd_resp_sendstr(request, portal_html_start);
+        }
     }
 
     httpd_resp_set_status(request, "302 Found");
@@ -114,12 +162,18 @@ static esp_err_t start_services(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.lru_purge_enable = true;
+    config.stack_size = 8192;
     esp_err_t error = httpd_start(&http, &config);
     if (error != ESP_OK) {
         return error;
     }
     const httpd_uri_t route = {.uri = "/*", .method = HTTP_GET, .handler = landing_page};
     error = httpd_register_uri_handler(http, &route);
+    const char *auth_paths[] = {"/api/login", "/api/password", "/api/logout"};
+    for (size_t i = 0; error == ESP_OK && i < sizeof(auth_paths) / sizeof(auth_paths[0]); i++) {
+        const httpd_uri_t auth_route = {.uri = auth_paths[i], .method = HTTP_POST, .handler = auth_post};
+        error = httpd_register_uri_handler(http, &auth_route);
+    }
     if (error == ESP_OK) {
         dns_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (dns_socket < 0) {
@@ -188,6 +242,7 @@ static esp_err_t set_ap(bool enabled)
     if (error == ESP_OK) {
         ap_initialized = true;
         ap_running = enabled;
+        status_led_set_ap(enabled);
         idle_since = 0;
         ESP_LOGI(TAG, "Setup AP %s", enabled ? "enabled" : "disabled");
     }
@@ -227,6 +282,7 @@ static void ap_policy_task(void *context)
 esp_err_t portal_init(void)
 {
     ESP_RETURN_ON_ERROR(nvs_flash_init(), TAG, "NVS initialization");
+    ESP_RETURN_ON_ERROR(portal_auth_init(), TAG, "Portal authentication initialization");
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "Network initialization");
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "Event loop initialization");
 
@@ -251,12 +307,19 @@ esp_err_t portal_init(void)
     return ESP_OK;
 }
 
-void portal_set_cellular(bool registered)
+void portal_set_status(lte_status_t lte, const char *data, gps_status_t gps)
 {
     if (!ap_lock) {
         return;
     }
+    portENTER_CRITICAL(&status_lock);
+    lte_status = lte;
+    gps_status = gps;
+    data_status = data ? data : "Unknown";
+    portEXIT_CRITICAL(&status_lock);
+
     xSemaphoreTake(ap_lock, portMAX_DELAY);
+    bool registered = lte == LTE_HOME || lte == LTE_ROAMING;
     if (!cellular_known || cellular_registered != registered) {
         cellular_known = true;
         cellular_registered = registered;

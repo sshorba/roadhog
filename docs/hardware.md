@@ -42,3 +42,22 @@ The North American modem and chosen PUCK antenna are intended to include T-Mobil
 ## Future custom PCB
 
 Plan to publish editable KiCad schematic and PCB, BOM with manufacturer part numbers, assembly files, enclosure models and test procedures. Evaluate ESP32-S3 module temperature grades, automotive EMC/transients, modem regulatory/carrier approvals, and secure manufacturing provisioning.
+
+## Onboard RGB status LED
+
+| Pattern | State |
+| --- | --- |
+| Solid red | The ESP32 cannot communicate with the modem |
+| Flashing red | LTE is unregistered and GPS has a fix |
+| Flashing yellow | LTE is registered and GPS has no fix |
+| Alternating yellow and red | LTE is unregistered and GPS has no fix |
+| Solid green | LTE is registered and GPS has a fix |
+| Alternating green and blue | The setup Wi-Fi AP is enabled |
+
+Each step lasts 400 ms. When the AP is enabled during an LTE or GPS fault,
+the LED shows two cycles of the fault pattern followed by two cycles of
+green and blue. Loss of modem communication always shows solid red.
+
+The default GPIO is 38 for the ESP32-S3-DevKitC-1 v1.1. Set
+`ROADHOG_STATUS_LED_GPIO` to 48 for the original revision in `menuconfig`.
+See the [Espressif DevKitC-1 guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html#hardware-revision-details).
