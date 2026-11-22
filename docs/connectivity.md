@@ -43,6 +43,9 @@ roadhog/<device-id>/responses
 
 ## Cellular validation
 
+The [LTE PPP bench diagnostic](lte-diagnostic.md) describes the opt-in
+IPv4, DNS, and HTTPS check and the SMS recovery test.
+
 US Mobile supports network options based on T-Mobile, AT&T, and Verizon. **Frequency support does not guarantee device activation or SMS/VoLTE provisioning.** Validate modem IMEI, SIM, SMS, data, and any voice-calling use before committing to a carrier. Verify simultaneous modem data, GNSS, and SMS operation with the chosen AT/PPP multiplexing approach.
 
 ## OTA

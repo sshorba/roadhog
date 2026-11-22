@@ -283,8 +283,6 @@ esp_err_t portal_init(void)
 {
     ESP_RETURN_ON_ERROR(nvs_flash_init(), TAG, "NVS initialization");
     ESP_RETURN_ON_ERROR(portal_auth_init(), TAG, "Portal authentication initialization");
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "Network initialization");
-    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "Event loop initialization");
 
     esp_netif_t *ap = esp_netif_create_default_wifi_ap();
     esp_netif_ip_info_t ip;

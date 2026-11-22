@@ -17,3 +17,26 @@ config ROADHOG_STATUS_LED_GPIO
     default 38
     help
         Use GPIO38 for ESP32-S3-DevKitC-1 v1.1, or GPIO48 for the original revision.
+
+menu "Road Hog LTE diagnostic"
+
+config ROADHOG_LTE_DIAGNOSTIC
+    bool "Run one LTE PPP diagnostic per boot"
+    depends on ESP_MODEM_USE_PPP_MODE && LWIP_PPP_ENABLE_IPV4
+    depends on MBEDTLS_CERTIFICATE_BUNDLE && MBEDTLS_HAVE_TIME_DATE && ESP_HTTP_CLIENT_ENABLE_HTTPS
+    depends on !ESP_TLS_SKIP_SERVER_CERT_VERIFY
+    select ESP_NETIF_SET_DNS_PER_DEFAULT_NETIF
+    default n
+
+config ROADHOG_LTE_APN
+    string "Carrier APN"
+    depends on ROADHOG_LTE_DIAGNOSTIC
+    default ""
+
+config ROADHOG_LTE_DELAY
+    int "Seconds of AT/SMS service before the diagnostic"
+    depends on ROADHOG_LTE_DIAGNOSTIC
+    range 30 600
+    default 90
+
+endmenu
