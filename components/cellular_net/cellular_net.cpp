@@ -68,35 +68,107 @@ static bool parse_number(string_view &fields, unsigned &value)
     return true;
 }
 
-static bool query_context(DCE &dce, const char *command, string_view prefix, bool &present)
+struct context_query_t {
+    const char *name;
+    const char *read;
+    const char *test;
+    string_view prefix;
+};
+
+static constexpr context_query_t primary_contexts{"AT+CGDCONT?", "AT+CGDCONT?\r",
+                                                   "AT+CGDCONT=?\r", "+CGDCONT:"};
+static constexpr context_query_t secondary_contexts{"AT+CGDSCONT?", "AT+CGDSCONT?\r",
+                                                     "AT+CGDSCONT=?\r", "+CGDSCONT:"};
+static constexpr context_query_t active_contexts{"AT+CGACT?", "AT+CGACT?\r",
+                                                  "AT+CGACT=?\r", "+CGACT:"};
+
+struct context_inventory_t {
+    bool present = false;
+    bool final_seen = false;
+    bool modem_error = false;
+    bool malformed = false;
+};
+
+static void log_context_error(const char *name, string_view line)
 {
-    present = false;
-    bool valid = true;
-    auto result = run_at(dce, command, 3000, [&](string_view line) {
+    ESP_LOGW(TAG, "%s <- %.*s", name, static_cast<int>(line.size()), line.data());
+}
+
+static context_inventory_t query_context(DCE &dce, const context_query_t &query)
+{
+    context_inventory_t inventory;
+    bool empty = false;
+    bool have_rows = false;
+    const bool activity = query.prefix == active_contexts.prefix;
+    auto result = run_at(dce, query.read, 3000, [&](string_view line) {
         if (line == "OK") {
-            return valid ? command_result::OK : command_result::FAIL;
+            inventory.final_seen = true;
+            ESP_LOGI(TAG, "%s <- OK%s", query.name, have_rows ? "" : " (empty inventory)");
+            return inventory.malformed ? command_result::FAIL : command_result::OK;
         }
-        if (line.starts_with(prefix)) {
-            line.remove_prefix(prefix.size());
-            unsigned cid;
-            if (!parse_number(line, cid) || !line.starts_with(',')) {
-                valid = false;
-            } else if (cid == diagnostic_cid) {
-                present = true;
-                if (prefix == "+CGACT:") {
-                    line.remove_prefix(1);
-                    unsigned state;
-                    if (!parse_number(line, state) || !line.empty() || state > 1) {
-                        valid = false;
-                    } else {
-                        present = state == 1;
-                    }
-                }
+        if (!line.starts_with(query.prefix)) {
+            return command_result::TIMEOUT;
+        }
+
+        line.remove_prefix(query.prefix.size());
+        // SIMCom documents the row after the prefix as optional.
+        if (line.find_first_not_of(" \t") == string_view::npos) {
+            empty = true;
+            inventory.malformed |= have_rows;
+            ESP_LOGI(TAG, "%s <- %.*s <empty>", query.name,
+                     static_cast<int>(query.prefix.size()), query.prefix.data());
+            return command_result::TIMEOUT;
+        }
+
+        unsigned cid;
+        unsigned active = 1;
+        bool valid = parse_number(line, cid) && cid != 0;
+        if (valid) {
+            const auto separator = line.find_first_not_of(" \t");
+            valid = separator != string_view::npos && line[separator] == ',';
+            if (valid) {
+                line.remove_prefix(separator + 1);
             }
         }
+        if (valid && activity) {
+            valid = parse_number(line, active) && active <= 1 &&
+                    line.find_first_not_of(" \t") == string_view::npos;
+        }
+        have_rows = true;
+        inventory.malformed |= !valid || empty;
+        if (!valid) {
+            ESP_LOGW(TAG, "%s <- malformed PDP row (details omitted)", query.name);
+        } else if (activity) {
+            ESP_LOGI(TAG, "%s <- +CGACT: %u,%u", query.name, cid, active);
+        } else {
+            ESP_LOGI(TAG, "%s <- %.*s %u,<definition fields omitted>", query.name,
+                     static_cast<int>(query.prefix.size()), query.prefix.data(), cid);
+        }
+        if (valid && cid == diagnostic_cid && active) {
+            inventory.present = true;
+        }
         return command_result::TIMEOUT;
+    }, [&](string_view line) {
+        inventory.final_seen = true;
+        inventory.modem_error = true;
+        log_context_error(query.name, line);
     });
-    return result == command_result::OK;
+
+    if (!inventory.final_seen) {
+        ESP_LOGW(TAG, "%s inventory incomplete: %s", query.name,
+                 result == command_result::TIMEOUT ? "response timeout" : "AT buffer or transport failure");
+    } else if (inventory.malformed) {
+        ESP_LOGW(TAG, "%s inventory rejected by parser", query.name);
+    } else if (!inventory.modem_error) {
+        ESP_LOGI(TAG, "%s inventory: CID %u %s", query.name, diagnostic_cid,
+                 inventory.present ? "occupied" : "absent or inactive");
+    }
+    return inventory;
+}
+
+static bool inventory_confirmed(const context_inventory_t &inventory)
+{
+    return inventory.final_seen && !inventory.modem_error && !inventory.malformed;
 }
 
 static bool query_value(DCE &dce, const char *command, string_view prefix, unsigned &value)
@@ -142,30 +214,77 @@ static bool recover_at(DCE &dce, bool dial_attempted, bool ppp_started)
     return command_mode_ready(dce);
 }
 
+static bool verify_cid_available(DCE &dce)
+{
+    bool available = true;
+    for (const auto *query : {&primary_contexts, &secondary_contexts, &active_contexts}) {
+        auto inventory = query_context(dce, *query);
+        available &= inventory_confirmed(inventory) && !inventory.present;
+        if (!inventory.final_seen && !command_mode_ready(dce)) {
+            ESP_LOGW(TAG, "Remaining PDP inventory checks skipped: AT synchronization not confirmed");
+            return false;
+        }
+        if (inventory.modem_error) {
+            // The test form queries supported syntax and ranges only. It
+            // is never evidence that an existing context is absent.
+            bool capability_seen = false;
+            bool test_final_seen = false;
+            auto result = run_at(dce, query->test, 3000, [&](string_view line) {
+                if (line.starts_with(query->prefix)) {
+                    capability_seen = true;
+                    ESP_LOGI(TAG, "%s capability <- %.*s", query->name,
+                             static_cast<int>(line.size()), line.data());
+                }
+                if (line == "OK") {
+                    test_final_seen = true;
+                    return command_result::OK;
+                }
+                return command_result::TIMEOUT;
+            }, [&](string_view line) {
+                test_final_seen = true;
+                log_context_error(query->name, line);
+            });
+            ESP_LOGW(TAG, "%s read failed; capability test %s", query->name,
+                     result == command_result::OK && capability_seen ? "recognized"
+                                                                    : "did not confirm support");
+            if (!test_final_seen && !command_mode_ready(dce)) {
+                return false;
+            }
+        }
+    }
+    return available;
+}
+
 static bool remove_test_context(DCE &dce)
 {
-    bool active;
-    if (!query_context(dce, "AT+CGACT?\r", "+CGACT:", active)) {
+    auto active = query_context(dce, active_contexts);
+    if (!inventory_confirmed(active)) {
         return false;
     }
     char command[32];
-    if (active) {
+    if (active.present) {
         snprintf(command, sizeof(command), "AT+CGACT=0,%u\r", diagnostic_cid);
         run_at(dce, command, 5000);
-        if (!command_mode_ready(dce) ||
-            !query_context(dce, "AT+CGACT?\r", "+CGACT:", active) || active) {
+        if (!command_mode_ready(dce)) {
+            return false;
+        }
+        active = query_context(dce, active_contexts);
+        if (!inventory_confirmed(active) || active.present) {
             return false;
         }
     }
-    bool defined;
-    if (!query_context(dce, "AT+CGDCONT?\r", "+CGDCONT:", defined)) {
+    auto defined = query_context(dce, primary_contexts);
+    if (!inventory_confirmed(defined)) {
         return false;
     }
-    if (defined) {
+    if (defined.present) {
         snprintf(command, sizeof(command), "AT+CGDCONT=%u\r", diagnostic_cid);
         run_at(dce, command, 3000);
-        if (!command_mode_ready(dce) ||
-            !query_context(dce, "AT+CGDCONT?\r", "+CGDCONT:", defined) || defined) {
+        if (!command_mode_ready(dce)) {
+            return false;
+        }
+        defined = query_context(dce, primary_contexts);
+        if (!inventory_confirmed(defined) || defined.present) {
             return false;
         }
     }
@@ -337,10 +456,7 @@ static esp_err_t test_session(DCE &dce, esp_netif_t *netif, const char *apn, ses
     }
     ESP_LOGI(TAG, "Packet attachment confirmed");
 
-    bool used;
-    if (!query_context(dce, "AT+CGDCONT?\r", "+CGDCONT:", used) || used ||
-        !query_context(dce, "AT+CGDSCONT?\r", "+CGDSCONT:", used) || used ||
-        !query_context(dce, "AT+CGACT?\r", "+CGACT:", used) || used) {
+    if (!verify_cid_available(dce)) {
         ESP_LOGW(TAG, "Cannot confirm diagnostic CID %u is unused; diagnostic skipped", diagnostic_cid);
         return ESP_ERR_INVALID_STATE;
     }

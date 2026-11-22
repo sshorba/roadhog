@@ -143,6 +143,24 @@ a newline arrives. The diagnostic processes each complete line once.
 An overlong line or an exhausted response buffer fails the transaction
 so an incomplete context inventory cannot pass preflight.
 
+## PDP inventory diagnostics
+
+The serial log identifies each read command, the returned CIDs and
+activation states, and the final modem result. It omits primary context
+definition fields such as APNs and addresses. A prefix with an empty
+row followed by `OK` is a documented empty inventory. Malformed or
+incomplete replies, modem errors, and an occupied CID stop the test
+before it writes a context.
+
+If a read command returns an error, the diagnostic probes its
+read-only `=?` form to check whether the modem recognizes it. That form
+reports capabilities. `AT+CGACT?` can identify an active CID, and
+`AT+CGPADDR=?` lists defined CIDs, but the SIMCom manual does not say
+whether that list includes inactive secondary definitions. A missing
+CID in either output cannot replace a failed secondary inventory.
+When an inventory is unconfirmed, the diagnostic
+leaves the modem profiles alone and returns the UART to normal AT use.
+
 ## Timeout limits and remaining validation
 
 The AT deadlines bound how long the host waits for a reply. They cannot
@@ -158,11 +176,24 @@ It leaves the fallback portal available. The worker keeps ownership
 until its own cleanup ends. This avoids a second UART owner while the
 SDK is still using the first.
 
-The SIM7600 data-mode transition, carrier support for a temporary IPv4
-context, cleanup after a late reply, and actual SMS recovery still
-require bench validation. Power loss during the session or an
-unresponsive modem can leave a temporary context defined. The next
-diagnostic will skip that CID until its state is verified on the bench.
+Power loss during the session or an unresponsive modem can leave a
+temporary context defined. The next diagnostic will skip that CID until
+its state is verified on the bench. Failure-injection tests and
+handset SMS delivery still need bench validation.
+
+## Recorded bench result
+
+On US Mobile Light Speed with APN `wholesale`, the SIM7600NA-H returned
+an empty `+CGDSCONT:` row with `OK`. The primary inventory listed CIDs
+1–4, and the activation inventory showed CIDs 1 and 2 active. All three
+checks confirmed CID 8 was available. PPP obtained IPv4, DNS resolved
+the test host, and verified HTTPS returned 204.
+
+After PPP stopped, esp_modem reported that its mode transition could
+not confirm AT mode. The application then verified a command-specific
+AT reply, confirmed that CID 8 was inactive, removed its temporary
+definition, and read back CIDs 1–4. The serial console confirmed AT and
+SMS handling resumed and the GNSS session was still running.
 
 See the [SIMCom SIM7500/SIM7600 AT command manual](https://robu-prod-media.s3.ap-south-1.amazonaws.com/uploads/2022/04/SIM7500_SIM7600_Series_AT_Command_Manual_V3.00.pdf)
 for PDP inventory, definition and data mode commands.

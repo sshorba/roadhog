@@ -9,9 +9,9 @@ namespace cellular_net {
 inline constexpr size_t at_response_capacity = 4096;
 inline constexpr size_t at_line_capacity = 384;
 
-template<typename Modem, typename LineHandler>
+template<typename Modem, typename LineHandler, typename ErrorHandler>
 esp_modem::command_result run_at(Modem &modem, const char *command, uint32_t timeout_ms,
-                                 LineHandler handle_line)
+                                 LineHandler handle_line, ErrorHandler handle_error)
 {
     using esp_modem::command_result;
 
@@ -41,6 +41,7 @@ esp_modem::command_result run_at(Modem &modem, const char *command, uint32_t tim
             }
             if (line == "ERROR" || line.starts_with("+CME ERROR:") ||
                 line.starts_with("+CMS ERROR:")) {
+                handle_error(line);
                 return command_result::FAIL;
             }
             command_result result = handle_line(line);
@@ -49,6 +50,13 @@ esp_modem::command_result run_at(Modem &modem, const char *command, uint32_t tim
             }
         }
     }, timeout_ms);
+}
+
+template<typename Modem, typename LineHandler>
+esp_modem::command_result run_at(Modem &modem, const char *command, uint32_t timeout_ms,
+                                 LineHandler handle_line)
+{
+    return run_at(modem, command, timeout_ms, handle_line, [](std::string_view) {});
 }
 
 } // namespace cellular_net
