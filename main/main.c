@@ -106,13 +106,17 @@ void app_main(void)
         portal_set_status(lte, data, gps);
         ESP_LOGI(TAG, "LTE: %s, data context: %s, GPS: %s",
                  lte_label(lte), data, gps_label(gps));
-        modem_reachable |= probe(modem, "AT+CSQ", "+CSQ:");
+        bool csq_answered = probe(modem, "AT+CSQ", "+CSQ:");
+        modem_reachable |= csq_answered;
         status_led_set_connections(modem_reachable || lte != LTE_UNKNOWN || gps != GPS_UNAVAILABLE,
                                    lte == LTE_HOME || lte == LTE_ROAMING, gps == GPS_FIX);
 #ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
         if (diagnostic_pending && esp_timer_get_time() >= diagnostic_at) {
             diagnostic_pending = false;
-            if (lte == LTE_HOME || lte == LTE_ROAMING) {
+            // A missing final can mean an older AT command still owns the stream.
+            if (!csq_answered) {
+                ESP_LOGW(TAG, "LTE diagnostic skipped: AT command stream is not idle");
+            } else if (lte == LTE_HOME || lte == LTE_ROAMING) {
                 ESP_LOGI(TAG, "LTE registration confirmed: %s", lte_label(lte));
                 bool uart_reopened;
                 modem = lte_diagnostic_run(modem, &config, &uart_reopened);
