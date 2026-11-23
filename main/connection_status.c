@@ -10,7 +10,7 @@
 
 static const char *TAG = "connection_status";
 
-void start_gps(modem_t *modem)
+bool start_gps(modem_t *modem)
 {
     char response[64];
     modem_result_t result = {0};
@@ -20,15 +20,16 @@ void start_gps(modem_t *modem)
         strncmp(response, "+CGPS:", 6) == 0 &&
         response[strspn(response + 6, " ") + 6] == '1') {
         ESP_LOGI(TAG, "GPS session already running");
-        return;
+        return true;
     }
     error = modem_command(modem, "AT+CGPS=1", NULL, 5000, NULL, 0, &result);
     if (error == ESP_OK && result.final == MODEM_FINAL_OK) {
         ESP_LOGI(TAG, "GPS session started");
-    } else {
-        ESP_LOGW(TAG, "GPS start failed: %s",
-                 error == ESP_OK ? result.final_line : esp_err_to_name(error));
+        return true;
     }
+    ESP_LOGW(TAG, "GPS start failed: %s",
+             error == ESP_OK ? result.final_line : esp_err_to_name(error));
+    return false;
 }
 
 static bool read_decimal(const char *text, double *value)

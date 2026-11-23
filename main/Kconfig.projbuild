@@ -40,3 +40,22 @@ config ROADHOG_LTE_DELAY
     default 90
 
 endmenu
+
+menu "Road Hog OTA rollback bench"
+    depends on BOOTLOADER_APP_ROLLBACK_ENABLE
+
+config ROADHOG_OTA_BENCH_BOOT_PEER
+    bool "Select an untried, serial-staged ota_1 from healthy ota_0"
+    default n
+    help
+        Bench only. On healthy ota_0, select a validly formatted ota_1 image
+        that has no OTA state entry, then reboot. Keep disabled outside testing.
+
+config ROADHOG_OTA_BENCH_REJECT_PENDING
+    bool "Reject a pending image to demonstrate rollback"
+    depends on !ROADHOG_OTA_BENCH_BOOT_PEER
+    default n
+    help
+        Bench only. Force a failed health result for a pending image.
+
+endmenu

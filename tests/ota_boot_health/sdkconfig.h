@@ -1,0 +1,1 @@
+/* Test configurations are selected by compiler flags. */
