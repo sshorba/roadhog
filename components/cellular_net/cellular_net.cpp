@@ -292,7 +292,7 @@ static bool remove_test_context(DCE &dce)
     return true;
 }
 
-static bool ppp_is_uplink(esp_netif_t *netif)
+bool cellular_ppp_is_uplink(esp_netif_t *netif)
 {
     return esp_netif_is_netif_up(netif) && esp_netif_get_default_netif() == netif;
 }
@@ -302,7 +302,7 @@ static esp_err_t wait_for_ppp(esp_netif_t *netif)
     int64_t deadline = esp_timer_get_time() + 45000000;
     while (esp_timer_get_time() < deadline) {
         esp_netif_ip_info_t ip;
-        if (ppp_is_uplink(netif) && esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr) {
+        if (cellular_ppp_is_uplink(netif) && esp_netif_get_ip_info(netif, &ip) == ESP_OK && ip.ip.addr) {
             ESP_LOGI(TAG, "PPP IPv4 acquired: " IPSTR, IP2STR(&ip.ip));
             return ESP_OK;
         }
@@ -315,6 +315,7 @@ static esp_err_t wait_for_ppp(esp_netif_t *netif)
 struct dns_lookup_t {
     SemaphoreHandle_t done;
     ip4_addr_t address;
+    char host[254];
 };
 
 static void dns_complete(const char *, const ip_addr_t *address, void *context)
@@ -329,29 +330,47 @@ static void dns_complete(const char *, const ip_addr_t *address, void *context)
 static void start_dns(void *context)
 {
     ip_addr_t address;
-    err_t result = dns_gethostbyname_addrtype(test_host, &address, dns_complete, context,
+    auto &lookup = *static_cast<dns_lookup_t *>(context);
+    err_t result = dns_gethostbyname_addrtype(lookup.host, &address, dns_complete, context,
                                              LWIP_DNS_ADDRTYPE_IPV4);
     if (result != ERR_INPROGRESS) {
-        dns_complete(test_host, result == ERR_OK ? &address : nullptr, context);
+        dns_complete(lookup.host, result == ERR_OK ? &address : nullptr, context);
     }
 }
 
-static esp_err_t resolve_test_host(ip4_addr_t &address)
+esp_err_t cellular_resolve_ipv4(const char *host, char *address, size_t size)
 {
-    // One lookup per boot. lwIP may deliver the callback after our deadline.
-    static StaticSemaphore_t done_storage;
-    static dns_lookup_t lookup = {xSemaphoreCreateBinaryStatic(&done_storage), {}};
-    if (tcpip_try_callback(start_dns, &lookup) != ERR_OK) {
-        return ESP_FAIL;
+    // A timed-out lookup may complete later. Those slots are never reused.
+    static StaticSemaphore_t storage[2];
+    static dns_lookup_t slots[2];
+    static bool expired[2];
+    for (unsigned i = 0; i < 2; ++i) {
+        if (expired[i]) {
+            continue;
+        }
+        auto &lookup = slots[i];
+        if (strlen(host) >= sizeof(lookup.host)) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (!lookup.done) {
+            lookup.done = xSemaphoreCreateBinaryStatic(&storage[i]);
+        }
+        strcpy(lookup.host, host);
+        lookup.address = {};
+        if (tcpip_try_callback(start_dns, &lookup) != ERR_OK) {
+            return ESP_FAIL;
+        }
+        if (xSemaphoreTake(lookup.done, pdMS_TO_TICKS(12000)) != pdTRUE) {
+            expired[i] = true;
+            return ESP_ERR_TIMEOUT;
+        }
+        return lookup.address.addr && ip4addr_ntoa_r(&lookup.address, address, size)
+               ? ESP_OK : ESP_ERR_NOT_FOUND;
     }
-    if (xSemaphoreTake(lookup.done, pdMS_TO_TICKS(12000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-    address = lookup.address;
-    return address.addr ? ESP_OK : ESP_ERR_NOT_FOUND;
+    return ESP_ERR_TIMEOUT;
 }
 
-static esp_err_t check_https(esp_netif_t *netif)
+static esp_err_t prepare_tls(esp_netif_t *netif)
 {
     esp_netif_dns_info_t dns = {};
     bool have_dns = esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
@@ -363,14 +382,7 @@ static esp_err_t check_https(esp_netif_t *netif)
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    ip4_addr_t address;
-    esp_err_t error = resolve_test_host(address);
-    if (error != ESP_OK) {
-        ESP_LOGE(TAG, "DNS lookup failed: %s", esp_err_to_name(error));
-        return error;
-    }
-    ESP_LOGI(TAG, "DNS resolved %s", test_host);
-
+    esp_err_t error;
     esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.cloudflare.com");
     error = esp_netif_sntp_init(&sntp);
     if (error == ESP_OK) {
@@ -381,9 +393,22 @@ static esp_err_t check_https(esp_netif_t *netif)
         ESP_LOGE(TAG, "Clock synchronization for TLS failed: %s", esp_err_to_name(error));
         return error;
     }
-    if (!ppp_is_uplink(netif)) {
+    if (!cellular_ppp_is_uplink(netif)) {
         return ESP_ERR_INVALID_STATE;
     }
+
+    return ESP_OK;
+}
+
+static esp_err_t check_https(esp_netif_t *netif)
+{
+    char address[16];
+    esp_err_t error = cellular_resolve_ipv4(test_host, address, sizeof(address));
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "DNS lookup failed: %s", esp_err_to_name(error));
+        return error;
+    }
+    ESP_LOGI(TAG, "DNS resolved %s", test_host);
 
     struct ifreq interface = {};
     error = esp_netif_get_netif_impl_name(netif, interface.ifr_name);
@@ -391,7 +416,7 @@ static esp_err_t check_https(esp_netif_t *netif)
         return error;
     }
     char url[sizeof("https://255.255.255.255/generate_204")];
-    snprintf(url, sizeof(url), "https://" IPSTR "/generate_204", IP2STR(&address));
+    snprintf(url, sizeof(url), "https://%s/generate_204", address);
     esp_http_client_config_t http = {};
     http.url = url;
     http.method = HTTP_METHOD_HEAD;
@@ -410,7 +435,7 @@ static esp_err_t check_https(esp_netif_t *netif)
     if (error == ESP_OK) {
         int64_t deadline = esp_timer_get_time() + 10000000;
         do {
-            if (!ppp_is_uplink(netif)) {
+            if (!cellular_ppp_is_uplink(netif)) {
                 error = ESP_ERR_INVALID_STATE;
                 break;
             }
@@ -444,7 +469,8 @@ struct session_state_t {
     bool ppp_transition_attempted = false;
 };
 
-static esp_err_t test_session(DCE &dce, esp_netif_t *netif, const char *apn, session_state_t &state)
+static esp_err_t test_session(DCE &dce, esp_netif_t *netif, const char *apn, session_state_t &state,
+                              cellular_operation_t operation, void *context)
 {
     if (!command_mode_ready(dce)) {
         return ESP_ERR_INVALID_STATE;
@@ -491,10 +517,14 @@ static esp_err_t test_session(DCE &dce, esp_netif_t *netif, const char *apn, ses
     }
 
     esp_err_t error = wait_for_ppp(netif);
-    return error == ESP_OK ? check_https(netif) : error;
+    if (error == ESP_OK) {
+        error = prepare_tls(netif);
+    }
+    return error == ESP_OK ? (operation ? operation(netif, context) : check_https(netif)) : error;
 }
 
-esp_err_t cellular_net_test(const cellular_net_config_t *config, bool *at_ready)
+esp_err_t cellular_net_session(const cellular_net_config_t *config, bool *at_ready,
+                               cellular_operation_t operation, void *context)
 {
     *at_ready = true;
     esp_netif_config_t net_config = ESP_NETIF_DEFAULT_PPP();
@@ -527,7 +557,7 @@ esp_err_t cellular_net_test(const cellular_net_config_t *config, bool *at_ready)
     esp_err_t error = ESP_FAIL;
     session_state_t state;
     try {
-        error = test_session(*dce, netif.get(), config->apn, state);
+        error = test_session(*dce, netif.get(), config->apn, state, operation, context);
     } catch (const std::exception &) {
         ESP_LOGE(TAG, "esp_modem failed during the diagnostic; attempting cleanup");
     }
@@ -545,5 +575,10 @@ esp_err_t cellular_net_test(const cellular_net_config_t *config, bool *at_ready)
     }
     ESP_LOGI(TAG, "Returning UART with modem in command mode");
     return error;
+}
+
+esp_err_t cellular_net_test(const cellular_net_config_t *config, bool *at_ready)
+{
+    return cellular_net_session(config, at_ready, nullptr, nullptr);
 }
 #endif

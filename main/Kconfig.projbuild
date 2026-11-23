@@ -60,3 +60,23 @@ config ROADHOG_OTA_BENCH_REJECT_PENDING
         Bench only. Force a failed health result for a pending image.
 
 endmenu
+
+menu "Road Hog LTE OTA bench"
+    depends on ROADHOG_LTE_DIAGNOSTIC && BOOTLOADER_APP_ROLLBACK_ENABLE && ROADHOG_SMS_CONTROL
+
+config ROADHOG_OTA_UPDATE_BENCH
+    bool "Enable explicit serial-console LTE OTA commands"
+    depends on !ROADHOG_OTA_BENCH_BOOT_PEER && !ROADHOG_OTA_BENCH_REJECT_PENDING && ESP_CONSOLE_UART
+    default n
+
+config ROADHOG_OTA_RELEASE_BASE
+    string "Release asset base URL (without trailing slash)"
+    depends on ROADHOG_OTA_UPDATE_BENCH
+    default "https://github.com/sshorba/roadhog/releases/download"
+
+config ROADHOG_OTA_RELEASE_HOSTS
+    string "Exact allowed HTTPS hostnames, comma separated"
+    depends on ROADHOG_OTA_UPDATE_BENCH
+    default "github.com,release-assets.githubusercontent.com"
+
+endmenu

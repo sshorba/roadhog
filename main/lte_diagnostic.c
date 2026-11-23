@@ -16,19 +16,24 @@ typedef struct {
     SemaphoreHandle_t done;
     esp_err_t result;
     bool at_ready;
+    cellular_operation_t operation;
+    void *context;
 } diagnostic_t;
 
 static void run_diagnostic(void *context)
 {
     diagnostic_t *diagnostic = context;
-    diagnostic->result = cellular_net_test(&diagnostic->config, &diagnostic->at_ready);
+    diagnostic->result = cellular_net_session(&diagnostic->config, &diagnostic->at_ready,
+                                              diagnostic->operation, diagnostic->context);
     xSemaphoreGive(diagnostic->done);
     vTaskDelete(NULL);
 }
 
-modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *uart_reopened)
+modem_t *lte_session_run(modem_t *modem, const modem_config_t *config, bool *uart_reopened,
+                         cellular_operation_t operation, void *context, esp_err_t *session_result)
 {
     *uart_reopened = false;
+    *session_result = ESP_ERR_INVALID_ARG;
     if (!cellular_apn_valid(CONFIG_ROADHOG_LTE_APN)) {
         ESP_LOGE(TAG, "Set a valid carrier APN in menuconfig");
         return modem;
@@ -48,12 +53,14 @@ modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *
         .done = xSemaphoreCreateBinaryStatic(&done_storage),
         .result = ESP_ERR_NO_MEM,
         .at_ready = true,
+        .operation = operation,
+        .context = context,
     };
     ESP_LOGI(TAG, "Releasing AT UART for PPP; SMS and GPS queries paused");
     modem_close(modem);
     if (xTaskCreate(run_diagnostic, "lte_diagnostic", 8192, &diagnostic, 4, NULL) == pdPASS) {
-        if (xSemaphoreTake(diagnostic.done, pdMS_TO_TICKS(180000)) != pdTRUE) {
-            ESP_LOGE(TAG, "Diagnostic exceeded three minutes; AT UART will stay closed");
+        if (xSemaphoreTake(diagnostic.done, pdMS_TO_TICKS(operation ? 480000 : 180000)) != pdTRUE) {
+            ESP_LOGE(TAG, "LTE session deadline exceeded; AT UART will stay closed");
             return NULL;
         }
     }
@@ -74,8 +81,14 @@ modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *
         modem_close(modem);
         return NULL;
     }
+    *session_result = diagnostic.result;
     *uart_reopened = true;
     ESP_LOGI(TAG, "AT ready after diagnostic");
     return modem;
+}
+modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *uart_reopened)
+{
+    esp_err_t result;
+    return lte_session_run(modem, config, uart_reopened, NULL, NULL, &result);
 }
 #endif
