@@ -133,6 +133,15 @@ static esp_err_t send_reply(modem_t *modem, const char *number, const char *mess
 }
 #endif
 
+#ifdef CONFIG_ROADHOG_SMS_CONTROL
+static void configure_sms(sms_control_t *sms, modem_t *modem)
+{
+    // Accept deliveries queued during the CNMI command itself.
+    sms->configured = command_ok(modem, "ATE0") && command_ok(modem, "AT+CMGF=0") && command_ok(modem, "AT+CSMS=1");
+    sms->configured = sms->configured && command_ok(modem, "AT+CNMI=2,2,0,0,0");
+}
+#endif
+
 void sms_control_start(sms_control_t *sms, modem_t *modem)
 {
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
@@ -141,9 +150,7 @@ void sms_control_start(sms_control_t *sms, modem_t *modem)
         ESP_LOGE(TAG, "SMS owner or user storage is unavailable");
         return;
     }
-    // Accept deliveries queued during the CNMI command itself.
-    sms->configured = command_ok(modem, "ATE0") && command_ok(modem, "AT+CMGF=0") && command_ok(modem, "AT+CSMS=1");
-    sms->configured = sms->configured && command_ok(modem, "AT+CNMI=2,2,0,0,0");
+    configure_sms(sms, modem);
     if (sms->configured) {
         unsigned users = 0;
         for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
@@ -152,6 +159,24 @@ void sms_control_start(sms_control_t *sms, modem_t *modem)
         ESP_LOGI(TAG, "SMS commands enabled; loaded %u additional users", users);
     } else {
         ESP_LOGE(TAG, "SMS setup failed");
+    }
+#else
+    (void)sms;
+    (void)modem;
+#endif
+}
+
+void sms_control_resume(sms_control_t *sms, modem_t *modem)
+{
+#ifdef CONFIG_ROADHOG_SMS_CONTROL
+    if (sms->configured) {
+        sms->expected_tpdu = 0;
+        configure_sms(sms, modem);
+        if (sms->configured) {
+            ESP_LOGI(TAG, "SMS commands resumed after LTE diagnostic");
+        } else {
+            ESP_LOGE(TAG, "SMS setup failed after LTE diagnostic");
+        }
     }
 #else
     (void)sms;

@@ -1,6 +1,11 @@
+#include "sdkconfig.h"
 #include "connection_status.h"
 #include "driver/gpio.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "lte_diagnostic.h"
 #include "modem.h"
 #include "portal.h"
 #include "sms_control.h"
@@ -44,7 +49,11 @@ void app_main(void)
     if (led_error != ESP_OK) {
         ESP_LOGW(TAG, "Status LED unavailable: %s", esp_err_to_name(led_error));
     }
-    esp_err_t portal_error = portal_init();
+    esp_err_t network_error = esp_netif_init();
+    if (network_error == ESP_OK) {
+        network_error = esp_event_loop_create_default();
+    }
+    esp_err_t portal_error = network_error == ESP_OK ? portal_init() : network_error;
     if (portal_error != ESP_OK) {
         ESP_LOGE(TAG, "Setup portal unavailable: %s", esp_err_to_name(portal_error));
     }
@@ -77,6 +86,16 @@ void app_main(void)
     sms_control_start(&sms, modem);
     start_gps(modem);
 
+#ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
+    bool diagnostic_pending = network_error == ESP_OK;
+    const int64_t diagnostic_at = esp_timer_get_time() + CONFIG_ROADHOG_LTE_DELAY * 1000000LL;
+    if (diagnostic_pending) {
+        ESP_LOGI(TAG, "LTE diagnostic scheduled in %d seconds", CONFIG_ROADHOG_LTE_DELAY);
+    } else {
+        ESP_LOGE(TAG, "LTE diagnostic unavailable: network initialization failed");
+    }
+#endif
+
     for (;;) {
         sms_control_service(&sms, modem);
         bool modem_reachable = probe(modem, "AT+CPIN?", "+CPIN:");
@@ -87,9 +106,35 @@ void app_main(void)
         portal_set_status(lte, data, gps);
         ESP_LOGI(TAG, "LTE: %s, data context: %s, GPS: %s",
                  lte_label(lte), data, gps_label(gps));
-        modem_reachable |= probe(modem, "AT+CSQ", "+CSQ:");
+        bool csq_answered = probe(modem, "AT+CSQ", "+CSQ:");
+        modem_reachable |= csq_answered;
         status_led_set_connections(modem_reachable || lte != LTE_UNKNOWN || gps != GPS_UNAVAILABLE,
                                    lte == LTE_HOME || lte == LTE_ROAMING, gps == GPS_FIX);
+#ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
+        if (diagnostic_pending && esp_timer_get_time() >= diagnostic_at) {
+            diagnostic_pending = false;
+            // A missing final can mean an older AT command still owns the stream.
+            if (!csq_answered) {
+                ESP_LOGW(TAG, "LTE diagnostic skipped: AT command stream is not idle");
+            } else if (lte == LTE_HOME || lte == LTE_ROAMING) {
+                ESP_LOGI(TAG, "LTE registration confirmed: %s", lte_label(lte));
+                bool uart_reopened;
+                modem = lte_diagnostic_run(modem, &config, &uart_reopened);
+                if (!modem) {
+                    status_led_set_connections(false, false, false);
+                    portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
+                    ESP_LOGE(TAG, "Restart both devices to restore SMS and GNSS");
+                    return;
+                }
+                if (uart_reopened) {
+                    sms_control_resume(&sms, modem);
+                    start_gps(modem);
+                }
+            } else {
+                ESP_LOGW(TAG, "LTE diagnostic skipped at deadline: %s", lte_label(lte));
+            }
+        }
+#endif
         if (modem_poll(modem, 5000) != ESP_OK) {
             status_led_set_connections(false, false, false);
             portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
