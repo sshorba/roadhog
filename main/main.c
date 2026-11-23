@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "lte_diagnostic.h"
 #include "modem.h"
+#include "ota_boot_health.h"
 #include "portal.h"
 #include "sms_control.h"
 #include "status_led.h"
@@ -20,7 +21,7 @@ static void log_notification(const char *line, void *context)
     }
 }
 
-static bool probe(modem_t *modem, const char *command, const char *prefix)
+static modem_final_t probe(modem_t *modem, const char *command, const char *prefix)
 {
     modem_result_t result;
     char response[MODEM_LINE_CAPACITY];
@@ -39,7 +40,7 @@ static bool probe(modem_t *modem, const char *command, const char *prefix)
     if (result.final != MODEM_FINAL_NONE) {
         ESP_LOGI(TAG, "%s final: %s", command, result.final_line);
     }
-    return result.final != MODEM_FINAL_NONE;
+    return result.final;
 }
 
 void app_main(void)
@@ -70,6 +71,7 @@ void app_main(void)
     if (error != ESP_OK) {
         portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
         ESP_LOGE(TAG, "Cannot open modem UART: %s", esp_err_to_name(error));
+        ota_boot_health_finish(false);
         return;
     }
     ESP_LOGI(TAG, "SIM7600 UART1 TX=17 RX=18 baud=115200");
@@ -79,12 +81,22 @@ void app_main(void)
         portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
         ESP_LOGE(TAG, "Startup UART fault; check modem power and wiring, then restart both devices");
         modem_close(modem);
+        ota_boot_health_finish(false);
         return;
     }
-    status_led_set_connections(probe(modem, "AT", NULL), false, false);
+    modem_final_t at = probe(modem, "AT", NULL);
+    status_led_set_connections(at != MODEM_FINAL_NONE, false, false);
     portal_set_status(read_lte_registration(modem), NULL, GPS_UNAVAILABLE);
     sms_control_start(&sms, modem);
-    start_gps(modem);
+    bool gps_started = start_gps(modem);
+
+#ifdef CONFIG_ROADHOG_SMS_CONTROL
+    bool sms_ready = sms.configured;
+#else
+    bool sms_ready = true;
+#endif
+    ota_boot_health_finish(portal_error == ESP_OK && at == MODEM_FINAL_OK &&
+                           sms_ready && gps_started);
 
 #ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
     bool diagnostic_pending = network_error == ESP_OK;
@@ -98,7 +110,7 @@ void app_main(void)
 
     for (;;) {
         sms_control_service(&sms, modem);
-        bool modem_reachable = probe(modem, "AT+CPIN?", "+CPIN:");
+        bool modem_reachable = probe(modem, "AT+CPIN?", "+CPIN:") != MODEM_FINAL_NONE;
         lte_status_t lte = read_lte_registration(modem);
         const char *data = lte_data_context(modem);
         gps_fix_t fix;
@@ -106,7 +118,7 @@ void app_main(void)
         portal_set_status(lte, data, gps);
         ESP_LOGI(TAG, "LTE: %s, data context: %s, GPS: %s",
                  lte_label(lte), data, gps_label(gps));
-        bool csq_answered = probe(modem, "AT+CSQ", "+CSQ:");
+        bool csq_answered = probe(modem, "AT+CSQ", "+CSQ:") != MODEM_FINAL_NONE;
         modem_reachable |= csq_answered;
         status_led_set_connections(modem_reachable || lte != LTE_UNKNOWN || gps != GPS_UNAVAILABLE,
                                    lte == LTE_HOME || lte == LTE_ROAMING, gps == GPS_FIX);

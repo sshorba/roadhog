@@ -50,4 +50,7 @@ US Mobile supports network options based on T-Mobile, AT&T, and Verizon. **Frequ
 
 ## OTA
 
+The [16 MB OTA migration guide](ota-migration.md) covers the opt-in
+A/B partition layout, startup verification, and rollback bench procedure.
+
 Use signed HTTPS firmware downloads, dual OTA partitions, rollback, and battery/vehicle-state prerequisites. Support self-hosted update URLs and prefer Wi-Fi for large updates when practical.

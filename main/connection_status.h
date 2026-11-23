@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "modem.h"
 
 typedef enum {
@@ -23,7 +25,7 @@ typedef enum {
     LTE_ROAMING,
 } lte_status_t;
 
-void start_gps(modem_t *modem);
+bool start_gps(modem_t *modem);
 gps_status_t read_gps(modem_t *modem, gps_fix_t *fix);
 const char *gps_label(gps_status_t status);
 lte_status_t read_lte_registration(modem_t *modem);
