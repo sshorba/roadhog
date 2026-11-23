@@ -1,10 +1,11 @@
 #include "provisioning.h"
 #include "owner_verification.h"
+#include "setup_button.h"
 
 #include <stddef.h>
 #include <string.h>
 
-#include "bootloader_random.h"
+#include "esp_timer.h"
 #include "esp_random.h"
 #include "mbedtls/constant_time.h"
 #include "mbedtls/platform_util.h"
@@ -27,7 +28,11 @@ typedef struct {
 static provisioning_state_t state;
 static config_record_t record;
 static char setup_token[SETUP_SECRET_LENGTH + 1];
-static bool claim_locked;
+static int64_t session_expires;
+static bool claim_locked, claim_saved;
+static config_record_t pending;
+static const int64_t session_duration = INT64_C(15) * 60 * 1000000;
+static const char factory_wifi_password[] = "012345678";
 
 bool provisioning_owner_valid(const char *owner)
 {
@@ -98,11 +103,9 @@ void provisioning_init(void)
         }
     } else if (error == ESP_ERR_NVS_NOT_FOUND &&
                namespace_absent("sms") && namespace_absent("portal_auth")) {
-        // Called before Wi-Fi, ADC use, or tasks serving the portal.
-        bootloader_random_enable();
-        generate_secret(record.wifi_password);
-        generate_secret(setup_token);
-        bootloader_random_disable();
+        if (setup_button_init() != ESP_OK) {
+            return;
+        }
         state = PROVISION_FACTORY;
     }
 }
@@ -121,7 +124,10 @@ const char *provisioning_apn(void)
 
 const char *provisioning_wifi_password(void)
 {
-    return state == PROVISION_CORRUPT ? NULL : record.wifi_password;
+    if (state == PROVISION_FACTORY) {
+        return factory_wifi_password;
+    }
+    return state == PROVISION_CONFIGURED ? record.wifi_password : NULL;
 }
 
 const password_record_t *provisioning_admin(void)
@@ -169,19 +175,47 @@ esp_err_t provisioning_save_admin(const password_record_t *admin)
     return error;
 }
 
-bool provisioning_setup_authorized(const char *token)
+static bool session_matches(const char *token)
 {
-    // The draft has no production interface that can disclose this secret.
-    // Its per-boot credential handoff requires separate physical review.
-    return state == PROVISION_FACTORY && !claim_locked &&
+    return state == PROVISION_FACTORY && esp_timer_get_time() < session_expires &&
            strnlen(token, sizeof(setup_token)) == SETUP_SECRET_LENGTH &&
            mbedtls_ct_memcmp(token, setup_token, SETUP_SECRET_LENGTH) == 0;
+}
+
+const char *provisioning_start_session(void)
+{
+    if (state != PROVISION_FACTORY || claim_locked || esp_timer_get_time() < session_expires) {
+        return NULL;
+    }
+    provisioning_cancel_claim();
+    generate_secret(setup_token); // The AP is running, so RF entropy is available.
+    session_expires = esp_timer_get_time() + session_duration;
+    return setup_token;
+}
+
+bool provisioning_setup_authorized(const char *token)
+{
+    return !claim_locked && session_matches(token);
+}
+
+void provisioning_cancel_claim(void)
+{
+    setup_button_cancel();
+    owner_verification_cancel();
+    mbedtls_platform_zeroize(&pending, sizeof(pending));
+}
+
+bool provisioning_setup_completed(const char *token)
+{
+    return claim_saved && session_matches(token);
 }
 
 esp_err_t provisioning_claim(const char *token, const char *owner, const char *apn,
                              const char *code, const password_record_t *admin)
 {
-    if (!provisioning_setup_authorized(token)) {
+    if (!provisioning_setup_authorized(token) ||
+        setup_button_state() == SETUP_BUTTON_WAITING ||
+        setup_button_state() == SETUP_BUTTON_CONFIRMED) {
         return ESP_ERR_INVALID_STATE;
     }
     if (!provisioning_owner_valid(owner) || !apn_valid(apn) || !admin_valid(admin)) {
@@ -190,15 +224,46 @@ esp_err_t provisioning_claim(const char *token, const char *owner, const char *a
     if (!owner_verification_consume(owner, code)) {
         return ESP_ERR_NOT_ALLOWED;
     }
-    config_record_t updated = {.version = 1, .admin = *admin};
-    strcpy(updated.owner, owner);
-    strcpy(updated.apn, apn);
-    memcpy(updated.wifi_password, record.wifi_password, sizeof(updated.wifi_password));
+    pending = (config_record_t){.version = 1, .admin = *admin};
+    strcpy(pending.owner, owner);
+    strcpy(pending.apn, apn);
+    generate_secret(pending.wifi_password);
+    // Give the authorized browser the entire confirmation window.
+    session_expires = esp_timer_get_time() + session_duration;
+    setup_button_arm();
+    return ESP_OK;
+}
 
-    // Lock out repeat claims even after an uncertain storage result.
+esp_err_t provisioning_finish_claim(const char *token, const char **wifi_password)
+{
+    if (provisioning_setup_completed(token)) {
+        *wifi_password = record.wifi_password;
+        return ESP_OK;
+    }
+    if (!provisioning_setup_authorized(token)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    switch (setup_button_state()) {
+    case SETUP_BUTTON_WAITING:
+        return ESP_ERR_NOT_FINISHED;
+    case SETUP_BUTTON_CONFIRMED:
+        break;
+    case SETUP_BUTTON_EXPIRED:
+        provisioning_cancel_claim();
+        return ESP_ERR_TIMEOUT;
+    default:
+        return ESP_ERR_NOT_ALLOWED;
+    }
+
+    // Repeat polls can retrieve the saved password but cannot repeat a write.
     claim_locked = true;
-    mbedtls_platform_zeroize(setup_token, sizeof(setup_token));
-    esp_err_t error = commit(&updated);
-    mbedtls_platform_zeroize(&updated, sizeof(updated));
+    esp_err_t error = commit(&pending);
+    if (error == ESP_OK) {
+        memcpy(record.wifi_password, pending.wifi_password, sizeof(record.wifi_password));
+        claim_saved = true;
+        session_expires = esp_timer_get_time() + session_duration;
+        *wifi_password = record.wifi_password;
+    }
+    provisioning_cancel_claim();
     return error;
 }

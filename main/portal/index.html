@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Road Hog Setup</title>
   <style>
+    [hidden] { display: none !important }
     *, *::before, *::after { box-sizing: border-box }
     body { margin: 0; min-height: 100vh; display: grid; place-items: center;
            padding: 1.25rem; background: #141815; color: #f2f3eb;
@@ -40,12 +41,8 @@
     <h1>Road Hog Setup</h1>
     <section id="factory" hidden>
       <h2>First-time setup</h2>
-      <p>Connect using the private setup Wi-Fi credential and enter the authorization code provided at the device.</p>
-      <form id="setup" method="post" action="/api/setup">
-        <label>Setup authorization code <input name="token" type="password" autocomplete="off"
-          required minlength="32" maxlength="32"></label>
-        <button id="read-sim" type="button">Read SIM phone number</button>
-        <dl><div><dt>SIM phone number</dt><dd id="setup-sim">Authorization required</dd></div></dl>
+      <button id="begin-setup" type="button">Start setup</button>
+      <form id="setup" method="post" action="/api/setup" hidden>
         <label>Owner SMS control number <input name="owner" type="tel" autocomplete="off"
           placeholder="+ followed by country code and number" required maxlength="16"></label>
         <button id="send-code" type="button">Send owner verification SMS</button>
@@ -59,8 +56,18 @@
           required minlength="12" maxlength="64"></label>
         <label>Confirm administrator password <input name="confirm" type="password" autocomplete="new-password"
           required minlength="12" maxlength="64"></label>
-        <button type="submit">Save setup</button>
+        <button type="submit">Verify SMS code</button>
       </form>
+      <div id="button-step" hidden>
+        <p role="status">SMS verified. Press and release the external setup button within 30 seconds.</p>
+        <button id="cancel-button" type="button">Cancel confirmation</button>
+      </div>
+      <div id="setup-saved" hidden>
+        <p>Save this Wi-Fi password for the configured device.</p>
+        <p><code id="configured-wifi"></code></p>
+        <dl><div><dt>SIM phone number</dt><dd id="setup-sim">Checking…</dd></div></dl>
+        <p>Restart Road Hög to activate the new settings.</p>
+      </div>
     </section>
     <section id="signin" hidden>
       <h2>Sign in</h2>
@@ -102,7 +109,15 @@
     const fields = ['lte', 'data', 'gps', 'sim'];
     const factory = document.getElementById('factory');
     const setup = document.getElementById('setup');
-    const readSim = document.getElementById('read-sim');
+    const beginSetup = document.getElementById('begin-setup');
+    const buttonStep = document.getElementById('button-step');
+    const cancelButton = document.getElementById('cancel-button');
+    const setupSaved = document.getElementById('setup-saved');
+    let setupToken = '';
+    function rememberSetupToken(token) {
+      setupToken = token;
+      try { sessionStorage.setItem('roadhogSetupToken', token); } catch {}
+    }
     let setupMode = false;
     let pending = false;
     let generation = 0;
@@ -212,26 +227,6 @@
       if (await submit('/api/logout', '', logout)) showSignin();
     });
 
-    readSim.addEventListener('click', async () => {
-      if (pending || !setup.elements.token.reportValidity()) return;
-      pending = true;
-      readSim.disabled = true;
-      const display = document.getElementById('setup-sim');
-      display.textContent = 'Checking…';
-      message('');
-      try {
-        const response = await request('/api/setup/sim', { method: 'POST', body: setup.elements.token.value });
-        const text = await response.text();
-        display.textContent = response.ok ? text : 'Authorization required';
-        if (!response.ok) message(text);
-      } catch {
-        display.textContent = 'Could not read the SIM number';
-      } finally {
-        pending = false;
-        readSim.disabled = false;
-      }
-    });
-
     const sendCode = document.getElementById('send-code');
     const changeOwner = document.getElementById('change-owner');
     const retryLater = document.getElementById('retry-later');
@@ -243,7 +238,7 @@
       try {
         if (!pending) {
           const response = await request('/api/setup', {
-            method: 'POST', body: setup.elements.token.value + '\nstatus'
+            method: 'POST', body: setupToken + '\nstatus'
           });
           const text = await response.text();
           if (current !== verificationGeneration) return;
@@ -259,9 +254,9 @@
     }
 
     sendCode.addEventListener('click', async () => {
-      const { token, owner, code } = setup.elements;
-      if (!token.reportValidity() || !owner.reportValidity()) return;
-      if (await submit('/api/setup', [token.value, 'send', owner.value].join('\n'), sendCode)) {
+      const { owner, code } = setup.elements;
+      if (!setupToken || !owner.reportValidity()) return;
+      if (await submit('/api/setup', [setupToken, 'send', owner.value].join('\n'), sendCode)) {
         owner.readOnly = true;
         code.value = '';
         sendCode.textContent = 'Resend owner verification SMS';
@@ -271,8 +266,10 @@
     });
 
     async function cancelVerification(control) {
-      if (await submit('/api/setup', setup.elements.token.value + '\ncancel', control)) {
+      if (await submit('/api/setup', setupToken + '\ncancel', control)) {
         verificationGeneration++;
+        buttonStep.hidden = true;
+        setup.hidden = false;
         setup.elements.owner.readOnly = false;
         setup.elements.code.value = '';
         sendCode.textContent = 'Send owner verification SMS';
@@ -291,19 +288,90 @@
     });
     retryLater.addEventListener('click', () => cancelVerification(retryLater));
 
+    cancelButton.addEventListener('click', () => cancelVerification(cancelButton));
+
+    async function finishSetup(resume = false) {
+      if (pending) return;
+      pending = true;
+      cancelButton.disabled = true;
+      let retry = false;
+      try {
+        const response = await request('/api/setup', { method: 'POST', body: setupToken + '\nfinish' });
+        const text = await response.text();
+        if (response.status === 202) {
+          setup.hidden = true;
+          buttonStep.hidden = false;
+          retry = true;
+        } else if (response.ok) {
+          setup.reset();
+          setup.hidden = buttonStep.hidden = true;
+          document.getElementById('configured-wifi').textContent = text;
+          setupSaved.hidden = false;
+          message('');
+          try {
+            const sim = await request('/api/setup/sim', { method: 'POST', body: setupToken });
+            document.getElementById('setup-sim').textContent = sim.ok ? await sim.text() : 'Unavailable';
+          } catch {
+            document.getElementById('setup-sim').textContent = 'Unavailable';
+          }
+        } else {
+          buttonStep.hidden = true;
+          setup.hidden = response.status === 403 || response.status >= 500;
+          if (response.status === 403) {
+            rememberSetupToken('');
+            beginSetup.hidden = false;
+          }
+          if (!resume || response.status !== 409) message(text);
+        }
+      } catch {
+        message('Can’t check button confirmation. Check your Wi-Fi connection.');
+        retry = true;
+      } finally {
+        pending = false;
+        cancelButton.disabled = false;
+      }
+      if (retry) setTimeout(() => {
+        if (!buttonStep.hidden || resume) finishSetup(resume);
+      }, 1000);
+    }
+
+    beginSetup.addEventListener('click', async () => {
+      if (pending) return;
+      pending = true;
+      beginSetup.disabled = true;
+      try {
+        const response = await request('/api/setup', { method: 'POST', body: 'session' });
+        const token = await response.text();
+        if (!response.ok) {
+          message(token);
+          return;
+        }
+        rememberSetupToken(token);
+        beginSetup.hidden = true;
+        setup.hidden = false;
+        message('');
+      } catch {
+        message('Can’t start setup. Check your Wi-Fi connection.');
+      } finally {
+        pending = false;
+        beginSetup.disabled = false;
+      }
+    });
+
     setup.addEventListener('submit', async event => {
       event.preventDefault();
-      const { token, owner, code, apn, admin, confirm } = setup.elements;
+      const { owner, code, apn, admin, confirm } = setup.elements;
       if (admin.value !== confirm.value) {
         message('The administrator passwords do not match.');
         return;
       }
-      if (await submit('/api/setup', [token.value, 'confirm', owner.value, code.value, apn.value, admin.value].join('\n'),
+      if (await submit('/api/setup', [setupToken, 'confirm', owner.value, code.value, apn.value, admin.value].join('\n'),
                        event.submitter)) {
         verificationGeneration++;
-        setup.reset();
+        code.value = admin.value = confirm.value = '';
         setup.hidden = true;
-        message('Setup saved. Restart Road Hög to enable the new settings.');
+        buttonStep.hidden = false;
+        await finishSetup();
       }
     });
 
@@ -313,7 +381,16 @@
         if (!response.ok) throw new Error('Setup state unavailable');
         setupMode = await response.text() === 'factory';
         factory.hidden = !setupMode;
-        if (!setupMode) poll();
+        if (!setupMode) {
+          rememberSetupToken('');
+          poll();
+        } else {
+          try { setupToken = sessionStorage.getItem('roadhogSetupToken') || ''; } catch {}
+          if (setupToken) {
+            beginSetup.hidden = true;
+            await finishSetup(true);
+          }
+        }
       } catch {
         message('Can’t read setup state. Check your Wi-Fi connection.');
       }

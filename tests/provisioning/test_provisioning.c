@@ -6,6 +6,7 @@
 
 #include "provisioning.h"
 #include "owner_verification.h"
+#include "setup_button.h"
 
 typedef unsigned nvs_handle_t;
 enum { NVS_READONLY, NVS_READWRITE };
@@ -17,8 +18,6 @@ static unsigned writes;
 static uint8_t entropy;
 
 static esp_err_t nvs_flash_init(void) { return init_error ? ESP_FAIL : ESP_OK; }
-static void bootloader_random_enable(void) {}
-static void bootloader_random_disable(void) {}
 
 static void esp_fill_random(uint8_t *dst, size_t length)
 {
@@ -89,6 +88,63 @@ static int64_t clock_us;
 static uint32_t random_value;
 static int64_t esp_timer_get_time(void) { return clock_us; }
 static uint32_t esp_random(void) { return ++random_value; }
+
+enum { GPIO_NUM_4 = 4, GPIO_MODE_INPUT = 1, GPIO_PULLUP_ENABLE = 1,
+       GPIO_PULLDOWN_DISABLE = 0, GPIO_INTR_DISABLE = 0 };
+#define CONFIG_ROADHOG_STATUS_LED_GPIO 38
+typedef struct { uint64_t pin_bit_mask; int mode, pull_up_en, pull_down_en, intr_type; } gpio_config_t;
+typedef struct {
+    void (*callback)(void *);
+    const char *name;
+    bool skip_unhandled_events;
+} esp_timer_create_args_t;
+typedef unsigned esp_timer_handle_t;
+static bool pin_high;
+static unsigned button_inits;
+
+static esp_err_t gpio_config(const gpio_config_t *config)
+{
+    assert(config->pin_bit_mask == (1U << GPIO_NUM_4) && config->mode == GPIO_MODE_INPUT);
+    assert(config->pull_up_en == GPIO_PULLUP_ENABLE && config->pull_down_en == GPIO_PULLDOWN_DISABLE);
+    assert(config->intr_type == GPIO_INTR_DISABLE);
+    ++button_inits;
+    return ESP_OK;
+}
+
+static int gpio_get_level(int pin) { assert(pin == GPIO_NUM_4); return pin_high; }
+
+static esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *timer)
+{
+    assert(args->callback && args->name && args->skip_unhandled_events);
+    *timer = 1;
+    return ESP_OK;
+}
+
+static esp_err_t esp_timer_start_periodic(esp_timer_handle_t timer, uint64_t interval)
+{
+    assert(timer == 1 && interval == 10000);
+    return ESP_OK;
+}
+
+static void esp_timer_delete(esp_timer_handle_t timer) { assert(timer == 1); }
+
+#include "setup_button_under_test.inc"
+
+static void sample(bool high, int64_t elapsed)
+{
+    clock_us += elapsed;
+    pin_high = high;
+    sample_button(NULL);
+}
+
+static void press_button(void)
+{
+    sample(true, SAMPLE_US);
+    sample(true, DEBOUNCE_US);
+    sample(false, SAMPLE_US);
+    sample(false, DEBOUNCE_US);
+    assert(setup_button_state() == SETUP_BUTTON_CONFIRMED);
+}
 
 #include "owner_verification_under_test.inc"
 #include "provisioning_under_test.inc"
@@ -161,7 +217,10 @@ typedef struct {
 static void reboot(void)
 {
     state = PROVISION_CORRUPT;
-    claim_locked = false;
+    claim_locked = claim_saved = false;
+    session_expires = 0;
+    memset(&pending, 0, sizeof(pending));
+    setup_button_cancel();
     memset(&record, 0, sizeof(record));
     memset(setup_token, 0, sizeof(setup_token));
     clear(OWNER_VERIFY_IDLE);
@@ -191,18 +250,17 @@ int main(void)
     assert(!provisioning_admin() && !provisioning_owner() && !provisioning_apn());
     sms_control_t sms = {.owner = provisioning_owner(), .users = {"+5678"}};
     assert(!sms_sender_allowed(&sms, "+5678"));
-    assert(strlen(provisioning_wifi_password()) == SETUP_SECRET_LENGTH);
-    strcpy(token, setup_token);
-    strcpy(ap_key, provisioning_wifi_password());
-    assert(strcmp(token, ap_key));
-    assert(provisioning_claim(ap_key, "+1234", "example.apn", "", &admin) == ESP_ERR_INVALID_STATE);
+    assert(!strcmp(provisioning_wifi_password(), "012345678"));
+    assert(!provisioning_setup_authorized(""));
+    strcpy(token, provisioning_start_session());
+    assert(!provisioning_start_session());
+    assert(provisioning_claim("012345678", "+1234", "example.apn", "", &admin) == ESP_ERR_INVALID_STATE);
     assert(provisioning_claim(token, "1234", "example.apn", "", &admin) == ESP_ERR_INVALID_ARG);
     assert(provisioning_claim(token, "+1234", "x\rAT", "", &admin) == ESP_ERR_INVALID_ARG);
     assert(!writes);
     reboot();
     assert(provisioning_state() == PROVISION_FACTORY && !provisioning_setup_authorized(token));
-    strcpy(token, setup_token);
-    strcpy(ap_key, provisioning_wifi_password());
+    strcpy(token, provisioning_start_session());
     assert(provisioning_claim(token, "+1234", "example.apn", "000000", &admin) == ESP_ERR_NOT_ALLOWED);
     owner_verify_message_t sent = deliver("+1234", true);
     assert(provisioning_claim(token, "+5678", "example.apn", sent.code, &admin) == ESP_ERR_NOT_ALLOWED);
@@ -212,8 +270,38 @@ int main(void)
     assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_OK);
     assert(!provisioning_owner());
     assert(provisioning_claim(token, "+5678", "example.apn", "", &admin) == ESP_ERR_INVALID_STATE);
-    assert(writes == 1);
+    const char *saved_wifi;
+    assert(provisioning_finish_claim(token, &saved_wifi) == ESP_ERR_NOT_FINISHED);
+    assert(!writes);
+    // A button held at window start cannot count. Release must be stable.
+    sample(false, SAMPLE_US);
+    sample(false, DEBOUNCE_US);
+    assert(setup_button_state() == SETUP_BUTTON_WAITING);
+    sample(true, SAMPLE_US);
+    sample(false, SAMPLE_US);
+    sample(false, DEBOUNCE_US);
+    assert(setup_button_state() == SETUP_BUTTON_WAITING);
+    // After a stable release, a brief low glitch still cannot confirm.
+    sample(true, SAMPLE_US);
+    sample(true, DEBOUNCE_US);
+    sample(false, SAMPLE_US);
+    sample(true, SAMPLE_US);
+    assert(setup_button_state() == SETUP_BUTTON_WAITING);
+    press_button();
+    assert(!writes);
+    assert(provisioning_finish_claim("another-session", &saved_wifi) == ESP_ERR_INVALID_STATE);
+    assert(!writes);
+    assert(provisioning_finish_claim(token, &saved_wifi) == ESP_OK);
+    assert(strlen(saved_wifi) == SETUP_SECRET_LENGTH && strcmp(saved_wifi, "012345678"));
+    strcpy(ap_key, saved_wifi);
+    assert(provisioning_finish_claim(token, &saved_wifi) == ESP_OK);
+    assert(provisioning_setup_completed(token) && writes == 1);
+    unsigned previous_inits = button_inits;
     reboot();
+    assert(button_inits == previous_inits && !provisioning_start_session());
+    sample(false, 2 * DEBOUNCE_US);
+    sample(true, 2 * DEBOUNCE_US);
+    assert(writes == 1 && setup_button_state() == SETUP_BUTTON_IDLE);
     assert(provisioning_state() == PROVISION_CONFIGURED);
     assert(!strcmp(provisioning_owner(), "+1234") && !strcmp(provisioning_apn(), "example.apn"));
     sms.owner = provisioning_owner();
@@ -253,23 +341,56 @@ int main(void)
 
     fresh_flash();
     set_error = true;
-    strcpy(token, setup_token);
+    strcpy(token, provisioning_start_session());
     sent = deliver("+1234", true);
-    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_FAIL);
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_OK);
+    press_button();
+    assert(provisioning_finish_claim(token, &saved_wifi) == ESP_FAIL);
     assert(!provisioning_owner() && !provisioning_setup_authorized(token));
     reboot();
     assert(provisioning_state() == PROVISION_CORRUPT);
 
     fresh_flash();
     commit_error = true;
-    strcpy(token, setup_token);
+    strcpy(token, provisioning_start_session());
     sent = deliver("+1234", true);
-    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_FAIL);
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_OK);
+    press_button();
+    assert(provisioning_finish_claim(token, &saved_wifi) == ESP_FAIL);
     assert(!provisioning_owner() && !provisioning_setup_authorized(token));
     // A commit error can follow a durable write. Only a validated record
     // loaded on reboot may enable SMS or administrator authentication.
     reboot();
     assert(provisioning_state() == PROVISION_CONFIGURED);
+    fresh_flash();
+    strcpy(token, provisioning_start_session());
+    // A complete press before arming is ignored.
+    sample(true, SAMPLE_US);
+    sample(false, DEBOUNCE_US);
+    sample(true, DEBOUNCE_US);
+    sent = deliver("+1234", true);
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_OK);
+    sample(true, SAMPLE_US);
+    sample(true, DEBOUNCE_US);
+    clock_us = expires - 1;
+    sample(false, 0);
+    sample(false, DEBOUNCE_US);
+    assert(provisioning_finish_claim(token, &saved_wifi) == ESP_ERR_TIMEOUT && !writes);
+    clock_us += SEND_INTERVAL;
+    sent = deliver("+1234", true);
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_OK);
+    press_button();
+    provisioning_cancel_claim();
+    assert(provisioning_finish_claim(token, &saved_wifi) == ESP_ERR_NOT_ALLOWED && !writes);
+    clock_us += SEND_INTERVAL;
+    sent = deliver("+1234", true);
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_OK);
+    reboot();
+    assert(provisioning_finish_claim(token, &saved_wifi) == ESP_ERR_INVALID_STATE && !writes);
+    strcpy(token, provisioning_start_session());
+    clock_us = session_expires;
+    assert(provisioning_start_session() && !provisioning_setup_authorized(token));
+
     fresh_flash();
     sent = deliver("+1234", false);
     assert(owner_verification_status() == OWNER_VERIFY_FAILED);
@@ -328,5 +449,5 @@ int main(void)
     sms_owner_verification_service(&modem);
     assert(owner_verification_status() == OWNER_VERIFY_SENT && modem.attempts == 2);
     assert(!provisioning_owner() && !writes);
-    puts("Provisioning, SMS PDU delivery, challenge lifecycle, NVS errors and reboot persistence passed");
+    puts("Provisioning, GPIO4 debounce and session binding, SMS challenge and reboot tests passed");
 }

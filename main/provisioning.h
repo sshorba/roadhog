@@ -23,6 +23,10 @@ const char *provisioning_apn(void);
 const char *provisioning_wifi_password(void);
 const password_record_t *provisioning_admin(void);
 esp_err_t provisioning_save_admin(const password_record_t *admin);
+const char *provisioning_start_session(void);
+bool provisioning_setup_completed(const char *token);
+void provisioning_cancel_claim(void);
+esp_err_t provisioning_finish_claim(const char *token, const char **wifi_password);
 bool provisioning_setup_authorized(const char *token);
 esp_err_t provisioning_claim(const char *token, const char *owner, const char *apn,
                              const char *code, const password_record_t *admin);

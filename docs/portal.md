@@ -1,12 +1,12 @@
 # Wi-Fi setup portal
 
-On a factory device the WPA2 setup AP starts on boot and stays up while
-the device remains unprovisioned. It accepts one station. The first-run
-wizard collects an E.164 owner SMS number, carrier APN and a separate
-administrator password. Request an SMS to the owner number, then enter its
-six-digit verification code before saving. The protected setup channel and one-use authorization
-code are required. The draft has no credential handoff mechanism pending
-physical security review. See [factory provisioning](factory-provisioning.md).
+On a factory device the WPA2 setup AP starts on boot with password
+`012345678`, accepts one station, and stays up until a provisioned reboot.
+Select **Start setup**, enter the E.164 owner number, carrier APN and a
+separate administrator password, and verify the code sent by SMS. When your
+own browser prompts you, press the external GPIO4 setup button within 30
+seconds. Save the new configured-device Wi-Fi password shown after the
+write and restart. See [factory provisioning](factory-provisioning.md).
 
 On a configured device the setup AP starts off while the modem checks LTE registration. When the
 modem is registered, the owner can text `APON` to enable it or `APOFF` to
@@ -20,8 +20,8 @@ The fallback uses cellular registration and does not depend on an active data
 context or internet access.
 
 When enabled, the network is `ROADHOG-XXXX`, using the last four hexadecimal
-characters of the Wi-Fi AP MAC address. The WPA2 network uses the device
-setup Wi-Fi credential and supplies an IPv4 address, gateway and DNS by DHCP.
+characters of the Wi-Fi AP MAC address. The configured WPA2 network uses its generated
+Wi-Fi credential and supplies an IPv4 address, gateway and DNS by DHCP.
 
 Join the network on a phone or laptop. Phones that use HTTP captive network
 checks should offer to open the setup page. If the prompt does not appear,

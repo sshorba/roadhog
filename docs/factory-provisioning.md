@@ -2,27 +2,27 @@
 
 Issue #11 is independent of the GitHub Releases installer. This draft
 implements device state, credential storage, protected portal, wizard, SMS
-gating and read-only SIM number display. Credential handoff and the destructive
-prototype reset procedure are pending review.
+gating and read-only SIM number display. The external setup button authorizes the final claim. The destructive
+prototype reset procedure remains pending review.
 
 ## Boot and claim state
 
 | State | Expected behavior |
 | --- | --- |
-| Factory | The application settings and prior ownership namespaces are absent. Start WPA2 AP with a per-boot random Wi-Fi passphrase, allow one station, and leave it up until a provisioned reboot. SMS is disabled. |
+| Factory | The application settings and prior ownership namespaces are absent. Start the WPA2 AP with the factory password `012345678`, allow one station, and leave it up until a provisioned reboot. SMS is disabled. |
 | Configured | The versioned settings blob parses and validates. Use the stored owner, APN, administrator hash and Wi-Fi credential. Switch to the configured AP lifecycle. Load additional users from the existing SMS namespace. |
 | Recovery required | NVS failed, the settings namespace is present without a valid record, or legacy ownership data exists without settings. Do not open a claimable AP or accept SMS. Log only the setup/validation failure. |
 
-The wizard requires the physically handed-off setup authorization code over
-the private AP. With that code, the owner requests an SMS for the proposed
-E.164 number and enters the six-digit code from the message. The SIM number
+Join the factory AP and select **Start setup**. One browser setup session
+can request an SMS for the proposed E.164 number and submit the six-digit
+code from the message. The SIM number
 display is independent of the proposed destination.
 
 - The normal AT loop sends a GSM 7-bit PDU to the pending number after LTE
   registration. The HTTP task queues requests and reads status. It never
   controls the UART. Modem acceptance only means it accepted submission.
 - The firmware generates the challenge with the ESP32 RNG while Wi-Fi is
-  active. It is bound to the recipient and the single per-boot setup session.
+  active. It is bound to the recipient and the active browser setup session.
   A queued request expires after 90 seconds. A successfully submitted code
   expires after five minutes. Verification allows five failures per code and
   at most one guess per second. The code, destination and SMS payload stay
@@ -36,16 +36,20 @@ display is independent of the proposed destination.
   destination, then retry after the cooldown. An undelivered SMS can be
   resent even after modem acceptance. If the modem's AT stream is faulted,
   restart the modem and ESP32 in the documented order. A restart discards
-  pending verification and resets the in-memory limits, with fresh physical
-  setup credentials required. The AP stays up throughout setup.
+  pending verification and resets the in-memory limits. Start a new
+  browser setup session after restart. The AP stays up throughout setup.
 
 The proposed owner and administrator remain unprivileged during verification.
-Only a valid, matching, unused code permits the server to commit the versioned
-`device_cfg/settings_v1` blob with the owner, APN, Wi-Fi credential and salted
-PBKDF2-HMAC-SHA-256 administrator hash. The server checks readback and consumes
-the setup authorization even if the write outcome is uncertain. The saved
-settings become active on reboot. Unreadable or incomplete data requires local
-recovery review. Repeat submissions cannot replace an owner.
+Valid SMS verification freezes the owner, APN and administrator hash for the
+pending session and opens a 30-second physical confirmation window. The
+browser prompts the user to press the button, then requests the commit using
+its original session token. Only then does the server commit and read back
+`device_cfg/settings_v1`. The record includes a randomly generated configured
+Wi-Fi password, displayed to that browser after a successful write. Save it
+before restarting. The device keeps the factory AP until reboot, when the
+saved credentials and owner take effect. An uncertain write locks the session
+and requires a reboot. Repeat completion requests may retrieve the configured
+Wi-Fi password without repeating the write.
 
 The normal password change uses the same record and preserves its owner,
 APN and Wi-Fi credential. No default owner or administrator password is
@@ -58,29 +62,37 @@ are recoverable from plaintext NVS on a device without flash/NVS encryption.
 Neither an application reset nor this wizard changes eFuses or enables secure
 boot, flash encryption or NVS encryption.
 
-## Physical authorization to review
+## External setup button
 
-The build generates independent 128-bit Wi-Fi and setup secrets with ESP32-S3
-hardware entropy before the radio starts. It has no production route to reveal
-those secrets. The indefinite AP and token-gated wizard can be tested with
-controlled fixtures. An approved local handoff is required before an owner
-can join and claim on hardware.
+Wire a normally open momentary switch between **GPIO4** and **GND**. GPIO4
+uses an internal pull-up and reads low while pressed. The DevKitC-1 v1.1
+exposes GPIO4 on J1 pin 4. The modem UART uses GPIO17/18 and the board LED
+uses GPIO38 or GPIO48, depending on revision. The firmware rejects a build
+that assigns the status LED to GPIO4. Confirm the prototype's physical wiring
+before powering or testing the switch. [Espressif board guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html#header-block)
 
-For the bench, consider a deliberate local action after firmware has booted,
-followed by a short-lived credential handoff through supervised wired access.
-Prefer a dedicated non-strapping input for production. The DevKitC-1 BOOT
-button is wired for download mode. GPIO0 held at reset, and USB bridge
-DTR/RTS activity, can affect boot selection. A BOOT-based bench proposal needs
-actual board revision, wiring, debounce, reset and serial bridge validation
-before approval. Do not make an ordinary reboot or a held-at-startup pin
-authorize setup. Avoid routine console logging of tokens or passphrases.
-A protected fixture or another deliberate local interface could deliver
-credentials to the physically present owner. Decide the handoff, expiration,
-and whether to require application-level TLS before production use. The draft
-uses HTTP inside WPA2 link protection with AP address, Host and Origin checks.
-Another party trusted with the AP credential is inside that trust boundary.
+The input is configured only on a factory boot. After SMS verification,
+the sampler requires 40 ms of stable release followed by 40 ms of stable
+press before the deadline. A press before the window, a button held when the
+window opens, contact bounce and a late press cannot authorize setup. A
+configured device has no button-driven erase or reset behavior.
 
-[Espressif board guide](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s3/esp32-s3-devkitc-1/user_guide_v1.1.html) · [ESP32-S3 boot mode selection](https://docs.espressif.com/projects/esptool/en/latest/esp32s3/advanced-topics/boot-mode-selection.html)
+The setup session uses an unpredictable token with a 15-minute lifetime.
+Arming the button gives the same browser a fresh session interval and the
+full 30-second button window. Cancel or reboot discards the pending settings.
+A lost browser session can be restarted once it expires, or by rebooting an
+unprovisioned device. A fresh button press is required for the replacement
+session after it verifies SMS. Only the browser that submitted the verified
+settings can finish the pending claim or read its result.
+
+The factory password is deliberately shared. The setup portal uses HTTP
+over that Wi-Fi and checks the local address, Host and Origin. The shared
+password does not authenticate the owner or protect against another party
+that knows it and can capture or interfere with local traffic. Run initial
+setup in a controlled location and press the button only when your own
+browser prompts you. Review application-level transport protection before
+relying on setup around untrusted parties. Configured devices use the
+generated Wi-Fi password and existing administrator login and AP timeout.
 
 ## SIM number and OTA behavior
 
@@ -91,8 +103,8 @@ national number or a validated international number. Ambiguous multiple
 entries, unsupported responses, malformed or absent values show
 “Not available from SIM/carrier.” This field is independent of LTE service
 and the owner number. The dashboard requires administrator authentication.
-The wizard requires its setup authorization code before reading the cached
-value. The GUI renders it as text.
+The wizard shows the cached value only in the successfully confirmed
+setup session. The GUI renders it as text.
 
 [SIMCom SIM7500/SIM7600 AT Command Manual, section 6.2.5](https://www.waveshare.net/w/upload/6/68/SIM7500_SIM7600_Series_AT_Command_Manual_V2.00.pdf)
 
@@ -137,9 +149,8 @@ leaves the compiled owner bytes on flash.
    the inventory proves no other needed data exists. A reset must never
    silently carry old additional-user grants to a new owner. An ordinary
    firmware update or reboot preserves `users_v1`.
-4. Boot only after verified readback and the authorized claim mechanism are
-   ready. Verify persistent protected AP, lack of SMS authorization, rejected
-   unauthenticated claims and SIM reads, successful local SMS verification and setup, power-cycle
+4. Boot only after verified readback and the external button and its wiring have been reviewed. Verify persistent protected AP, lack of SMS authorization, rejected
+   unauthenticated claims and SIM reads, SMS verification followed by the fresh GPIO4 press, power-cycle
    persistence, normal AP timeout, owner-only SMS permissions, and rollback
    to a generic image. For recovery, restore the verified matching firmware,
    configuration and OTA metadata only under owner approval.
@@ -158,6 +169,6 @@ python3 tests/ota_boot_health/run_sdk_lifecycle.py /path/to/esp-idf-v6.1.1
 
 The host fixtures exercise factory, configured, legacy and corrupt
 classification, authorization and repeat claims, SMS sender and owner-only
-checks, SMS PDU encoding and modem failure handling, resend and guess limits, expiration, replay, write failures, interrupted states, reboot and SIM parsing. Physical authorization, AP lifetime on the
-radio, actual NVS power-loss behavior and hardware OTA rollback require
-bench validation after review.
+checks, SMS PDU encoding and modem failure handling, resend and guess limits, expiration, replay, write failures, interrupted states, reboot and SIM parsing. The button fixture covers a held input, contact bounce, pre-window and late presses,
+expiry, cancellation, session mismatch and single-write completion. Verify actual
+GPIO wiring, radio behavior, NVS power loss and hardware rollback on the bench.

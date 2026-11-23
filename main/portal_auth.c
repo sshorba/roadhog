@@ -1,6 +1,7 @@
 #include "portal_auth.h"
 #include "provisioning.h"
 #include "owner_verification.h"
+#include "setup_button.h"
 #include "portal.h"
 
 #include <stdint.h>
@@ -170,6 +171,10 @@ static bool receive_body(httpd_req_t *request, char *body, size_t length)
 static esp_err_t verification_action(httpd_req_t *request, const char *action, const char *body)
 {
     if (!strcmp(action, "send") && body && !strchr(body, '\n')) {
+        setup_button_state_t button = setup_button_state();
+        if (button == SETUP_BUTTON_WAITING || button == SETUP_BUTTON_CONFIRMED) {
+            return auth_response(request, "409 Conflict", "Cancel button confirmation before requesting another code.");
+        }
         esp_err_t error = owner_verification_request(body);
         if (error == ESP_OK) {
             return auth_response(request, "202 Accepted", "Waiting for the modem to send the code.");
@@ -181,7 +186,7 @@ static esp_err_t verification_action(httpd_req_t *request, const char *action, c
                              "Wait at least a minute between requests. Up to five sends per 15 minutes.");
     }
     if (!strcmp(action, "cancel") && !body) {
-        owner_verification_cancel();
+        provisioning_cancel_claim();
         return auth_response(request, "200 OK", "Verification canceled.");
     }
     if (!strcmp(action, "status") && !body) {
@@ -199,6 +204,25 @@ static esp_err_t verification_action(httpd_req_t *request, const char *action, c
     return auth_response(request, "400 Bad Request", "Invalid verification request.");
 }
 
+static esp_err_t finish_setup(httpd_req_t *request, const char *token)
+{
+    const char *wifi_password;
+    switch (provisioning_finish_claim(token, &wifi_password)) {
+    case ESP_OK:
+        return auth_response(request, "200 OK", wifi_password);
+    case ESP_ERR_NOT_FINISHED:
+        return auth_response(request, "202 Accepted", "Waiting for the external setup button.");
+    case ESP_ERR_TIMEOUT:
+        return auth_response(request, "408 Request Timeout", "Button window expired. Request a new SMS code.");
+    case ESP_ERR_NOT_ALLOWED:
+        return auth_response(request, "409 Conflict", "No setup confirmation is pending.");
+    case ESP_ERR_INVALID_STATE:
+        return auth_response(request, "403 Forbidden", "Setup session unavailable. Restart setup if needed.");
+    default:
+        return auth_response(request, "500 Internal Server Error", "Setup could not be saved. Restart the device before retrying.");
+    }
+}
+
 static esp_err_t setup_post(httpd_req_t *request, bool show_sim)
 {
     char body[SETUP_SECRET_LENGTH + OWNER_CAPACITY + APN_CAPACITY + ADMIN_PASSWORD_MAX +
@@ -209,18 +233,28 @@ static esp_err_t setup_post(httpd_req_t *request, bool show_sim)
         result = auth_response(request, "400 Bad Request", "Invalid setup request.");
         goto done;
     }
-    char *rest = body;
-    const char *token = strsep(&rest, "\n");
-    if (!provisioning_setup_authorized(token)) {
-        result = auth_response(request, "403 Forbidden", "Physical setup authorization is required.");
+    if (!show_sim && !strcmp(body, "session")) {
+        const char *session_token = provisioning_start_session();
+        result = session_token ? auth_response(request, "201 Created", session_token) :
+                 auth_response(request, "409 Conflict", "A setup session is already active, or the device is configured.");
         goto done;
     }
-    if (show_sim || !rest) {
-        result = show_sim && !rest ? portal_sim_response(request) :
-                 auth_response(request, "400 Bad Request", "Invalid setup request.");
+    char *rest = body;
+    const char *token = strsep(&rest, "\n");
+    if (show_sim) {
+        result = !rest && provisioning_setup_completed(token) ? portal_sim_response(request) :
+                 auth_response(request, "403 Forbidden", "Complete setup to view the SIM phone number.");
         goto done;
     }
     const char *action = strsep(&rest, "\n");
+    if (action && !strcmp(action, "finish") && !rest) {
+        result = finish_setup(request, token);
+        goto done;
+    }
+    if (!action || !provisioning_setup_authorized(token)) {
+        result = auth_response(request, "403 Forbidden", "Start or resume setup in this browser.");
+        goto done;
+    }
     if (strcmp(action, "confirm")) {
         result = verification_action(request, action, rest);
         goto done;
@@ -238,9 +272,11 @@ static esp_err_t setup_post(httpd_req_t *request, bool show_sim)
                       ? provisioning_claim(token, owner, apn, code, &updated) : ESP_FAIL;
     mbedtls_platform_zeroize(&updated, sizeof(updated));
     if (error == ESP_OK) {
-        result = auth_response(request, "200 OK", "Saved. Restart the device to enable the new settings.");
+        result = auth_response(request, "202 Accepted", "SMS verified. Press the external setup button within 30 seconds.");
     } else if (error == ESP_ERR_NOT_ALLOWED) {
         result = auth_response(request, "403 Forbidden", "Code not verified. Check the number and code, wait a second before retrying, or request a new code.");
+    } else if (error == ESP_ERR_INVALID_STATE) {
+        result = auth_response(request, "409 Conflict", "A button confirmation is already pending, or setup has ended.");
     } else if (error == ESP_ERR_INVALID_ARG) {
         result = auth_response(request, "400 Bad Request", "Enter a valid E.164 owner number and carrier APN.");
     } else {

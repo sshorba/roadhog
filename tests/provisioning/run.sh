@@ -4,6 +4,7 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -r "$tmp"' EXIT
 # ESP-IDF APIs are supplied by the NVS fixture. Compile the production logic.
+sed '/^#include "/d' "$root/main/setup_button.c" > "$tmp/setup_button_under_test.inc"
 sed '/^#include "/d' "$root/main/provisioning.c" > "$tmp/provisioning_under_test.inc"
 sed '/^#include "/d' "$root/main/owner_verification.c" > "$tmp/owner_verification_under_test.inc"
 sed -n '/^bool sms_number_valid/,/^bool sms_users_load/{ /^bool sms_users_load/!p; }
