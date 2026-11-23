@@ -48,6 +48,12 @@
         <dl><div><dt>SIM phone number</dt><dd id="setup-sim">Authorization required</dd></div></dl>
         <label>Owner SMS control number <input name="owner" type="tel" autocomplete="off"
           placeholder="+ followed by country code and number" required maxlength="16"></label>
+        <button id="send-code" type="button">Send owner verification SMS</button>
+        <button id="change-owner" type="button" hidden>Change number</button>
+        <button id="retry-later" type="button" hidden>Retry later</button>
+        <p id="verification-status" role="status"></p>
+        <label>Owner verification code <input name="code" type="text" inputmode="numeric"
+          autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label>
         <label>Carrier APN <input name="apn" autocomplete="off" required maxlength="100"></label>
         <label>Administrator password <input name="admin" type="password" autocomplete="new-password"
           required minlength="12" maxlength="64"></label>
@@ -226,15 +232,75 @@
       }
     });
 
+    const sendCode = document.getElementById('send-code');
+    const changeOwner = document.getElementById('change-owner');
+    const retryLater = document.getElementById('retry-later');
+    const verificationStatus = document.getElementById('verification-status');
+    let verificationGeneration = 0;
+
+    async function watchVerification(current) {
+      if (current !== verificationGeneration) return;
+      try {
+        if (!pending) {
+          const response = await request('/api/setup', {
+            method: 'POST', body: setup.elements.token.value + '\nstatus'
+          });
+          const text = await response.text();
+          if (current !== verificationGeneration) return;
+          verificationStatus.textContent = response.ok ? text : 'Verification status unavailable.';
+          if (response.status === 403) return;
+        }
+      } catch {
+        if (current === verificationGeneration) {
+          verificationStatus.textContent = 'Verification status unavailable. Check your Wi-Fi connection.';
+        }
+      }
+      setTimeout(() => watchVerification(current), 3000);
+    }
+
+    sendCode.addEventListener('click', async () => {
+      const { token, owner, code } = setup.elements;
+      if (!token.reportValidity() || !owner.reportValidity()) return;
+      if (await submit('/api/setup', [token.value, 'send', owner.value].join('\n'), sendCode)) {
+        owner.readOnly = true;
+        code.value = '';
+        sendCode.textContent = 'Resend owner verification SMS';
+        changeOwner.hidden = retryLater.hidden = false;
+        await watchVerification(++verificationGeneration);
+      }
+    });
+
+    async function cancelVerification(control) {
+      if (await submit('/api/setup', setup.elements.token.value + '\ncancel', control)) {
+        verificationGeneration++;
+        setup.elements.owner.readOnly = false;
+        setup.elements.code.value = '';
+        sendCode.textContent = 'Send owner verification SMS';
+        changeOwner.hidden = retryLater.hidden = true;
+        verificationStatus.textContent = 'Verification canceled. You can request another SMS when ready.';
+        return true;
+      }
+      return false;
+    }
+
+    changeOwner.addEventListener('click', async () => {
+      if (await cancelVerification(changeOwner)) {
+        setup.elements.owner.value = '';
+        setup.elements.owner.focus();
+      }
+    });
+    retryLater.addEventListener('click', () => cancelVerification(retryLater));
+
     setup.addEventListener('submit', async event => {
       event.preventDefault();
-      const { token, owner, apn, admin, confirm } = setup.elements;
+      const { token, owner, code, apn, admin, confirm } = setup.elements;
       if (admin.value !== confirm.value) {
         message('The administrator passwords do not match.');
         return;
       }
-      if (await submit('/api/setup', [token.value, owner.value, apn.value, admin.value].join('\n'),
+      if (await submit('/api/setup', [token.value, 'confirm', owner.value, code.value, apn.value, admin.value].join('\n'),
                        event.submitter)) {
+        verificationGeneration++;
         setup.reset();
         setup.hidden = true;
         message('Setup saved. Restart Road Hög to enable the new settings.');

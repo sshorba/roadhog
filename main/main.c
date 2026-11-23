@@ -19,7 +19,8 @@ static const char *TAG = "roadhog";
 
 static void log_notification(const char *line, void *context)
 {
-    if (!sms_control_notification(context, line) && strncmp(line, "+CNUM:", 6)) {
+    if (!sms_control_notification(context, line) &&
+        provisioning_state() == PROVISION_CONFIGURED && strncmp(line, "+CNUM:", 6)) {
         ESP_LOGI(TAG, "Unsolicited: %s", line);
     }
 }
@@ -132,6 +133,9 @@ void app_main(void)
         sms_control_service(&sms, modem);
         bool modem_reachable = probe(modem, "AT+CPIN?", "+CPIN:") != MODEM_FINAL_NONE;
         lte_status_t lte = read_lte_registration(modem);
+        if (provisioning_state() == PROVISION_FACTORY && (lte == LTE_HOME || lte == LTE_ROAMING)) {
+            sms_owner_verification_service(modem);
+        }
         const char *data = lte_data_context(modem);
         gps_fix_t fix;
         gps_status_t gps = read_gps(modem, &fix);

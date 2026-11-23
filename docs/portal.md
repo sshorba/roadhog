@@ -3,7 +3,8 @@
 On a factory device the WPA2 setup AP starts on boot and stays up while
 the device remains unprovisioned. It accepts one station. The first-run
 wizard collects an E.164 owner SMS number, carrier APN and a separate
-administrator password. The protected setup channel and one-use authorization
+administrator password. Request an SMS to the owner number, then enter its
+six-digit verification code before saving. The protected setup channel and one-use authorization
 code are required. The draft has no credential handoff mechanism pending
 physical security review. See [factory provisioning](factory-provisioning.md).
 

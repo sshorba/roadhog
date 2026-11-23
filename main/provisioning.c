@@ -1,4 +1,5 @@
 #include "provisioning.h"
+#include "owner_verification.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -178,13 +179,16 @@ bool provisioning_setup_authorized(const char *token)
 }
 
 esp_err_t provisioning_claim(const char *token, const char *owner, const char *apn,
-                             const password_record_t *admin)
+                             const char *code, const password_record_t *admin)
 {
     if (!provisioning_setup_authorized(token)) {
         return ESP_ERR_INVALID_STATE;
     }
     if (!provisioning_owner_valid(owner) || !apn_valid(apn) || !admin_valid(admin)) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (!owner_verification_consume(owner, code)) {
+        return ESP_ERR_NOT_ALLOWED;
     }
     config_record_t updated = {.version = 1, .admin = *admin};
     strcpy(updated.owner, owner);

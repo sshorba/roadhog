@@ -13,18 +13,39 @@ prototype reset procedure are pending review.
 | Configured | The versioned settings blob parses and validates. Use the stored owner, APN, administrator hash and Wi-Fi credential. Switch to the configured AP lifecycle. Load additional users from the existing SMS namespace. |
 | Recovery required | NVS failed, the settings namespace is present without a valid record, or legacy ownership data exists without settings. Do not open a claimable AP or accept SMS. Log only the setup/validation failure. |
 
-The wizard accepts an owner number, APN and an administrator password in one
-authorized request. The server requires the setup authorization code over the
-private AP, compares it in constant time, validates bounded input, and
-consumes the code when it attempts a write. Owner and administrator are
-separate identities. A single versioned blob at `device_cfg/settings_v1`
-stores the E.164 SMS owner, APN, Wi-Fi credential and salted
-PBKDF2-HMAC-SHA-256 administrator hash. The server commits and checks readback.
-It never activates a partially written record from RAM. After reboot a valid
-record enables the configured behavior. If a power interruption leaves an
-unreadable or incomplete record, a local recovery review is required. A
-failure after a durable commit can still yield a configured device after
-reboot. Repeat submissions cannot replace an owner.
+The wizard requires the physically handed-off setup authorization code over
+the private AP. With that code, the owner requests an SMS for the proposed
+E.164 number and enters the six-digit code from the message. The SIM number
+display is independent of the proposed destination.
+
+- The normal AT loop sends a GSM 7-bit PDU to the pending number after LTE
+  registration. The HTTP task queues requests and reads status. It never
+  controls the UART. Modem acceptance only means it accepted submission.
+- The firmware generates the challenge with the ESP32 RNG while Wi-Fi is
+  active. It is bound to the recipient and the single per-boot setup session.
+  A queued request expires after 90 seconds. A successfully submitted code
+  expires after five minutes. Verification allows five failures per code and
+  at most one guess per second. The code, destination and SMS payload stay
+  out of serial logs and status endpoints.
+- Resend or changing the destination is limited globally to one request per
+  minute and five per rolling 15 minutes. A successful resend replaces the
+  previous challenge. Change number and Retry later cancel it without
+  resetting the send limits. A cancellation can race with an in-progress
+  SMS, whose late result cannot restore the challenge.
+- If SMS submission fails, check registration, service allowance and the
+  destination, then retry after the cooldown. An undelivered SMS can be
+  resent even after modem acceptance. If the modem's AT stream is faulted,
+  restart the modem and ESP32 in the documented order. A restart discards
+  pending verification and resets the in-memory limits, with fresh physical
+  setup credentials required. The AP stays up throughout setup.
+
+The proposed owner and administrator remain unprivileged during verification.
+Only a valid, matching, unused code permits the server to commit the versioned
+`device_cfg/settings_v1` blob with the owner, APN, Wi-Fi credential and salted
+PBKDF2-HMAC-SHA-256 administrator hash. The server checks readback and consumes
+the setup authorization even if the write outcome is uncertain. The saved
+settings become active on reboot. Unreadable or incomplete data requires local
+recovery review. Repeat submissions cannot replace an owner.
 
 The normal password change uses the same record and preserves its owner,
 APN and Wi-Fi credential. No default owner or administrator password is
@@ -118,7 +139,7 @@ leaves the compiled owner bytes on flash.
    firmware update or reboot preserves `users_v1`.
 4. Boot only after verified readback and the authorized claim mechanism are
    ready. Verify persistent protected AP, lack of SMS authorization, rejected
-   unauthenticated claims and SIM reads, successful local setup, power-cycle
+   unauthenticated claims and SIM reads, successful local SMS verification and setup, power-cycle
    persistence, normal AP timeout, owner-only SMS permissions, and rollback
    to a generic image. For recovery, restore the verified matching firmware,
    configuration and OTA metadata only under owner approval.
@@ -137,6 +158,6 @@ python3 tests/ota_boot_health/run_sdk_lifecycle.py /path/to/esp-idf-v6.1.1
 
 The host fixtures exercise factory, configured, legacy and corrupt
 classification, authorization and repeat claims, SMS sender and owner-only
-checks, write failures, interrupted states, reboot and SIM parsing. Physical authorization, AP lifetime on the
+checks, SMS PDU encoding and modem failure handling, resend and guess limits, expiration, replay, write failures, interrupted states, reboot and SIM parsing. Physical authorization, AP lifetime on the
 radio, actual NVS power-loss behavior and hardware OTA rollback require
 bench validation after review.

@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "provisioning.h"
+#include "owner_verification.h"
 
 typedef unsigned nvs_handle_t;
 enum { NVS_READONLY, NVS_READWRITE };
@@ -80,7 +81,73 @@ static esp_err_t nvs_commit(nvs_handle_t handle)
     return commit_error ? ESP_FAIL : ESP_OK;
 }
 
+typedef int portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define portENTER_CRITICAL(lock) ((void)(lock))
+#define portEXIT_CRITICAL(lock) ((void)(lock))
+static int64_t clock_us;
+static uint32_t random_value;
+static int64_t esp_timer_get_time(void) { return clock_us; }
+static uint32_t esp_random(void) { return ++random_value; }
+
+#include "owner_verification_under_test.inc"
 #include "provisioning_under_test.inc"
+
+typedef struct { bool reject_command, reject_sms; unsigned attempts; } modem_t;
+typedef struct { int final; } modem_result_t;
+enum { MODEM_FINAL_OK = 1 };
+
+static esp_err_t modem_command(modem_t *modem, const char *command, const char *prefix,
+                               unsigned timeout, char *response, size_t capacity,
+                               modem_result_t *result)
+{
+    assert(!strcmp(command, "ATE0") || !strcmp(command, "AT+CMGF=0"));
+    assert(!prefix && timeout == 5000 && !response && !capacity);
+    result->final = MODEM_FINAL_OK;
+    return modem->reject_command ? ESP_FAIL : ESP_OK;
+}
+
+static esp_err_t modem_submit_sms(modem_t *modem, unsigned length, const char *text,
+                                  modem_result_t *result)
+{
+    (void)result;
+    ++modem->attempts;
+    uint8_t pdu[160];
+    assert(length + 1 <= sizeof(pdu) && strlen(text) == (length + 1) * 2);
+    for (size_t i = 0; i <= length; ++i) {
+        unsigned byte;
+        assert(sscanf(text + 2 * i, "%2x", &byte) == 1);
+        pdu[i] = byte;
+    }
+    assert(pdu[0] == 0 && pdu[3] == 4 && pdu[4] == 0x91);
+    assert(pdu[5] == 0x21 && pdu[6] == 0x43); // +1234
+    char decoded[48] = {0};
+    assert(pdu[9] < sizeof(decoded));
+    for (size_t i = 0; i < pdu[9]; ++i) {
+        size_t bit = i * 7;
+        unsigned value = pdu[10 + bit / 8] >> (bit % 8);
+        if (bit % 8 > 1) {
+            value |= pdu[11 + bit / 8] << (8 - bit % 8);
+        }
+        decoded[i] = value & 0x7f;
+    }
+    char expected[48];
+    snprintf(expected, sizeof(expected), "Road Hog owner verification code: %s", challenge.code);
+    assert(!strcmp(decoded, expected));
+    return modem->reject_sms ? ESP_FAIL : ESP_OK;
+}
+
+#include "sms_delivery_under_test.inc"
+
+static owner_verify_message_t deliver(const char *owner, bool accepted)
+{
+    owner_verify_message_t sent;
+    assert(owner_verification_request(owner) == ESP_OK);
+    assert(owner_verification_take(&sent));
+    assert(!strcmp(owner, sent.owner));
+    owner_verification_finish(accepted);
+    return sent;
+}
 
 enum { SMS_NUMBER_CAPACITY = OWNER_CAPACITY, SMS_USER_LIMIT = 6 };
 typedef struct {
@@ -97,6 +164,10 @@ static void reboot(void)
     claim_locked = false;
     memset(&record, 0, sizeof(record));
     memset(setup_token, 0, sizeof(setup_token));
+    clear(OWNER_VERIFY_IDLE);
+    next_send = next_guess = deadline = clock_us = 0;
+    send_count = guesses = 0;
+    in_flight = false;
     provisioning_init();
 }
 
@@ -124,17 +195,23 @@ int main(void)
     strcpy(token, setup_token);
     strcpy(ap_key, provisioning_wifi_password());
     assert(strcmp(token, ap_key));
-    assert(provisioning_claim(ap_key, "+1234", "example.apn", &admin) == ESP_ERR_INVALID_STATE);
-    assert(provisioning_claim(token, "1234", "example.apn", &admin) == ESP_ERR_INVALID_ARG);
-    assert(provisioning_claim(token, "+1234", "x\rAT", &admin) == ESP_ERR_INVALID_ARG);
+    assert(provisioning_claim(ap_key, "+1234", "example.apn", "", &admin) == ESP_ERR_INVALID_STATE);
+    assert(provisioning_claim(token, "1234", "example.apn", "", &admin) == ESP_ERR_INVALID_ARG);
+    assert(provisioning_claim(token, "+1234", "x\rAT", "", &admin) == ESP_ERR_INVALID_ARG);
     assert(!writes);
     reboot();
     assert(provisioning_state() == PROVISION_FACTORY && !provisioning_setup_authorized(token));
     strcpy(token, setup_token);
     strcpy(ap_key, provisioning_wifi_password());
-    assert(provisioning_claim(token, "+1234", "example.apn", &admin) == ESP_OK);
+    assert(provisioning_claim(token, "+1234", "example.apn", "000000", &admin) == ESP_ERR_NOT_ALLOWED);
+    owner_verify_message_t sent = deliver("+1234", true);
+    assert(provisioning_claim(token, "+5678", "example.apn", sent.code, &admin) == ESP_ERR_NOT_ALLOWED);
+    assert(!writes && !provisioning_owner());
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_ERR_NOT_ALLOWED);
+    clock_us += SECOND;
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_OK);
     assert(!provisioning_owner());
-    assert(provisioning_claim(token, "+5678", "example.apn", &admin) == ESP_ERR_INVALID_STATE);
+    assert(provisioning_claim(token, "+5678", "example.apn", "", &admin) == ESP_ERR_INVALID_STATE);
     assert(writes == 1);
     reboot();
     assert(provisioning_state() == PROVISION_CONFIGURED);
@@ -177,7 +254,8 @@ int main(void)
     fresh_flash();
     set_error = true;
     strcpy(token, setup_token);
-    assert(provisioning_claim(token, "+1234", "example.apn", &admin) == ESP_FAIL);
+    sent = deliver("+1234", true);
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_FAIL);
     assert(!provisioning_owner() && !provisioning_setup_authorized(token));
     reboot();
     assert(provisioning_state() == PROVISION_CORRUPT);
@@ -185,11 +263,70 @@ int main(void)
     fresh_flash();
     commit_error = true;
     strcpy(token, setup_token);
-    assert(provisioning_claim(token, "+1234", "example.apn", &admin) == ESP_FAIL);
+    sent = deliver("+1234", true);
+    assert(provisioning_claim(token, "+1234", "example.apn", sent.code, &admin) == ESP_FAIL);
     assert(!provisioning_owner() && !provisioning_setup_authorized(token));
     // A commit error can follow a durable write. Only a validated record
     // loaded on reboot may enable SMS or administrator authentication.
     reboot();
     assert(provisioning_state() == PROVISION_CONFIGURED);
-    puts("Provisioning claims, legacy quarantine, errors and reboot persistence passed");
+    fresh_flash();
+    sent = deliver("+1234", false);
+    assert(owner_verification_status() == OWNER_VERIFY_FAILED);
+    assert(!owner_verification_consume("+1234", sent.code));
+    assert(owner_verification_request("+5678") == ESP_ERR_TIMEOUT);
+    clock_us += SEND_INTERVAL;
+    sent = deliver("+1234", true);
+    for (unsigned i = 0; i < GUESS_LIMIT; ++i) {
+        assert(!owner_verification_consume("+1234", "999999"));
+        clock_us += SECOND;
+    }
+    assert(owner_verification_status() == OWNER_VERIFY_LOCKED);
+    assert(!owner_verification_consume("+1234", sent.code));
+    clock_us = 2 * SEND_INTERVAL;
+    sent = deliver("+1234", true);
+    clock_us += CODE_LIFETIME;
+    assert(!owner_verification_consume("+1234", sent.code));
+    assert(owner_verification_status() == OWNER_VERIFY_EXPIRED);
+    sent = deliver("+1234", true);
+    clock_us += SEND_INTERVAL;
+    owner_verify_message_t replacement = deliver("+1234", true);
+    assert(strcmp(sent.code, replacement.code));
+    assert(!owner_verification_consume("+1234", sent.code));
+    clock_us += SECOND;
+    assert(owner_verification_consume("+1234", replacement.code));
+    assert(!owner_verification_consume("+1234", replacement.code));
+    clock_us += SEND_INTERVAL;
+    assert(owner_verification_request("+1234") == ESP_ERR_TIMEOUT);
+    clock_us = SEND_WINDOW;
+    assert(owner_verification_request("+1234") == ESP_OK);
+    assert(owner_verification_take(&sent));
+    owner_verification_cancel();
+    assert(owner_verification_status() == OWNER_VERIFY_IDLE);
+    owner_verification_finish(true);
+    assert(!owner_verification_consume("+1234", sent.code));
+    reboot();
+    assert(!owner_verification_consume("+1234", sent.code) && !provisioning_owner());
+    assert(owner_verification_request("+1234") == ESP_OK);
+    clock_us += QUEUE_LIFETIME;
+    assert(!owner_verification_take(&sent));
+    assert(owner_verification_status() == OWNER_VERIFY_EXPIRED);
+    fresh_flash();
+    modem_t modem = {.reject_command = true};
+    assert(owner_verification_request("+1234") == ESP_OK);
+    sms_owner_verification_service(&modem);
+    assert(owner_verification_status() == OWNER_VERIFY_FAILED && modem.attempts == 0);
+    clock_us += SEND_INTERVAL;
+    modem.reject_command = false;
+    modem.reject_sms = true;
+    assert(owner_verification_request("+1234") == ESP_OK);
+    sms_owner_verification_service(&modem);
+    assert(owner_verification_status() == OWNER_VERIFY_FAILED && modem.attempts == 1);
+    clock_us += SEND_INTERVAL;
+    modem.reject_sms = false;
+    assert(owner_verification_request("+1234") == ESP_OK);
+    sms_owner_verification_service(&modem);
+    assert(owner_verification_status() == OWNER_VERIFY_SENT && modem.attempts == 2);
+    assert(!provisioning_owner() && !writes);
+    puts("Provisioning, SMS PDU delivery, challenge lifecycle, NVS errors and reboot persistence passed");
 }

@@ -25,5 +25,5 @@ const password_record_t *provisioning_admin(void);
 esp_err_t provisioning_save_admin(const password_record_t *admin);
 bool provisioning_setup_authorized(const char *token);
 esp_err_t provisioning_claim(const char *token, const char *owner, const char *apn,
-                             const password_record_t *admin);
+                             const char *code, const password_record_t *admin);
 bool provisioning_owner_valid(const char *owner);

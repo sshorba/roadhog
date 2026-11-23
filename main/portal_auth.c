@@ -1,5 +1,6 @@
 #include "portal_auth.h"
 #include "provisioning.h"
+#include "owner_verification.h"
 #include "portal.h"
 
 #include <stdint.h>
@@ -166,9 +167,42 @@ static bool receive_body(httpd_req_t *request, char *body, size_t length)
     return !memchr(body, '\0', length) && !strchr(body, '\r');
 }
 
+static esp_err_t verification_action(httpd_req_t *request, const char *action, const char *body)
+{
+    if (!strcmp(action, "send") && body && !strchr(body, '\n')) {
+        esp_err_t error = owner_verification_request(body);
+        if (error == ESP_OK) {
+            return auth_response(request, "202 Accepted", "Waiting for the modem to send the code.");
+        }
+        if (error == ESP_ERR_INVALID_ARG) {
+            return auth_response(request, "400 Bad Request", "Enter a valid E.164 owner number.");
+        }
+        return auth_response(request, "429 Too Many Requests",
+                             "Wait at least a minute between requests. Up to five sends per 15 minutes.");
+    }
+    if (!strcmp(action, "cancel") && !body) {
+        owner_verification_cancel();
+        return auth_response(request, "200 OK", "Verification canceled.");
+    }
+    if (!strcmp(action, "status") && !body) {
+        static const char *const labels[] = {
+            [OWNER_VERIFY_IDLE] = "Request a code for the owner number.",
+            [OWNER_VERIFY_QUEUED] = "Waiting for LTE registration and SMS service.",
+            [OWNER_VERIFY_SENDING] = "Sending the verification SMS.",
+            [OWNER_VERIFY_SENT] = "The modem accepted the SMS. Enter the code when it arrives.",
+            [OWNER_VERIFY_FAILED] = "SMS send failed. Check service and retry. If the modem is offline, restart both devices.",
+            [OWNER_VERIFY_EXPIRED] = "The request expired. Request a new code when SMS service is available.",
+            [OWNER_VERIFY_LOCKED] = "Too many guesses. Request a new code.",
+        };
+        return auth_response(request, "200 OK", labels[owner_verification_status()]);
+    }
+    return auth_response(request, "400 Bad Request", "Invalid verification request.");
+}
+
 static esp_err_t setup_post(httpd_req_t *request, bool show_sim)
 {
-    char body[SETUP_SECRET_LENGTH + OWNER_CAPACITY + APN_CAPACITY + ADMIN_PASSWORD_MAX + 2];
+    char body[SETUP_SECRET_LENGTH + OWNER_CAPACITY + APN_CAPACITY + ADMIN_PASSWORD_MAX +
+              OWNER_CODE_LENGTH + sizeof("confirm") + 5];
     size_t length = request->content_len;
     esp_err_t result;
     if (!length || length >= sizeof(body) || !receive_body(request, body, length)) {
@@ -181,23 +215,32 @@ static esp_err_t setup_post(httpd_req_t *request, bool show_sim)
         result = auth_response(request, "403 Forbidden", "Physical setup authorization is required.");
         goto done;
     }
-    if (show_sim && !rest) {
-        result = portal_sim_response(request);
+    if (show_sim || !rest) {
+        result = show_sim && !rest ? portal_sim_response(request) :
+                 auth_response(request, "400 Bad Request", "Invalid setup request.");
+        goto done;
+    }
+    const char *action = strsep(&rest, "\n");
+    if (strcmp(action, "confirm")) {
+        result = verification_action(request, action, rest);
         goto done;
     }
     const char *owner = strsep(&rest, "\n");
+    const char *code = strsep(&rest, "\n");
     const char *apn = strsep(&rest, "\n");
-    if (show_sim || !owner || !apn || !rest || strchr(rest, '\n') ||
+    if (!owner || !code || !apn || !rest || strchr(rest, '\n') ||
         strlen(rest) < ADMIN_PASSWORD_MIN || strlen(rest) > ADMIN_PASSWORD_MAX) {
         result = auth_response(request, "400 Bad Request", "Check the setup fields and use a 12–64 byte password.");
         goto done;
     }
     password_record_t updated;
     esp_err_t error = prepare_password(rest, &updated)
-                      ? provisioning_claim(token, owner, apn, &updated) : ESP_FAIL;
+                      ? provisioning_claim(token, owner, apn, code, &updated) : ESP_FAIL;
     mbedtls_platform_zeroize(&updated, sizeof(updated));
     if (error == ESP_OK) {
         result = auth_response(request, "200 OK", "Saved. Restart the device to enable the new settings.");
+    } else if (error == ESP_ERR_NOT_ALLOWED) {
+        result = auth_response(request, "403 Forbidden", "Code not verified. Check the number and code, wait a second before retrying, or request a new code.");
     } else if (error == ESP_ERR_INVALID_ARG) {
         result = auth_response(request, "400 Bad Request", "Enter a valid E.164 owner number and carrier APN.");
     } else {
