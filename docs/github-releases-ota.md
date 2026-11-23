@@ -135,12 +135,54 @@ Only the final ESP-IDF boot selection updates OTA metadata.
 
 ## Local verification
 
-Run `sh tests/ota_release/run.sh`, `sh tests/ota_boot_health/run.sh` and
-`python3 tests/ota_boot_health/run_sdk_lifecycle.py /path/to/esp-idf`.
-Local tests cover canonical manifest rules, URL allowlist, response length
-checks, interrupted streams, signing fixtures and the SDK boot lifecycle. Bench network and power behavior require hardware
-or an approved modem/network fixture. Before accepting the implementation,
-exercise invalid certificates, disallowed redirects, HTTP errors, truncation,
-bad digest and signature, mismatched targets, LTE interruption, unavailable
-inactive slot and loss of power during writes. For each failure confirm the
-running boot selection and saved configuration are preserved.
+Run these commands with a C toolchain, Python 3, OpenSSL, and the libcurl
+and OpenSSL development packages available.
+
+```sh
+sh tests/ota_release/run.sh
+python3 tests/ota_release/run_integration.py /path/to/esp-idf-v6.1.1
+sh tests/ota_boot_health/run.sh
+python3 tests/ota_boot_health/run_sdk_lifecycle.py /path/to/esp-idf-v6.1.1
+```
+
+The integration runner binds a temporary localhost HTTPS server and generates
+disposable TLS and release signing keys. It executes the OTA installer and LTE
+recovery wrapper with host adapters for HTTP, crypto, modem and flash. It uses
+real P-256 signatures, TLS hostname/CA checks and SNI via OpenSSL/libcurl, and
+executes the pinned ESP-IDF `esp_ota_resume()` and `esp_ota_write()` functions on
+simulated NOR flash. No live GitHub calls or device access are needed.
+
+The fixture stages and selects a signed image in both slot directions over
+GitHub-style redirects, including a chunked transfer. It starts with a populated
+inactive slot and checks the erased sectors, image bytes, and untouched tail.
+It checks that a dry run, invalid signature, altered or truncated image,
+HTTP failure, invalid staged image, readback mismatch, TLS or redirect failure,
+unavailable slot, lost data link, or failed LTE/AT/SMS/GNSS recovery cannot
+select a candidate. All cases compare the complete flash outside the inactive
+application byte for byte, including the running image and NVS. Boot selection
+is modeled separately, and the SDK lifecycle fixture exercises the real
+boot-selection and rollback logic.
+
+## Remaining hardware validation
+
+Use only a private, signed test release with the existing compiled SMS owner
+for the first trial. After separate approval:
+
+1. Confirm the currently selected VALID image, stable bench power and usable
+   SMS, GPS and portal. Capture partition and NVS baselines as needed.
+2. Run the dry run over SIM7600 PPP using the ESP-IDF certificate bundle.
+   Exercise a hostname mismatch, untrusted CA and a private endpoint that
+   returns an allowlisted HTTPS redirect. Confirm TLS failures abort and that
+   redirects keep the intended TLS peer name and Host header.
+3. Install a valid candidate to the already populated inactive slot. Verify
+   the image hash, contents of the running slot, and boot metadata. Confirm
+   successful LTE teardown and working SMS and GPS before manually rebooting.
+4. With separate authorization as needed, exercise a truncated or tampered
+   private transfer, link loss and a modem recovery failure. Confirm the
+   running slot stays selected. Check NVS byte for byte in trials without
+   intentional configuration changes and check the existing SMS permissions.
+5. Verify ESP-IDF image validation, pending verification and a persistent
+   VALID boot on the prototype. Test rollback with an approved rejecting
+   candidate. A controlled brownout test needs a separate procedure and
+   approval. Live GitHub CDN certificate and redirect behavior also remains
+   unverified and is outside the first private installation trial.

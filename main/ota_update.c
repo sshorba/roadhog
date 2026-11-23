@@ -90,12 +90,14 @@ static esp_err_t read_body(esp_http_client_handle_t client, int64_t content_leng
     uint8_t buffer[HTTP_BUFFER];
     while (transfer_ready(netif, deadline)) {
         int count = esp_http_client_read(client, (char *)buffer, sizeof(buffer));
+        if (!transfer_ready(netif, deadline)) {
+            return ESP_ERR_TIMEOUT;
+        }
         if (count < 0) {
             return ESP_FAIL;
         }
         if (count > 0) {
-            if ((size_t)count > body->maximum - body->used ||
-                !transfer_ready(netif, deadline)) {
+            if ((size_t)count > body->maximum - body->used) {
                 return ESP_ERR_INVALID_SIZE;
             }
             esp_err_t error = body->consume(body->context, buffer, count);

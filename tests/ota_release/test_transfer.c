@@ -105,7 +105,7 @@ int main(void)
     assert(fixture.offset == 0);
     fixture.drop_link = &netif;
     memset(output, 0, sizeof(output));
-    assert(run(&fixture, &netif, 8, 20, output, 8, 8) != ESP_OK);
+    assert(run(&fixture, &netif, 8, 20, output, 8, 8) == ESP_ERR_TIMEOUT);
     assert(output[0] == 0);
     assert(run(&fixture, &netif, 8, 20, output, 8, 8) == ESP_ERR_TIMEOUT);
 
