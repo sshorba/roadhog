@@ -9,7 +9,7 @@ prototype reset procedure remains pending review.
 
 | State | Expected behavior |
 | --- | --- |
-| Factory | The application settings and prior ownership namespaces are absent. Start the WPA2 AP with the factory password `012345678`, allow one station, and leave it up until a provisioned reboot. SMS is disabled. |
+| Factory | The application settings and prior ownership namespaces are absent. Start the WPA2 AP with the factory password `012345678`, allow one station, and leave it up until a provisioned reboot. SMS commands are disabled. |
 | Configured | The versioned settings blob parses and validates. Use the stored owner, APN, administrator hash and Wi-Fi credential. Switch to the configured AP lifecycle. Load additional users from the existing SMS namespace. |
 | Recovery required | NVS failed, the settings namespace is present without a valid record, or legacy ownership data exists without settings. Do not open a claimable AP or accept SMS. Log only the setup/validation failure. |
 
@@ -102,7 +102,8 @@ the value. The parser accepts a single unambiguous quoted digits-only
 national number or a validated international number. Ambiguous multiple
 entries, unsupported responses, malformed or absent values show
 “Not available from SIM/carrier.” This field is independent of LTE service
-and the owner number. The dashboard requires administrator authentication.
+and the owner number. The authenticated dashboard displays the registered owner and the SIM phone
+number as separate fields.
 The wizard shows the cached value only in the successfully confirmed
 setup session. The GUI renders it as text.
 

@@ -36,8 +36,8 @@ a salted password hash in NVS. The portal accepts one session at a time
 for up to 30 minutes. HTTP traffic relies on the private Wi-Fi's link
 protection. Use the device AP directly and keep its Wi-Fi credential private.
 
-The authenticated dashboard shows the SIM phone number only when the modem
-reports one. This is separate from the owner SMS control number. Missing SIM
+The authenticated dashboard shows the registered owner SMS control number
+and a separate SIM phone number when the modem reports one. Missing SIM
 number information is shown as “Not available from SIM/carrier.”
 
 To check the portal from a connected computer:

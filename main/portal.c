@@ -64,10 +64,12 @@ static esp_err_t status_response(httpd_req_t *request)
     memcpy(number, sim_number, sizeof(number));
     portEXIT_CRITICAL(&status_lock);
 
-    char body[192];
+    const char *owner = provisioning_owner();
+    char body[224];
     snprintf(body, sizeof(body),
-             "{\"lte\":\"%s\",\"data\":\"%s\",\"gps\":\"%s\",\"sim\":\"%s\"}",
-             lte_label(lte), data, gps_label(gps), number[0] ? number : sim_unavailable);
+             "{\"lte\":\"%s\",\"data\":\"%s\",\"gps\":\"%s\",\"sim\":\"%s\",\"owner\":\"%s\"}",
+             lte_label(lte), data, gps_label(gps), number[0] ? number : sim_unavailable,
+             owner ? owner : "Not configured");
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_sendstr(request, body);
 }
