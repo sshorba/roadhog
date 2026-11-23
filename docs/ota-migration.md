@@ -24,9 +24,15 @@ available for the legacy table.
 Two 4 MiB slots leave room for TLS and telemetry code. The remainder of
 the flash is unallocated. Both slots share the existing NVS partition
 with its original format and size. There is no separate factory image.
-The first boot with erased OTA metadata selects slot A and seeds its
-state as valid. Bench-test A before selecting B. Serial ROM download
-mode and the backups below are the recovery path for the legacy layout.
+With erased metadata, ESP-IDF v6.1.1 selects slot A. After successfully
+loading the image and before handing off to the app, the bootloader
+writes sequence 1 with `ESP_OTA_IMG_VALID` and a checksum into the first
+metadata sector. The app then reads `ESP_OK` and `ESP_OTA_IMG_VALID`
+from `esp_ota_get_state_partition()`. If the write failed and no matching
+entry persisted, that API returns `ESP_ERR_NOT_FOUND` even though A can
+execute. No app-side metadata initialization is required on a successful
+first boot. Serial ROM download mode and the backups below are the
+recovery path for the legacy layout.
 
 ## Boot health and rollback
 
@@ -47,8 +53,18 @@ unhealthy image valid. An unconfirmed image can still be aborted by the
 bootloader on the next reset, so have serial recovery available. Ordinary
 boots of a valid slot do not rewrite OTA metadata.
 
-Host tests exercise the app policy against SDK stubs. The bench-only
-controls below exercise the actual bootloader with two serial-staged
+Before the bench selector can schedule B, A must pass the current boot's
+startup checks, report a persisted `VALID` state, and match the slot
+returned by `esp_ota_get_boot_partition()`. That last check prevents A
+from starting a trial while it is running as an image fallback and
+another slot is still selected in OTA metadata. With A selected,
+`esp_ota_set_boot_partition()` writes B's `NEW` entry into the other
+sector, retaining A as the rollback target. A missing state or a slot
+mismatch blocks selection without writing metadata.
+
+Host tests exercise app policy and run the relevant pinned ESP-IDF
+bootloader and OTA functions against simulated flash. The bench-only
+controls below exercise the physical bootloader with two serial-staged
 images once separately approved. They do not download or install firmware
 from the application.
 
@@ -64,6 +80,7 @@ idf.py -B build/ota-normal -D SDKCONFIG=build/ota-normal-sdkconfig \
 idf.py -B build/ota-lte -D SDKCONFIG=build/ota-lte-sdkconfig \
   -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.lte-diagnostic.defaults;sdkconfig.ota-16mb.defaults' build
 sh tests/ota_boot_health/run.sh
+python3 tests/ota_boot_health/run_sdk_lifecycle.py "$IDF_PATH"
 python "$IDF_PATH/components/partition_table/gen_esp32part.py" \
   --flash-size 16MB partitions.ota-16mb.csv /tmp/roadhog-ota-layout.bin
 ```
@@ -85,7 +102,7 @@ application offset `0x10000`, a 16 MB bootloader header, and both 4 MiB
 slots. Each image must fit both. Compare the new and old tables to
 confirm exact NVS and PHY offsets and sizes. In local ESP-IDF v6.1.1
 builds using the existing bench settings, the normal OTA image was
-915,232 bytes and the LTE diagnostic image was 1,046,832 bytes.
+916,000 bytes and the LTE diagnostic image was 1,047,600 bytes.
 Both fit each 4,194,304-byte slot.
 
 ## Owner-approved one-time migration
@@ -178,8 +195,13 @@ review a device-specific migration.
    readback differs.
 
 4. Release BOOT and reset using EN. Open the serial monitor for the OTA
-   build. Verify the bootloader selects `ota_0` at `0x10000`. Test
-   SMS `STATUS`, `GPS` and an existing additional user, the saved portal
+   build. Verify the bootloader selects `ota_0` at `0x10000`. Look for
+   `Set actual ota_seq=1 in otadata[0]` on the first boot, then require
+   `Slot A startup checks passed; selected OTA state is VALID`. If A
+   runs without a persisted state or with a different slot selected,
+   stop before staging or selecting B. Check the bootloader version,
+   table, OTA metadata and flash write errors using the approved
+   recovery procedure. Test SMS `STATUS`, `GPS` and an existing additional user, the saved portal
    login after `APON`, and the LED. Use the
    [LTE diagnostic guide](lte-diagnostic.md) for an OTA build with PPP
    enabled. Keep a known-good slot and the legacy backups.
@@ -210,7 +232,8 @@ Use `build/ota-normal/roadhog.bin` as the healthy B candidate.
    write the candidate to `0x410000` and the selector to `0x10000`.
    Use `write-flash` and `verify-flash` for those two offsets as above.
    Leave the bootloader, table and NVS alone. Reset the board.
-6. A should pass startup and select B through `esp_ota_set_boot_partition()`.
+6. Require the same selected-`VALID` startup message from A before its
+   bench selector schedules B through `esp_ota_set_boot_partition()`.
    B should log pending verification. A healthy B should log that it
    marked itself valid and boot again after reset. A forced-fail B
    should log its rollback request, reboot to A, and stay there.

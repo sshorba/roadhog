@@ -12,11 +12,8 @@ static const char *TAG = "ota_health";
 #ifdef CONFIG_ROADHOG_OTA_BENCH_BOOT_PEER
 #include "esp_system.h"
 
-static void boot_untried_peer(const esp_partition_t *running)
+static void boot_untried_peer(void)
 {
-    if (running->subtype != ESP_PARTITION_SUBTYPE_APP_OTA_0) {
-        return;
-    }
     const esp_partition_t *peer = esp_partition_find_first(ESP_PARTITION_TYPE_APP,
                                                             ESP_PARTITION_SUBTYPE_APP_OTA_1,
                                                             NULL);
@@ -45,7 +42,13 @@ void ota_boot_health_finish(bool healthy)
     }
     esp_ota_img_states_t state;
     esp_err_t error = esp_ota_get_state_partition(running, &state);
-    if (error == ESP_ERR_NOT_FOUND || error == ESP_ERR_NOT_SUPPORTED) {
+    if (error == ESP_ERR_NOT_FOUND) {
+        if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
+            ESP_LOGW(TAG, "Slot A has no persisted OTA state; peer selection is blocked");
+        }
+        return;
+    }
+    if (error == ESP_ERR_NOT_SUPPORTED) {
         return;
     }
     if (error != ESP_OK) {
@@ -76,14 +79,28 @@ void ota_boot_health_finish(bool healthy)
             return;
         }
         ESP_LOGI(TAG, "%s marked valid after startup checks", running->label);
-        state = ESP_OTA_IMG_VALID;
+        error = esp_ota_get_state_partition(running, &state);
+        if (error != ESP_OK || state != ESP_OTA_IMG_VALID) {
+            ESP_LOGE(TAG, "Could not read back VALID state for %s", running->label);
+            return;
+        }
     }
 
+    if (healthy && state == ESP_OTA_IMG_VALID &&
+        running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
+        // A may be running after a bootloader fallback while another slot is
+        // still selected in otadata. Require A to own the selected entry so
+        // scheduling B writes the other sector and leaves A's entry intact.
+        const esp_partition_t *selected = esp_ota_get_boot_partition();
+        if (!selected || selected->address != running->address) {
+            ESP_LOGW(TAG, "Slot A is running but not selected; peer selection is blocked");
+            return;
+        }
+        ESP_LOGI(TAG, "Slot A startup checks passed; selected OTA state is VALID");
 #ifdef CONFIG_ROADHOG_OTA_BENCH_BOOT_PEER
-    if (healthy && state == ESP_OTA_IMG_VALID) {
-        boot_untried_peer(running);
-    }
+        boot_untried_peer();
 #endif
+    }
 }
 #else
 void ota_boot_health_finish(bool healthy)
