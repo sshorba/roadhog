@@ -1,4 +1,5 @@
 #include "sms_commands.h"
+#include "provisioning.h"
 #include "portal.h"
 #include "connection_status.h"
 
@@ -13,13 +14,14 @@ static const char *const unknown = "Unknown command, send \"?\" for help.";
 
 bool sms_number_valid(const char *number)
 {
-    size_t length = strlen(number);
-    return length >= 3 && length < SMS_NUMBER_CAPACITY && number[0] == '+' &&
-           number[1] != '0' && strspn(number + 1, "0123456789") == length - 1;
+    return provisioning_owner_valid(number);
 }
 
 bool sms_sender_allowed(const sms_control_t *sms, const char *sender)
 {
+    if (!sms->owner || !sms_number_valid(sender)) {
+        return false;
+    }
     if (strcmp(sms->owner, sender) == 0) {
         return true;
     }

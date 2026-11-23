@@ -1,4 +1,6 @@
 #include "portal_auth.h"
+#include "provisioning.h"
+#include "portal.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -8,51 +10,19 @@
 #include "esp_timer.h"
 #include "mbedtls/constant_time.h"
 #include "mbedtls/platform_util.h"
-#include "nvs.h"
 #include "psa/crypto.h"
 
-enum { PASSWORD_MIN = 8, PASSWORD_MAX = 64, SESSION_BYTES = 32 };
-static const char *const nvs_namespace = "portal_auth";
-static const char *const credential_key = "password_v1";
-static const char default_password[] = "roadhog";
+enum { SESSION_BYTES = 32 };
 static const int64_t session_duration = 30LL * 60 * 1000000;
 
-typedef struct {
-    uint8_t salt[16];
-    uint8_t hash[32];
-} password_record_t;
-
-// HTTP handlers share one server task. Initialization finishes before it starts.
-static password_record_t credential;
-static bool password_changed;
+// HTTP handlers share one server task.
 static char session[SESSION_BYTES * 2 + 1];
 static int64_t session_expires;
 static int64_t next_login_attempt;
 
 esp_err_t portal_auth_init(void)
 {
-    if (psa_crypto_init() != PSA_SUCCESS) {
-        return ESP_FAIL;
-    }
-    nvs_handle_t nvs;
-    esp_err_t error = nvs_open(nvs_namespace, NVS_READONLY, &nvs);
-    if (error == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
-    }
-    if (error != ESP_OK) {
-        return error;
-    }
-    size_t length = sizeof(credential);
-    error = nvs_get_blob(nvs, credential_key, &credential, &length);
-    nvs_close(nvs);
-    if (error == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_OK;
-    }
-    if (error == ESP_OK && length != sizeof(credential)) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    password_changed = error == ESP_OK;
-    return error;
+    return psa_crypto_init() == PSA_SUCCESS ? ESP_OK : ESP_FAIL;
 }
 
 static bool derive_password(const char *password, const password_record_t *record, uint8_t *hash)
@@ -79,38 +49,30 @@ static bool derive_password(const char *password, const password_record_t *recor
 
 static bool password_matches(const char *password)
 {
-    if (!password_changed) {
-        return strcmp(password, default_password) == 0;
+    const password_record_t *credential = provisioning_admin();
+    if (!credential) {
+        return false;
     }
-    uint8_t hash[sizeof(credential.hash)];
-    bool matches = derive_password(password, &credential, hash) &&
-                   mbedtls_ct_memcmp(hash, credential.hash, sizeof(hash)) == 0;
+    uint8_t hash[sizeof(credential->hash)];
+    bool matches = derive_password(password, credential, hash) &&
+                   mbedtls_ct_memcmp(hash, credential->hash, sizeof(hash)) == 0;
     mbedtls_platform_zeroize(hash, sizeof(hash));
     return matches;
+}
+
+static bool prepare_password(const char *password, password_record_t *updated)
+{
+    esp_fill_random(updated->salt, sizeof(updated->salt));
+    return derive_password(password, updated, updated->hash);
 }
 
 static bool save_password(const char *password)
 {
     password_record_t updated;
-    esp_fill_random(updated.salt, sizeof(updated.salt));
-    if (!derive_password(password, &updated, updated.hash)) {
-        return false;
-    }
-    nvs_handle_t nvs;
-    if (nvs_open(nvs_namespace, NVS_READWRITE, &nvs) != ESP_OK) {
-        return false;
-    }
-    esp_err_t error = nvs_set_blob(nvs, credential_key, &updated, sizeof(updated));
-    if (error == ESP_OK) {
-        error = nvs_commit(nvs);
-    }
-    nvs_close(nvs);
-    if (error != ESP_OK) {
-        return false;
-    }
-    credential = updated;
-    password_changed = true;
-    return true;
+    bool saved = prepare_password(password, &updated) &&
+                 provisioning_save_admin(&updated) == ESP_OK;
+    mbedtls_platform_zeroize(&updated, sizeof(updated));
+    return saved;
 }
 
 bool portal_authenticated(httpd_req_t *request)
@@ -176,8 +138,8 @@ static esp_err_t login(httpd_req_t *request, const char *username, const char *p
 
 static esp_err_t change_password(httpd_req_t *request, const char *current, const char *updated)
 {
-    if (strlen(updated) < PASSWORD_MIN) {
-        return auth_response(request, "400 Bad Request", "Use at least 8 bytes for the new password.");
+    if (strlen(updated) < ADMIN_PASSWORD_MIN) {
+        return auth_response(request, "400 Bad Request", "Use at least 12 bytes for the new password.");
     }
     if (!password_matches(current)) {
         return auth_response(request, "403 Forbidden", "Incorrect current password.");
@@ -191,8 +153,66 @@ static esp_err_t change_password(httpd_req_t *request, const char *current, cons
     return end_session(request);
 }
 
+static bool receive_body(httpd_req_t *request, char *body, size_t length)
+{
+    for (size_t offset = 0; offset < length;) {
+        int received = httpd_req_recv(request, body + offset, length - offset);
+        if (received <= 0) {
+            return false;
+        }
+        offset += received;
+    }
+    body[length] = '\0';
+    return !memchr(body, '\0', length) && !strchr(body, '\r');
+}
+
+static esp_err_t setup_post(httpd_req_t *request, bool show_sim)
+{
+    char body[SETUP_SECRET_LENGTH + OWNER_CAPACITY + APN_CAPACITY + ADMIN_PASSWORD_MAX + 2];
+    size_t length = request->content_len;
+    esp_err_t result;
+    if (!length || length >= sizeof(body) || !receive_body(request, body, length)) {
+        result = auth_response(request, "400 Bad Request", "Invalid setup request.");
+        goto done;
+    }
+    char *rest = body;
+    const char *token = strsep(&rest, "\n");
+    if (!provisioning_setup_authorized(token)) {
+        result = auth_response(request, "403 Forbidden", "Physical setup authorization is required.");
+        goto done;
+    }
+    if (show_sim && !rest) {
+        result = portal_sim_response(request);
+        goto done;
+    }
+    const char *owner = strsep(&rest, "\n");
+    const char *apn = strsep(&rest, "\n");
+    if (show_sim || !owner || !apn || !rest || strchr(rest, '\n') ||
+        strlen(rest) < ADMIN_PASSWORD_MIN || strlen(rest) > ADMIN_PASSWORD_MAX) {
+        result = auth_response(request, "400 Bad Request", "Check the setup fields and use a 12–64 byte password.");
+        goto done;
+    }
+    password_record_t updated;
+    esp_err_t error = prepare_password(rest, &updated)
+                      ? provisioning_claim(token, owner, apn, &updated) : ESP_FAIL;
+    mbedtls_platform_zeroize(&updated, sizeof(updated));
+    if (error == ESP_OK) {
+        result = auth_response(request, "200 OK", "Saved. Restart the device to enable the new settings.");
+    } else if (error == ESP_ERR_INVALID_ARG) {
+        result = auth_response(request, "400 Bad Request", "Enter a valid E.164 owner number and carrier APN.");
+    } else {
+        result = auth_response(request, "500 Internal Server Error", "Setup could not be verified. Restart the device before retrying.");
+    }
+done:
+    mbedtls_platform_zeroize(body, sizeof(body));
+    return result;
+}
+
 esp_err_t portal_auth_post(httpd_req_t *request)
 {
+    if (!strcmp(request->uri, "/api/setup") || !strcmp(request->uri, "/api/setup/sim")) {
+        return setup_post(request, !strcmp(request->uri, "/api/setup/sim"));
+    }
     bool signing_in = strcmp(request->uri, "/api/login") == 0;
     if (!signing_in && !portal_authenticated(request)) {
         return auth_response(request, "401 Unauthorized", "Sign in again.");
@@ -202,25 +222,20 @@ esp_err_t portal_auth_post(httpd_req_t *request)
     }
 
     // Two UTF-8 fields separated by a newline. Password inputs are single-line.
-    char body[2 * PASSWORD_MAX + 2];
+    char body[2 * ADMIN_PASSWORD_MAX + 2];
     size_t length = request->content_len;
     if (length == 0 || length >= sizeof(body)) {
         return auth_response(request, "400 Bad Request", "Enter values of up to 64 bytes each.");
     }
-    for (size_t offset = 0; offset < length;) {
-        int received = httpd_req_recv(request, body + offset, length - offset);
-        if (received <= 0) {
-            mbedtls_platform_zeroize(body, sizeof(body));
-            return ESP_FAIL;
-        }
-        offset += received;
+    if (!receive_body(request, body, length)) {
+        mbedtls_platform_zeroize(body, sizeof(body));
+        return auth_response(request, "400 Bad Request", "Invalid credentials format.");
     }
 
-    body[length] = '\0';
     char *second = strchr(body, '\n');
     esp_err_t result;
-    if (!second || memchr(body, '\0', length) || strchr(body, '\r') || strchr(second + 1, '\n') ||
-        (size_t)(second - body) > PASSWORD_MAX || strlen(second + 1) > PASSWORD_MAX) {
+    if (!second || strchr(second + 1, '\n') ||
+        (size_t)(second - body) > ADMIN_PASSWORD_MAX || strlen(second + 1) > ADMIN_PASSWORD_MAX) {
         result = auth_response(request, "400 Bad Request", "Invalid credentials format.");
     } else {
         *second++ = '\0';

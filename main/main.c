@@ -9,6 +9,9 @@
 #include "modem.h"
 #include "ota_boot_health.h"
 #include "portal.h"
+#include "provisioning.h"
+#include "sim_number.h"
+#include <string.h>
 #include "sms_control.h"
 #include "status_led.h"
 
@@ -16,7 +19,7 @@ static const char *TAG = "roadhog";
 
 static void log_notification(const char *line, void *context)
 {
-    if (!sms_control_notification(context, line)) {
+    if (!sms_control_notification(context, line) && strncmp(line, "+CNUM:", 6)) {
         ESP_LOGI(TAG, "Unsolicited: %s", line);
     }
 }
@@ -43,6 +46,19 @@ static modem_final_t probe(modem_t *modem, const char *command, const char *pref
     return result.final;
 }
 
+static void cache_sim_number(modem_t *modem)
+{
+    char response[2 * MODEM_LINE_CAPACITY];
+    char number[SIM_NUMBER_CAPACITY] = {0};
+    modem_result_t result;
+    if (modem_command(modem, "AT+CNUM", "+CNUM:", 2000,
+                      response, sizeof(response), &result) == ESP_OK &&
+        result.final == MODEM_FINAL_OK) {
+        sim_number_parse(response, number);
+    }
+    portal_set_sim_number(number);
+}
+
 void app_main(void)
 {
     static sms_control_t sms;
@@ -50,6 +66,7 @@ void app_main(void)
     if (led_error != ESP_OK) {
         ESP_LOGW(TAG, "Status LED unavailable: %s", esp_err_to_name(led_error));
     }
+    provisioning_init();
     esp_err_t network_error = esp_netif_init();
     if (network_error == ESP_OK) {
         network_error = esp_event_loop_create_default();
@@ -91,20 +108,23 @@ void app_main(void)
     bool gps_started = start_gps(modem);
 
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
-    bool sms_ready = sms.configured;
+    bool sms_ready = provisioning_state() == PROVISION_FACTORY || sms.configured;
 #else
     bool sms_ready = true;
 #endif
     ota_boot_health_finish(portal_error == ESP_OK && at == MODEM_FINAL_OK &&
                            sms_ready && gps_started);
+    if (at == MODEM_FINAL_OK) {
+        cache_sim_number(modem);
+    }
 
 #ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
-    bool diagnostic_pending = network_error == ESP_OK;
+    bool diagnostic_pending = network_error == ESP_OK && provisioning_apn() != NULL;
     const int64_t diagnostic_at = esp_timer_get_time() + CONFIG_ROADHOG_LTE_DELAY * 1000000LL;
     if (diagnostic_pending) {
         ESP_LOGI(TAG, "LTE diagnostic scheduled in %d seconds", CONFIG_ROADHOG_LTE_DELAY);
     } else {
-        ESP_LOGE(TAG, "LTE diagnostic unavailable: network initialization failed");
+        ESP_LOGE(TAG, "LTE diagnostic unavailable: network or provisioning is not ready");
     }
 #endif
 

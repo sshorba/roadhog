@@ -1,5 +1,6 @@
 #include "sms_control.h"
 #include "sms_commands.h"
+#include "provisioning.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -11,7 +12,6 @@
 
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
 static const char *TAG = "sms";
-static const char owner[] = CONFIG_ROADHOG_SMS_OWNER;
 static const char hex[] = "0123456789ABCDEF";
 
 enum { MAX_PDU_BYTES = 190 };
@@ -145,8 +145,11 @@ static void configure_sms(sms_control_t *sms, modem_t *modem)
 void sms_control_start(sms_control_t *sms, modem_t *modem)
 {
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
-    sms->owner = owner;
-    if (!sms_number_valid(owner) || !sms_users_load(sms)) {
+    sms->owner = provisioning_owner();
+    if (!sms->owner) {
+        return;
+    }
+    if (!sms_users_load(sms)) {
         ESP_LOGE(TAG, "SMS owner or user storage is unavailable");
         return;
     }

@@ -2,12 +2,7 @@ menu "Road Hog SMS control"
 
 config ROADHOG_SMS_CONTROL
     bool "Enable SMS commands"
-    default n
-
-config ROADHOG_SMS_OWNER
-    string "Authorized sender and reply destination (E.164)"
-    depends on ROADHOG_SMS_CONTROL
-    default ""
+    default y
 
 endmenu
 
@@ -27,11 +22,6 @@ config ROADHOG_LTE_DIAGNOSTIC
     depends on !ESP_TLS_SKIP_SERVER_CERT_VERIFY
     select ESP_NETIF_SET_DNS_PER_DEFAULT_NETIF
     default n
-
-config ROADHOG_LTE_APN
-    string "Carrier APN"
-    depends on ROADHOG_LTE_DIAGNOSTIC
-    default ""
 
 config ROADHOG_LTE_DELAY
     int "Seconds of AT/SMS service before the diagnostic"

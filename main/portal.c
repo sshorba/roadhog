@@ -1,5 +1,7 @@
 #include "portal.h"
 #include "portal_auth.h"
+#include "provisioning.h"
+#include "sim_number.h"
 #include "status_led.h"
 
 #include <stdbool.h>
@@ -20,7 +22,6 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "lwip/sockets.h"
-#include "nvs_flash.h"
 
 static const char *TAG = "portal";
 static char portal_url[sizeof("http://255.255.255.255/")];
@@ -33,6 +34,25 @@ static portMUX_TYPE status_lock = portMUX_INITIALIZER_UNLOCKED;
 static lte_status_t lte_status;
 static gps_status_t gps_status;
 static const char *data_status = "Unknown";
+static char sim_number[SIM_NUMBER_CAPACITY];
+static const char sim_unavailable[] = "Not available from SIM/carrier";
+
+void portal_set_sim_number(const char *number)
+{
+    portENTER_CRITICAL(&status_lock);
+    snprintf(sim_number, sizeof(sim_number), "%s", number);
+    portEXIT_CRITICAL(&status_lock);
+}
+
+esp_err_t portal_sim_response(httpd_req_t *request)
+{
+    char number[SIM_NUMBER_CAPACITY];
+    portENTER_CRITICAL(&status_lock);
+    memcpy(number, sim_number, sizeof(number));
+    portEXIT_CRITICAL(&status_lock);
+    httpd_resp_set_type(request, "text/plain; charset=utf-8");
+    return httpd_resp_sendstr(request, number[0] ? number : sim_unavailable);
+}
 
 static esp_err_t status_response(httpd_req_t *request)
 {
@@ -40,11 +60,14 @@ static esp_err_t status_response(httpd_req_t *request)
     lte_status_t lte = lte_status;
     gps_status_t gps = gps_status;
     const char *data = data_status;
+    char number[SIM_NUMBER_CAPACITY];
+    memcpy(number, sim_number, sizeof(number));
     portEXIT_CRITICAL(&status_lock);
 
-    char body[128];
+    char body[192];
     snprintf(body, sizeof(body),
-             "{\"lte\":\"%s\",\"data\":\"%s\",\"gps\":\"%s\"}", lte_label(lte), data, gps_label(gps));
+             "{\"lte\":\"%s\",\"data\":\"%s\",\"gps\":\"%s\",\"sim\":\"%s\"}",
+             lte_label(lte), data, gps_label(gps), number[0] ? number : sim_unavailable);
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_sendstr(request, body);
 }
@@ -58,7 +81,12 @@ static bool local_host(httpd_req_t *request)
         host[strlen(host) - 3] = '\0';
     }
 
-    return host_result == ESP_OK && strcmp(host, portal_host) == 0;
+    struct sockaddr_in local;
+    socklen_t length = sizeof(local);
+    return host_result == ESP_OK && strcmp(host, portal_host) == 0 &&
+           getsockname(httpd_req_to_sockfd(request), (struct sockaddr *)&local, &length) == 0 &&
+           length == sizeof(local) && local.sin_family == AF_INET &&
+           local.sin_addr.s_addr == dns_address.sin_addr.s_addr;
 }
 
 static esp_err_t auth_post(httpd_req_t *request)
@@ -77,7 +105,11 @@ static esp_err_t auth_post(httpd_req_t *request)
 static esp_err_t landing_page(httpd_req_t *request)
 {
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    if (local_host(request) || httpd_req_get_hdr_value_len(request, "Host") == 0) {
+    if (local_host(request)) {
+        if (strcmp(request->uri, "/api/setup/state") == 0) {
+            httpd_resp_set_type(request, "text/plain");
+            return httpd_resp_sendstr(request, provisioning_state() == PROVISION_FACTORY ? "factory" : "configured");
+        }
         if (strcmp(request->uri, "/api/status") == 0) {
             if (!local_host(request) || !portal_authenticated(request)) {
                 httpd_resp_set_status(request, "401 Unauthorized");
@@ -169,7 +201,7 @@ static esp_err_t start_services(void)
     }
     const httpd_uri_t route = {.uri = "/*", .method = HTTP_GET, .handler = landing_page};
     error = httpd_register_uri_handler(http, &route);
-    const char *auth_paths[] = {"/api/login", "/api/password", "/api/logout"};
+    const char *auth_paths[] = {"/api/login", "/api/password", "/api/logout", "/api/setup", "/api/setup/sim"};
     for (size_t i = 0; error == ESP_OK && i < sizeof(auth_paths) / sizeof(auth_paths[0]); i++) {
         const httpd_uri_t auth_route = {.uri = auth_paths[i], .method = HTTP_POST, .handler = auth_post};
         error = httpd_register_uri_handler(http, &auth_route);
@@ -194,9 +226,18 @@ static esp_err_t start_first_ap(void)
 {
     uint8_t mac[6];
     ESP_RETURN_ON_ERROR(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP), TAG, "AP MAC");
-    wifi_config_t wifi = {.ap = {.channel = 1, .max_connection = 4, .authmode = WIFI_AUTH_OPEN}};
+    wifi_config_t wifi = {.ap = {.channel = 1, .max_connection = 4, .authmode = WIFI_AUTH_WPA2_PSK}};
+    const char *passphrase = provisioning_wifi_password();
+    if (!passphrase) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    memcpy(wifi.ap.password, passphrase, strlen(passphrase) + 1);
     wifi.ap.ssid_len = snprintf((char *)wifi.ap.ssid, sizeof(wifi.ap.ssid),
                                "ROADHOG-%02X%02X", mac[4], mac[5]);
+
+    if (provisioning_state() == PROVISION_FACTORY) {
+        wifi.ap.max_connection = 1;
+    }
 
     static bool driver_initialized;
     if (!driver_initialized) {
@@ -281,10 +322,15 @@ static void ap_policy_task(void *context)
 
 esp_err_t portal_init(void)
 {
-    ESP_RETURN_ON_ERROR(nvs_flash_init(), TAG, "NVS initialization");
+    if (provisioning_state() == PROVISION_CORRUPT) {
+        return ESP_ERR_INVALID_STATE;
+    }
     ESP_RETURN_ON_ERROR(portal_auth_init(), TAG, "Portal authentication initialization");
 
     esp_netif_t *ap = esp_netif_create_default_wifi_ap();
+    if (!ap) {
+        return ESP_ERR_NO_MEM;
+    }
     esp_netif_ip_info_t ip;
     ESP_RETURN_ON_ERROR(esp_netif_get_ip_info(ap, &ip), TAG, "AP address");
     snprintf(portal_host, sizeof(portal_host), IPSTR, IP2STR(&ip.ip));
@@ -296,6 +342,14 @@ esp_err_t portal_init(void)
     ap_lock = xSemaphoreCreateMutex();
     if (!ap_lock) {
         return ESP_ERR_NO_MEM;
+    }
+    if (provisioning_state() == PROVISION_FACTORY) {
+        esp_err_t error = set_ap(true);
+        if (error != ESP_OK) {
+            vSemaphoreDelete(ap_lock);
+            ap_lock = NULL;
+        }
+        return error;
     }
     if (xTaskCreate(ap_policy_task, "portal_policy", 4096, NULL, 4, NULL) != pdPASS) {
         vSemaphoreDelete(ap_lock);
@@ -333,7 +387,7 @@ esp_err_t portal_request(bool enabled)
     }
     xSemaphoreTake(ap_lock, portMAX_DELAY);
     esp_err_t error;
-    if (!enabled && (!cellular_known || !cellular_registered)) {
+    if (!enabled && (provisioning_state() == PROVISION_FACTORY || !cellular_registered)) {
         error = ESP_ERR_INVALID_STATE;
     } else {
         error = set_ap(enabled);

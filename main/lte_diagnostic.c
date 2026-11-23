@@ -1,5 +1,6 @@
 #include "sdkconfig.h"
 #include "lte_diagnostic.h"
+#include "provisioning.h"
 
 #ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
 
@@ -29,8 +30,9 @@ static void run_diagnostic(void *context)
 modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *uart_reopened)
 {
     *uart_reopened = false;
-    if (!cellular_apn_valid(CONFIG_ROADHOG_LTE_APN)) {
-        ESP_LOGE(TAG, "Set a valid carrier APN in menuconfig");
+    const char *apn = provisioning_apn();
+    if (!apn || !cellular_apn_valid(apn)) {
+        ESP_LOGE(TAG, "Provision a valid carrier APN");
         return modem;
     }
     // One diagnostic per boot. If the worker outlives the deadline it retains
@@ -43,7 +45,7 @@ modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *
             .tx_pin = config->tx_pin,
             .rx_pin = config->rx_pin,
             .baud_rate = config->baud_rate,
-            .apn = CONFIG_ROADHOG_LTE_APN,
+            .apn = apn,
         },
         .done = xSemaphoreCreateBinaryStatic(&done_storage),
         .result = ESP_ERR_NO_MEM,

@@ -55,10 +55,10 @@ available and the serial log calls for a power cycle of both devices.
      -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.lte-diagnostic.defaults' menuconfig
    ```
 
-2. Under **Road Hog LTE diagnostic**, enter the APN for your provisioned
-   US Mobile network. The default delay is 90 seconds after startup
-   checks. Set up the SMS owner locally as described in
-   [SMS commands](sms.md), select the board-specific LED GPIO, and
+2. Use the carrier APN saved in [first-time setup](factory-provisioning.md).
+   The diagnostic runs only when an APN is provisioned. Set the delay
+   under **Road Hog LTE diagnostic** (90 seconds by default), select the
+   board-specific LED GPIO, and
    match the existing flash configuration. Keep the certificate bundle,
    HTTPS and certificate validity date checks enabled.
 

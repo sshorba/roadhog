@@ -1,6 +1,13 @@
 # Wi-Fi setup portal
 
-The setup AP starts off while the modem checks LTE registration. When the
+On a factory device the WPA2 setup AP starts on boot and stays up while
+the device remains unprovisioned. It accepts one station. The first-run
+wizard collects an E.164 owner SMS number, carrier APN and a separate
+administrator password. The protected setup channel and one-use authorization
+code are required. The draft has no credential handoff mechanism pending
+physical security review. See [factory provisioning](factory-provisioning.md).
+
+On a configured device the setup AP starts off while the modem checks LTE registration. When the
 modem is registered, the owner can text `APON` to enable it or `APOFF` to
 disable it immediately. The AP shuts down after five minutes with no Wi-Fi
 stations associated. The idle timer restarts after the last station leaves.
@@ -12,8 +19,8 @@ The fallback uses cellular registration and does not depend on an active data
 context or internet access.
 
 When enabled, the network is `ROADHOG-XXXX`, using the last four hexadecimal
-characters of the Wi-Fi AP MAC address. The network is open and supplies an
-IPv4 address, gateway, and DNS server by DHCP.
+characters of the Wi-Fi AP MAC address. The WPA2 network uses the device
+setup Wi-Fi credential and supplies an IPv4 address, gateway and DNS by DHCP.
 
 Join the network on a phone or laptop. Phones that use HTTP captive network
 checks should offer to open the setup page. If the prompt does not appear,
@@ -21,13 +28,16 @@ open `http://192.168.4.1/` directly. The AP has no internet uplink. The page ref
 every five seconds after sign-in. An active data context does not verify
 internet connectivity.
 
-The initial sign-in is username `admin` and password `roadhog`. Under
-**Change password**, enter the current password and confirm the new one.
-The new password must contain 8 to 64 UTF-8 bytes. Saving signs you out
-and stores a salted password hash in NVS so the new password survives a
-restart. The portal accepts one session at a time, for up to 30 minutes.
-The prototype AP is open and the portal uses HTTP, so traffic on the
-local Wi-Fi has no transport encryption.
+Sign in as `admin` with the password created during setup. Under **Change
+password**, enter the current password and confirm the new one. The new
+password must contain 12 to 64 UTF-8 bytes. Saving signs you out and stores
+a salted password hash in NVS. The portal accepts one session at a time
+for up to 30 minutes. HTTP traffic relies on the private Wi-Fi's link
+protection. Use the device AP directly and keep its Wi-Fi credential private.
+
+The authenticated dashboard shows the SIM phone number only when the modem
+reports one. This is separate from the owner SMS control number. Missing SIM
+number information is shown as “Not available from SIM/carrier.”
 
 To check the portal from a connected computer:
 

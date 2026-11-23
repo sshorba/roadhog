@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+tmp=$(mktemp -d)
+trap 'rm -r "$tmp"' EXIT
+# ESP-IDF APIs are supplied by the NVS fixture. Compile the production logic.
+sed '/^#include "/d' "$root/main/provisioning.c" > "$tmp/provisioning_under_test.inc"
+sed -n '/^bool sms_number_valid/,/^bool sms_users_load/{ /^bool sms_users_load/!p; }
+        /^static const char \*change_user/,/^static void gps_reply/{ /^static void gps_reply/!p; }' \
+    "$root/main/sms_commands.c" > "$tmp/sms_authorization_under_test.inc"
+cc -std=gnu11 -Wall -Wextra -Werror -I "$root/main" -I "$root/tests/provisioning" -I "$tmp" \
+    "$root/tests/provisioning/test_provisioning.c" -o "$tmp/provisioning"
+"$tmp/provisioning"
+cc -std=c11 -Wall -Wextra -Werror -I "$root/main" \
+    "$root/main/sim_number.c" "$root/tests/provisioning/test_sim_number.c" -o "$tmp/sim_number"
+"$tmp/sim_number"

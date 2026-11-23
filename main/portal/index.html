@@ -38,6 +38,24 @@
 <body>
   <main>
     <h1>Road Hog Setup</h1>
+    <section id="factory" hidden>
+      <h2>First-time setup</h2>
+      <p>Connect using the private setup Wi-Fi credential and enter the authorization code provided at the device.</p>
+      <form id="setup" method="post" action="/api/setup">
+        <label>Setup authorization code <input name="token" type="password" autocomplete="off"
+          required minlength="32" maxlength="32"></label>
+        <button id="read-sim" type="button">Read SIM phone number</button>
+        <dl><div><dt>SIM phone number</dt><dd id="setup-sim">Authorization required</dd></div></dl>
+        <label>Owner SMS control number <input name="owner" type="tel" autocomplete="off"
+          placeholder="+ followed by country code and number" required maxlength="16"></label>
+        <label>Carrier APN <input name="apn" autocomplete="off" required maxlength="100"></label>
+        <label>Administrator password <input name="admin" type="password" autocomplete="new-password"
+          required minlength="12" maxlength="64"></label>
+        <label>Confirm administrator password <input name="confirm" type="password" autocomplete="new-password"
+          required minlength="12" maxlength="64"></label>
+        <button type="submit">Save setup</button>
+      </form>
+    </section>
     <section id="signin" hidden>
       <h2>Sign in</h2>
       <form id="login" method="post" action="/api/login">
@@ -52,6 +70,7 @@
         <div><dt>LTE registration</dt><dd id="lte">Checking…</dd></div>
         <div><dt>LTE data context</dt><dd id="data">Checking…</dd></div>
         <div><dt>GPS fix</dt><dd id="gps">Checking…</dd></div>
+        <div><dt>SIM phone number</dt><dd id="sim">Checking…</dd></div>
       </dl>
       <details>
         <summary>Change password</summary>
@@ -74,7 +93,11 @@
     const login = document.getElementById('login');
     const password = document.getElementById('password');
     const logout = document.getElementById('logout');
-    const fields = ['lte', 'data', 'gps'];
+    const fields = ['lte', 'data', 'gps', 'sim'];
+    const factory = document.getElementById('factory');
+    const setup = document.getElementById('setup');
+    const readSim = document.getElementById('read-sim');
+    let setupMode = false;
     let pending = false;
     let generation = 0;
 
@@ -103,7 +126,7 @@
     }
 
     async function refreshStatus() {
-      if (pending) return;
+      if (pending || setupMode) return;
       const started = generation;
       try {
         const response = await request('/api/status');
@@ -183,7 +206,53 @@
       if (await submit('/api/logout', '', logout)) showSignin();
     });
 
-    poll();
+    readSim.addEventListener('click', async () => {
+      if (pending || !setup.elements.token.reportValidity()) return;
+      pending = true;
+      readSim.disabled = true;
+      const display = document.getElementById('setup-sim');
+      display.textContent = 'Checking…';
+      message('');
+      try {
+        const response = await request('/api/setup/sim', { method: 'POST', body: setup.elements.token.value });
+        const text = await response.text();
+        display.textContent = response.ok ? text : 'Authorization required';
+        if (!response.ok) message(text);
+      } catch {
+        display.textContent = 'Could not read the SIM number';
+      } finally {
+        pending = false;
+        readSim.disabled = false;
+      }
+    });
+
+    setup.addEventListener('submit', async event => {
+      event.preventDefault();
+      const { token, owner, apn, admin, confirm } = setup.elements;
+      if (admin.value !== confirm.value) {
+        message('The administrator passwords do not match.');
+        return;
+      }
+      if (await submit('/api/setup', [token.value, owner.value, apn.value, admin.value].join('\n'),
+                       event.submitter)) {
+        setup.reset();
+        setup.hidden = true;
+        message('Setup saved. Restart Road Hög to enable the new settings.');
+      }
+    });
+
+    async function start() {
+      try {
+        const response = await request('/api/setup/state');
+        if (!response.ok) throw new Error('Setup state unavailable');
+        setupMode = await response.text() === 'factory';
+        factory.hidden = !setupMode;
+        if (!setupMode) poll();
+      } catch {
+        message('Can’t read setup state. Check your Wi-Fi connection.');
+      }
+    }
+    start();
   </script>
 </body>
 </html>
