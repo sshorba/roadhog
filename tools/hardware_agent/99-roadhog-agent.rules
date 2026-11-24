@@ -1,0 +1,5 @@
+# QinHeng bridge observed on the Ubuntu bench.
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", ATTRS{serial}=="5CF9174631", GROUP="roadhog-agent", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
+# Native Espressif USB Serial/JTAG for the same enrolled prototype.
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ATTRS{serial}=="98:[cC]3:77:[bB]4:1[aA]:10", GROUP="roadhog-agent", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ATTRS{serial}=="98[cC]377[bB]41[aA]10", GROUP="roadhog-agent", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"

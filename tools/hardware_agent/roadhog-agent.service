@@ -1,0 +1,30 @@
+[Unit]
+Description=Road Hog read-only hardware test agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=roadhog-agent
+Group=roadhog-agent
+StateDirectory=roadhog-agent
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/opt/roadhog-agent/venv/bin/python -E -s -B /opt/roadhog-agent/agent.py --state-dir /var/lib/roadhog-agent --token-file /var/lib/roadhog-agent/github.token
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+DevicePolicy=closed
+DeviceAllow=char-ttyACM rw
+
+[Install]
+WantedBy=multi-user.target
