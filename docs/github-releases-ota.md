@@ -121,8 +121,9 @@ configure ESP32 Secure Boot.
 5. After the owner approves the exact signed candidate and confirms stable
    power, send `ota install powered 2` locally. Verify the inactive slot,
    reported size and digest, and restored AT/SMS/GNSS before checking the new
-   boot selection. SMS service and GNSS AT queries pause while PPP holds
-   the UART. The Wi-Fi portal stays up.
+   boot selection. Once selected, the candidate will boot on the next reset,
+   including an unexpected power cycle. SMS service and GNSS AT queries pause
+   while PPP holds the UART. The Wi-Fi portal stays up.
 6. Reboot manually only after a separate owner decision. Release the local
    console before resuming passive capture with the station. Verify the
    candidate moves from PENDING_VERIFY to VALID, remains selected after a
