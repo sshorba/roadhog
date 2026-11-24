@@ -1,9 +1,9 @@
 # Road Hog SMS commands
 
-Enable **Road Hog SMS control** in `idf.py menuconfig` and enter the owner
-number with a leading `+` and country code. Build with ESP-IDF v6.1.1 using
-`idf.py build`. Flash and monitor using `idf.py -p /dev/ttyACM0 flash monitor`.
-Wait for `SMS commands enabled`.
+**Road Hog SMS control** is enabled by default. After authorized [first-time
+setup](factory-provisioning.md), restart and wait for `SMS commands enabled`.
+The owner is the validated E.164 number in the provisioning record. A factory
+device and a device with unreadable provisioning authorize no SMS senders.
 
 Send a command by SMS to the modem SIM. Command names are case-insensitive
 and trailing spaces are ignored. Road Hog responds to an authorized sender. An unrecognized command receives
@@ -18,12 +18,11 @@ and trailing spaces are ignored. Road Hog responds to an authorized sender. An u
 | `USERS` | Owner and authorized numbers |
 | `ADDUSER +number` | Add a number, owner only |
 | `DELUSER +number` | Remove a number, owner only |
-| `APON` | Enable the setup AP, owner only |
+| `APON` | Enable the setup AP. The owner receives its SSID and current Wi-Fi password, even if it is already enabled. |
 | `APOFF` | Disable the setup AP while LTE is registered, owner only |
 
 Use a single space before the international number. The six additional
-numbers persist in NVS across resets. The owner is defined by the firmware
-configuration. SMS sender numbers can be spoofed. Anyone accepted as an
+numbers persist in the existing `sms/users_v1` NVS record across reboots. SMS sender numbers can be spoofed. Anyone accepted as an
 authorized sender can request location and the sender list.
 
 STATUS checks the modem when requested. An active data context indicates a

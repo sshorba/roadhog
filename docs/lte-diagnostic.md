@@ -17,9 +17,9 @@ its carrier-specific fields, are left intact.
 
 The diagnostic defines only the temporary IPv4 CID, then requests PPP
 on that CID with `AT+CGDATA`. It starts ESP-NETIF PPP only after a
-`CONNECT` result. When IPv4 comes up, it resolves
-`connectivitycheck.gstatic.com`, synchronizes its clock over SNTP, and
-sends a certificate- and hostname-verified HTTPS HEAD request. Only an
+`CONNECT` result. When IPv4 comes up, it synchronizes its clock over SNTP,
+resolves `connectivitycheck.gstatic.com`, and sends a certificate- and
+hostname-verified HTTPS HEAD request. Only an
 HTTP 2xx counts as success.
 
 The setup AP may stay online during the test. Its portal and the LEDs use
@@ -55,10 +55,10 @@ available and the serial log calls for a power cycle of both devices.
      -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.lte-diagnostic.defaults' menuconfig
    ```
 
-2. Under **Road Hog LTE diagnostic**, enter the APN for your provisioned
-   US Mobile network. The default delay is 90 seconds after startup
-   checks. Set up the SMS owner locally as described in
-   [SMS commands](sms.md), select the board-specific LED GPIO, and
+2. Use the carrier APN saved in [first-time setup](factory-provisioning.md).
+   The diagnostic runs only when an APN is provisioned. Set the delay
+   under **Road Hog LTE diagnostic** (90 seconds by default), select the
+   board-specific LED GPIO, and
    match the existing flash configuration. Keep the certificate bundle,
    HTTPS and certificate validity date checks enabled.
 
@@ -98,10 +98,10 @@ available and the serial log calls for a power cycle of both devices.
 - **No SIM or no registration.** With bench power off, remove the SIM or
   otherwise use an unregistered test SIM. Boot and check that the
   diagnostic skips at the deadline and the fallback AP remains available.
-- **Wrong APN.** Rebuild with a deliberately invalid test APN. Look for
-  attach, dial, or IPv4 failure and the subsequent AT readiness message.
-  Verify that a new `STATUS` still works with the registered SIM. Restore
-  the correct APN for later tests.
+- **Wrong APN.** On an approved disposable test profile, provision a
+  syntactically valid APN that the test carrier will reject. Look for attach,
+  dial, or IPv4 failure and the subsequent AT readiness message. Verify
+  that a new `STATUS` still works with the registered SIM.
 - **Occupied diagnostic CID or unattached packet service.** Check that an
   occupied CID 8 or an unattached modem causes the diagnostic to skip.
   Confirm that SMS resumes on a registered device. Check PDP inventory

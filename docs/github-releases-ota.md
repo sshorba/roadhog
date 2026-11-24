@@ -47,10 +47,19 @@ openssl dgst -sha256 -verify /path/to/release-public.pem \
 Use a PEM SubjectPublicKeyInfo P-256 public key. Keep the private key offline
 and out of source control, CI, and release assets. Review the image provenance,
 test results, embedded public key, configuration and asset checksums before any
-publication. A personalized test binary contains its compiled SMS owner.
-**Keep personalized binaries on a private bench endpoint.** Generic production
-publishing depends on the reviewed owner-provisioning work described in the
-[design notes](github-releases-ota-design.md).
+publication. Build installer and release artifacts from reviewed source commits
+and record their build configuration and SHA-256 digests. The generic images
+load the owner, carrier APN, portal settings and admin credentials from
+`device_cfg/settings_v1` in NVS, via [factory provisioning](factory-provisioning.md).
+Neither the release nor the signing manifest contains per-device provisioning.
+Verify this before approving any public asset.
+
+For a future owner-approved publication, create a GitHub release for tag
+`vN` at the exact reviewed source commit. Attach the three verified assets
+to the draft and review the release notes, tag, target, sequence and digests.
+Only publish after bench acceptance. A draft or private GitHub release is
+unavailable to the firmware's unauthenticated HTTPS fetcher. Use the
+separate bench HTTPS endpoint below for prepublication trials.
 
 The bench operator supplies the sequence. The firmware builds each URL as
 `<release-base>/vN/roadhog-vN.<suffix>`. The standard base is
@@ -85,40 +94,44 @@ configure ESP32 Secure Boot.
 
 ## Bench procedure
 
-1. Preserve the full recovery backup and private configuration. Confirm the
-   current OTA slot/state, supply voltage and stable external power for both
-   devices. Leave the inactive slot available. Build the normal and LTE/OTA
-   versions locally with v6.1.1. For the installer, layer the LTE diagnostic and
-   16 MB OTA defaults, preserve the private APN and SMS owner, and enable
-   `CONFIG_ROADHOG_OTA_UPDATE_BENCH`. Disable both rollback bench flags.
-2. Build the installer with `-D PROJECT_VER=1` and
-   `-D ROADHOG_OTA_PUBLIC_KEY=/absolute/path/to/test-public.pem`. Build a
-   genuinely newer bench candidate with `-D PROJECT_VER=2` and the same private
-   settings. Check app size and image info. Serve the three signed assets on an
-   approved private endpoint. Adjust the release base and host allowlist in the
-   installer before its build when using a bench server. Use an ephemeral
-   test key and do not reuse a production key.
-3. After separate approval, provision the bench installer into the intended
-   application slot using the existing layout. Verify that it is selected
-   and VALID, and verify SMS STATUS, GPS and portal operation. Do not erase
-   metadata or change other partitions as part of an OTA install.
-4. Send one complete line `ota check 2` through the configured physical UART
-   console. The explicit dry run makes no application writes. Confirm PPP,
-   signed-manifest verification, command-mode recovery and SMS restoration.
-   There is no scheduled LTE diagnostic in the enabled OTA bench build.
-5. With stable power, send `ota install powered 2`. The operator confirmation
-   is a bench prerequisite, since the device has no qualified power sensor.
-   Capture the manifest, slot, length, digest and download progress. Confirm
-   the device stages only the inactive application, verifies it, closes HTTPS,
-   tears down PPP, and restores AT/SMS before selecting the new boot slot.
-   GNSS is reinitialized after the AT driver reopens. SMS and GNSS AT operations
-   pause while PPP owns the UART. The Wi-Fi portal stays up.
-6. Verify SMS response after the download. Reboot the ESP32 manually only after
-   the candidate is selected. Capture pending verification and the health
-   result, and verify a subsequent boot stays on the validated image. Test SMS
-   STATUS/GPS, the portal and LEDs. Check NVS and the working application slot
-   against the prior snapshot where applicable. Use a separate approved
-   procedure for a failing candidate or flash recovery.
+1. In an owner-approved maintenance window, confirm stable power for the
+   modem and ESP32, a verified private recovery backup, the expected 16 MiB
+   A/B layout and a selected VALID application. Check STATUS, GPS and portal
+   access on the existing generic-provisioned firmware. Use the existing local
+   Ubuntu station for passive reports and, if separately approved, a read-only
+   layout check. Keep the recovery backup offline.
+2. Build the generic installer and newer candidate locally from reviewed source
+   using ESP-IDF v6.1.1. Layer the 16 MiB OTA and LTE diagnostic defaults,
+   enable `CONFIG_ROADHOG_OTA_UPDATE_BENCH` for the installer, and leave both
+   rollback bench flags disabled. Use decimal project versions such as 1 and 2.
+   Embed the ephemeral bench public key with
+   `-D ROADHOG_OTA_PUBLIC_KEY=/absolute/path/to/test-public.pem` for each
+   OTA-capable image. Check image metadata and slot size. Sign the three
+   candidate assets and serve them over approved private HTTPS. Set the bench
+   release base and allowlist before building the installer.
+3. If the selected app has no OTA console, provision the installer only through
+   a separately approved local maintenance procedure. Verify the selected
+   VALID installer and repeat the SMS, GNSS and portal baseline. Preserve
+   the existing provisioning, bootloader, partition table and recovery image.
+4. Pause the station's passive serial reader while the operator owns the port.
+   Confirm the attached bridge exposes the configured ESP32 UART console.
+   Send `ota check 2` as a complete console line. Confirm PPP, signature
+   verification and AT/SMS/GNSS recovery. The dry run leaves the app slots
+   unchanged. The installer has no scheduled PPP diagnostic.
+5. After the owner approves the exact signed candidate and confirms stable
+   power, send `ota install powered 2` locally. Verify the inactive slot,
+   reported size and digest, and restored AT/SMS/GNSS before checking the new
+   boot selection. SMS service and GNSS AT queries pause while PPP holds
+   the UART. The Wi-Fi portal stays up.
+6. Reboot manually only after a separate owner decision. Release the local
+   console before resuming passive capture with the station. Verify the
+   candidate moves from PENDING_VERIFY to VALID, remains selected after a
+   later approved reboot, preserves provisioning, and passes STATUS/GPS
+   and portal checks. If the candidate fails, verify the prior VALID slot
+   returns and follow the separate recovery procedure if needed.
+
+The Phase 1 hardware agent remains read-only. The operator handles any
+console input, installer provisioning, and resets locally.
 
 The transfer checks PPP routing, uses bounded DNS waits, an HTTP I/O timeout,
 a five-minute transfer budget capped at seven minutes from command initiation,
@@ -157,7 +170,7 @@ GitHub-style redirects, including a chunked transfer. It starts with a populated
 inactive slot and checks the erased sectors, image bytes, and untouched tail.
 It checks that a dry run, invalid signature, altered or truncated image,
 HTTP failure, invalid staged image, readback mismatch, TLS or redirect failure,
-unavailable slot, lost data link, or failed LTE/AT/SMS/GNSS recovery cannot
+unavailable slot, factory/no-APN state, lost data link, or failed LTE/AT/SMS/GNSS recovery cannot
 select a candidate. All cases compare the complete flash outside the inactive
 application byte for byte, including the running image and NVS. Boot selection
 is modeled separately, and the SDK lifecycle fixture exercises the real
@@ -165,8 +178,8 @@ boot-selection and rollback logic.
 
 ## Remaining hardware validation
 
-Use only a private, signed test release with the existing compiled SMS owner
-for the first trial. After separate approval:
+Use a private, signed test candidate on the existing generic-provisioned
+prototype. After separate approval:
 
 1. Confirm the currently selected VALID image, stable bench power and usable
    SMS, GPS and portal. Capture partition and NVS baselines as needed.

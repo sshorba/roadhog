@@ -1,5 +1,6 @@
 #include "sdkconfig.h"
 #include "lte_diagnostic.h"
+#include "provisioning.h"
 
 #ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
 
@@ -34,11 +35,12 @@ modem_t *lte_session_run(modem_t *modem, const modem_config_t *config, bool *uar
 {
     *uart_reopened = false;
     *session_result = ESP_ERR_INVALID_ARG;
-    if (!cellular_apn_valid(CONFIG_ROADHOG_LTE_APN)) {
-        ESP_LOGE(TAG, "Set a valid carrier APN in menuconfig");
+    const char *apn = provisioning_apn();
+    if (!apn || !cellular_apn_valid(apn)) {
+        ESP_LOGE(TAG, "Provision a valid carrier APN");
         return modem;
     }
-    // One diagnostic per boot. If the worker outlives the deadline it retains
+    // Calls are serialized by the AT owner. If a worker outlives its deadline it retains
     // valid storage and exclusive ownership of the UART until it exits.
     static diagnostic_t diagnostic;
     static StaticSemaphore_t done_storage;
@@ -48,7 +50,7 @@ modem_t *lte_session_run(modem_t *modem, const modem_config_t *config, bool *uar
             .tx_pin = config->tx_pin,
             .rx_pin = config->rx_pin,
             .baud_rate = config->baud_rate,
-            .apn = CONFIG_ROADHOG_LTE_APN,
+            .apn = apn,
         },
         .done = xSemaphoreCreateBinaryStatic(&done_storage),
         .result = ESP_ERR_NO_MEM,

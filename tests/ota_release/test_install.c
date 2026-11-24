@@ -22,7 +22,7 @@
 #define CONFIG_ROADHOG_OTA_RELEASE_BASE "https://github.com/sshorba/roadhog/releases/download"
 #define CONFIG_ROADHOG_OTA_RELEASE_HOSTS "github.com,release-assets.githubusercontent.com,wrong.example"
 #define CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 1
-#define CONFIG_ROADHOG_LTE_APN "fixture"
+#define FIXTURE_APN "fixture.carrier"
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 typedef int esp_err_t;
@@ -361,16 +361,21 @@ static esp_err_t esp_netif_get_netif_impl_name(esp_netif_t *netif, char *name)
     return ESP_OK;
 }
 
+static const char *provisioning_apn(void)
+{
+    return is_case("missing-apn") || is_case("factory") ? NULL : FIXTURE_APN;
+}
+
 static bool cellular_apn_valid(const char *apn)
 {
-    return !strcmp(apn, CONFIG_ROADHOG_LTE_APN);
+    return !strcmp(apn, FIXTURE_APN);
 }
 
 static esp_err_t cellular_net_session(const cellular_net_config_t *config, bool *recovered,
                                       cellular_operation_t operation, void *context)
 {
     esp_netif_t netif = {0};
-    assert(config && operation && !uart_open && !ppp_active);
+    assert(config && !strcmp(config->apn, FIXTURE_APN) && operation && !uart_open && !ppp_active);
     ppp_active = true;
     esp_err_t result = operation(&netif, context);
     ppp_active = false;
@@ -632,7 +637,7 @@ int main(int argc, char **argv)
     memcpy(baseline, flash, sizeof(flash));
     uart_open = true;
     modem_config_t config = {0};
-    sms_control_t sms = {.configured = true};
+    sms_control_t sms = {.configured = !is_case("factory")};
     const char *command = is_case("dry-run") ? "ota check 2" : "ota install powered 2";
     modem_t *result = run_update(&fixture_modem, &config, &sms, command);
 
@@ -669,7 +674,8 @@ int main(int argc, char **argv)
     }
     if (is_case("dry-run")) {
         assert(at_ready && sms_ready && gps_ready && requests == 4);
-    } else if (is_case("link-down") || is_case("missing-slot")) {
+    } else if (is_case("link-down") || is_case("missing-slot") ||
+               is_case("factory") || is_case("missing-apn")) {
         assert(requests == 0);
     } else if (is_case("redirect-loop")) {
         assert(requests == 4);

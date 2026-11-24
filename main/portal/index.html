@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>Road Hog Setup</title>
   <style>
+    [hidden] { display: none !important }
     *, *::before, *::after { box-sizing: border-box }
     body { margin: 0; min-height: 100vh; display: grid; place-items: center;
            padding: 1.25rem; background: #141815; color: #f2f3eb;
@@ -38,6 +39,36 @@
 <body>
   <main>
     <h1>Road Hog Setup</h1>
+    <section id="factory" hidden>
+      <h2>First-time setup</h2>
+      <button id="begin-setup" type="button">Start setup</button>
+      <form id="setup" method="post" action="/api/setup" hidden>
+        <label>Owner SMS control number <input name="owner" type="tel" autocomplete="off"
+          placeholder="+ followed by country code and number" required maxlength="16"></label>
+        <button id="send-code" type="button">Send owner verification SMS</button>
+        <button id="change-owner" type="button" hidden>Change number</button>
+        <button id="retry-later" type="button" hidden>Retry later</button>
+        <p id="verification-status" role="status"></p>
+        <label>Owner verification code <input name="code" type="text" inputmode="numeric"
+          autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required></label>
+        <label>Carrier APN <input name="apn" autocomplete="off" required maxlength="100"></label>
+        <label>Administrator password <input name="admin" type="password" autocomplete="new-password"
+          required minlength="12" maxlength="64"></label>
+        <label>Confirm administrator password <input name="confirm" type="password" autocomplete="new-password"
+          required minlength="12" maxlength="64"></label>
+        <button type="submit">Verify SMS code</button>
+      </form>
+      <div id="button-step" hidden>
+        <p role="status">SMS verified. Press and release the external setup button within 30 seconds.</p>
+        <button id="cancel-button" type="button">Cancel confirmation</button>
+      </div>
+      <div id="setup-saved" hidden>
+        <p>Save this Wi-Fi password for the configured device.</p>
+        <p><code id="configured-wifi"></code></p>
+        <dl><div><dt>SIM phone number</dt><dd id="setup-sim">Checking…</dd></div></dl>
+        <p>Restart Road Hög to activate the new settings.</p>
+      </div>
+    </section>
     <section id="signin" hidden>
       <h2>Sign in</h2>
       <form id="login" method="post" action="/api/login">
@@ -52,6 +83,9 @@
         <div><dt>LTE registration</dt><dd id="lte">Checking…</dd></div>
         <div><dt>LTE data context</dt><dd id="data">Checking…</dd></div>
         <div><dt>GPS fix</dt><dd id="gps">Checking…</dd></div>
+        <div><dt>Registered owner phone number</dt><dd id="owner">Checking…</dd></div>
+        <div><dt>SIM phone number</dt><dd id="sim">Checking…</dd></div>
+        <div><dt>Wi-Fi password</dt><dd id="wifi_password">Checking…</dd></div>
       </dl>
       <details>
         <summary>Change password</summary>
@@ -74,7 +108,19 @@
     const login = document.getElementById('login');
     const password = document.getElementById('password');
     const logout = document.getElementById('logout');
-    const fields = ['lte', 'data', 'gps'];
+    const fields = ['lte', 'data', 'gps', 'owner', 'sim', 'wifi_password'];
+    const factory = document.getElementById('factory');
+    const setup = document.getElementById('setup');
+    const beginSetup = document.getElementById('begin-setup');
+    const buttonStep = document.getElementById('button-step');
+    const cancelButton = document.getElementById('cancel-button');
+    const setupSaved = document.getElementById('setup-saved');
+    let setupToken = '';
+    function rememberSetupToken(token) {
+      setupToken = token;
+      try { sessionStorage.setItem('roadhogSetupToken', token); } catch {}
+    }
+    let setupMode = false;
     let pending = false;
     let generation = 0;
 
@@ -84,6 +130,7 @@
     }
 
     function showSignin() {
+      document.getElementById("wifi_password").textContent = "—";
       if (signin.hidden) {
         password.reset();
         dashboard.querySelector('details').open = false;
@@ -103,7 +150,7 @@
     }
 
     async function refreshStatus() {
-      if (pending) return;
+      if (pending || setupMode) return;
       const started = generation;
       try {
         const response = await request('/api/status');
@@ -183,7 +230,175 @@
       if (await submit('/api/logout', '', logout)) showSignin();
     });
 
-    poll();
+    const sendCode = document.getElementById('send-code');
+    const changeOwner = document.getElementById('change-owner');
+    const retryLater = document.getElementById('retry-later');
+    const verificationStatus = document.getElementById('verification-status');
+    let verificationGeneration = 0;
+
+    async function watchVerification(current) {
+      if (current !== verificationGeneration) return;
+      try {
+        if (!pending) {
+          const response = await request('/api/setup', {
+            method: 'POST', body: setupToken + '\nstatus'
+          });
+          const text = await response.text();
+          if (current !== verificationGeneration) return;
+          verificationStatus.textContent = response.ok ? text : 'Verification status unavailable.';
+          if (response.status === 403) return;
+        }
+      } catch {
+        if (current === verificationGeneration) {
+          verificationStatus.textContent = 'Verification status unavailable. Check your Wi-Fi connection.';
+        }
+      }
+      setTimeout(() => watchVerification(current), 3000);
+    }
+
+    sendCode.addEventListener('click', async () => {
+      const { owner, code } = setup.elements;
+      if (!setupToken || !owner.reportValidity()) return;
+      if (await submit('/api/setup', [setupToken, 'send', owner.value].join('\n'), sendCode)) {
+        owner.readOnly = true;
+        code.value = '';
+        sendCode.textContent = 'Resend owner verification SMS';
+        changeOwner.hidden = retryLater.hidden = false;
+        await watchVerification(++verificationGeneration);
+      }
+    });
+
+    async function cancelVerification(control) {
+      if (await submit('/api/setup', setupToken + '\ncancel', control)) {
+        verificationGeneration++;
+        buttonStep.hidden = true;
+        setup.hidden = false;
+        setup.elements.owner.readOnly = false;
+        setup.elements.code.value = '';
+        sendCode.textContent = 'Send owner verification SMS';
+        changeOwner.hidden = retryLater.hidden = true;
+        verificationStatus.textContent = 'Verification canceled. You can request another SMS when ready.';
+        return true;
+      }
+      return false;
+    }
+
+    changeOwner.addEventListener('click', async () => {
+      if (await cancelVerification(changeOwner)) {
+        setup.elements.owner.value = '';
+        setup.elements.owner.focus();
+      }
+    });
+    retryLater.addEventListener('click', () => cancelVerification(retryLater));
+
+    cancelButton.addEventListener('click', () => cancelVerification(cancelButton));
+
+    async function finishSetup(resume = false) {
+      if (pending) return;
+      pending = true;
+      cancelButton.disabled = true;
+      let retry = false;
+      try {
+        const response = await request('/api/setup', { method: 'POST', body: setupToken + '\nfinish' });
+        const text = await response.text();
+        if (response.status === 202) {
+          setup.hidden = true;
+          buttonStep.hidden = false;
+          retry = true;
+        } else if (response.ok) {
+          setup.reset();
+          setup.hidden = buttonStep.hidden = true;
+          document.getElementById('configured-wifi').textContent = text;
+          setupSaved.hidden = false;
+          message('');
+          try {
+            const sim = await request('/api/setup/sim', { method: 'POST', body: setupToken });
+            document.getElementById('setup-sim').textContent = sim.ok ? await sim.text() : 'Unavailable';
+          } catch {
+            document.getElementById('setup-sim').textContent = 'Unavailable';
+          }
+        } else {
+          buttonStep.hidden = true;
+          setup.hidden = response.status === 403 || response.status >= 500;
+          if (response.status === 403) {
+            rememberSetupToken('');
+            beginSetup.hidden = false;
+          }
+          if (!resume || response.status !== 409) message(text);
+        }
+      } catch {
+        message('Can’t check button confirmation. Check your Wi-Fi connection.');
+        retry = true;
+      } finally {
+        pending = false;
+        cancelButton.disabled = false;
+      }
+      if (retry) setTimeout(() => {
+        if (!buttonStep.hidden || resume) finishSetup(resume);
+      }, 1000);
+    }
+
+    beginSetup.addEventListener('click', async () => {
+      if (pending) return;
+      pending = true;
+      beginSetup.disabled = true;
+      try {
+        const response = await request('/api/setup', { method: 'POST', body: 'session' });
+        const token = await response.text();
+        if (!response.ok) {
+          message(token);
+          return;
+        }
+        rememberSetupToken(token);
+        beginSetup.hidden = true;
+        setup.hidden = false;
+        message('');
+      } catch {
+        message('Can’t start setup. Check your Wi-Fi connection.');
+      } finally {
+        pending = false;
+        beginSetup.disabled = false;
+      }
+    });
+
+    setup.addEventListener('submit', async event => {
+      event.preventDefault();
+      const { owner, code, apn, admin, confirm } = setup.elements;
+      if (admin.value !== confirm.value) {
+        message('The administrator passwords do not match.');
+        return;
+      }
+      if (await submit('/api/setup', [setupToken, 'confirm', owner.value, code.value, apn.value, admin.value].join('\n'),
+                       event.submitter)) {
+        verificationGeneration++;
+        code.value = admin.value = confirm.value = '';
+        setup.hidden = true;
+        buttonStep.hidden = false;
+        await finishSetup();
+      }
+    });
+
+    async function start() {
+      try {
+        const response = await request('/api/setup/state');
+        if (!response.ok) throw new Error('Setup state unavailable');
+        setupMode = await response.text() === 'factory';
+        factory.hidden = !setupMode;
+        if (!setupMode) {
+          rememberSetupToken('');
+          poll();
+        } else {
+          try { setupToken = sessionStorage.getItem('roadhogSetupToken') || ''; } catch {}
+          if (setupToken) {
+            beginSetup.hidden = true;
+            await finishSetup(true);
+          }
+        }
+      } catch {
+        message('Can’t read setup state. Check your Wi-Fi connection.');
+      }
+    }
+    start();
   </script>
 </body>
 </html>

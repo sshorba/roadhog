@@ -1,4 +1,5 @@
 #include "sms_commands.h"
+#include "provisioning.h"
 #include "portal.h"
 #include "connection_status.h"
 
@@ -13,13 +14,14 @@ static const char *const unknown = "Unknown command, send \"?\" for help.";
 
 bool sms_number_valid(const char *number)
 {
-    size_t length = strlen(number);
-    return length >= 3 && length < SMS_NUMBER_CAPACITY && number[0] == '+' &&
-           number[1] != '0' && strspn(number + 1, "0123456789") == length - 1;
+    return provisioning_owner_valid(number);
 }
 
 bool sms_sender_allowed(const sms_control_t *sms, const char *sender)
 {
+    if (!sms->owner || !sms_number_valid(sender)) {
+        return false;
+    }
     if (strcmp(sms->owner, sender) == 0) {
         return true;
     }
@@ -149,13 +151,25 @@ void sms_command_reply(sms_control_t *sms, modem_t *modem, const sms_request_t *
     if (strcmp(command, "?") == 0) {
         message = "Commands:\n? - Help\nSTATUS - Online\nGPS - Fix, speed, coordinates\nMAP - Google Maps\nUSERS - Authorized numbers\nADDUSER +number\nDELUSER +number\nAPON / APOFF";
     } else if (strcmp(command, "APON") == 0 || strcmp(command, "APOFF") == 0) {
-        if (strcmp(request->sender, sms->owner) != 0) {
+        bool enable = strcmp(command, "APON") == 0;
+        if (!sms_sender_allowed(sms, request->sender)) {
+            message = "Unauthorized";
+        } else if (!enable && strcmp(request->sender, sms->owner) != 0) {
             message = "Owner only";
         } else {
-            bool enable = strcmp(command, "APON") == 0;
             esp_err_t error = portal_request(enable);
             if (error == ESP_OK) {
                 message = enable ? "AP enabled" : "AP disabled";
+                if (enable && strcmp(request->sender, sms->owner) == 0 &&
+                    provisioning_state() == PROVISION_CONFIGURED) {
+                    const char *password = provisioning_wifi_password();
+                    char ssid[PORTAL_SSID_CAPACITY];
+                    if (password && portal_get_ssid(ssid) == ESP_OK) {
+                        snprintf(reply, SMS_TEXT_CAPACITY, "AP enabled\nSSID: %s\nWi-Fi password: %s",
+                                 ssid, password);
+                        return;
+                    }
+                }
             } else if (error == ESP_ERR_INVALID_STATE && !enable) {
                 message = "AP stays enabled: cellular unavailable";
             } else {

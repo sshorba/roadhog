@@ -25,6 +25,7 @@ CASES = (
     "session-timeout", "sms-failure", "gnss-failure", "wrong-cert",
     "untrusted-cert", "redirect-http", "redirect-host", "redirect-loop",
     "duplicate-location", "invalid-image", "readback-digest", "link-down", "missing-slot",
+    "factory", "missing-apn",
 )
 
 
