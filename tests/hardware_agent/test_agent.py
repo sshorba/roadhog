@@ -1,9 +1,12 @@
+import configparser
 import copy
+from fnmatch import fnmatchcase
 from datetime import datetime, timedelta, timezone
 import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
+import shlex
 import sqlite3
 import struct
 import subprocess
@@ -21,6 +24,7 @@ from github import GitHub, GitHubError, REPO_ID
 NOW = datetime(2026, 11, 24, 8, 0, 5, tzinfo=timezone.utc)
 SHA = "a" * 40
 ID = "0e11ea1f-89d1-4d23-b7f0-0543bc108ac0"
+CONNECTOR = {"id": 1144995, "slug": "chatgpt-codex-connector"}
 SECOND_ID = "0e11ea1f-89d1-4d23-b7f0-0543bc108ac1"
 
 
@@ -34,11 +38,12 @@ def manifest(**changes):
     )
 
 
-def request(job=None, comment_id=41, maintainer=agent.MAINTAINER):
+def request(job=None, comment_id=41, maintainer=agent.MAINTAINER, app=None):
     timestamp = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "id": comment_id,
         "user": {"id": maintainer, "type": "User"},
+        "performed_via_github_app": app,
         "created_at": timestamp,
         "updated_at": timestamp,
         "body": "```roadhog-job\n" + json.dumps(job or manifest()) + "\n```",
@@ -96,6 +101,38 @@ class ManifestTests(TestCase):
                 self.assertIsNone(agent.parse_job(dict(approved, **override), NOW))
         self.assertIsNone(agent.parse_job(approved, NOW + timedelta(hours=24, seconds=1)))
         self.assertIsNone(agent.parse_job(approved, NOW - timedelta(seconds=1)))
+
+    def test_actual_connector_provenance_allows_only_the_three_passive_operations(self):
+        for job in (
+            manifest(),
+            manifest(operation="serial-capture", plan={"seconds": 30}),
+            manifest(operation="build-validation", plan={}, artifact={"id": 10, "sha256": "f" * 64}),
+        ):
+            with self.subTest(operation=job["operation"]):
+                self.assertEqual(agent.parse_job(request(job, app=CONNECTOR), NOW), job)
+        for operation in ("device-info", "verify-layout", "reset", "flash", "config-write"):
+            job = manifest(operation=operation, plan={})
+            self.assertIsNone(agent.parse_job(request(job, app=CONNECTOR), NOW))
+        self.assertIsNone(agent.parse_job(request(manifest(plan={"seconds": 31}), app=CONNECTOR), NOW))
+
+    def test_connector_rejects_unknown_ambiguous_bot_other_actor_and_edited(self):
+        for app in (
+            {}, False, True, {"id": CONNECTOR["id"]}, {"slug": CONNECTOR["slug"]},
+            dict(CONNECTOR, id=12), dict(CONNECTOR, slug="someone-else"),
+            dict(CONNECTOR, id=str(CONNECTOR["id"])),
+        ):
+            with self.subTest(app=app):
+                self.assertIsNone(agent.parse_job(request(app=app), NOW))
+        original = request(app=CONNECTOR)
+        for modified in (
+            request(app=CONNECTOR, maintainer=999),
+            dict(original, user={"id": agent.MAINTAINER, "type": "Bot"}),
+            dict(original, updated_at="2026-11-24T08:00:06Z"),
+        ):
+            self.assertIsNone(agent.parse_job(modified, NOW))
+        direct = request()
+        del direct["performed_via_github_app"]
+        self.assertIsNone(agent.parse_job(direct, NOW))
 
 
 class PollTests(TestCase):
@@ -169,6 +206,16 @@ class PollTests(TestCase):
         self.device.return_value = "layout-ok"
         self.poll(github, ID)
         self.device.assert_called_once_with("verify-layout", 0)
+
+    def test_connector_cannot_dispatch_even_an_operator_selected_rom_uuid(self):
+        job = manifest(operation="device-info", plan={})
+        github = FakeGH([request(job, app=CONNECTOR)])
+        self.poll(github, ID)
+        self.device.assert_not_called()
+        self.assertFalse(github.posts)
+        github.comments.append(request(job, comment_id=42))
+        self.poll(github, ID)
+        self.device.assert_called_once_with("device-info", 0)
 
     def test_build_validation_never_uses_device(self):
         job = manifest(operation=agent.BUILD, plan={}, artifact={"id": 52, "sha256": "b" * 64})
@@ -478,3 +525,47 @@ class LocalSecurityTests(TestCase):
                     self.assertEqual(error.exception.code, 2 if flag else 1)
             request.assert_called_once_with("/user")
             station.assert_not_called()
+
+
+class DeploymentTests(TestCase):
+    tools = Path(agent.__file__).parent
+
+    def test_native_udev_globs_match_both_serial_spellings(self):
+        lines = (self.tools / "99-roadhog-agent.rules").read_text().splitlines()
+        native_patterns = [
+            line.split('ATTRS{serial}=="', 1)[1].split('"', 1)[0]
+            for line in lines
+            if 'ATTRS{idVendor}=="303a"' in line and 'ATTRS{idProduct}=="1001"' in line
+        ]
+        for serial in ("98:C3:77:B4:1A:10", "98c377b41a10", "98c377B41A10"):
+            self.assertTrue(any(fnmatchcase(serial, pattern) for pattern in native_patterns))
+        for serial in ("98:C3:77:B4:1A:11", "98c377b41a100", "5CF9174631"):
+            self.assertFalse(any(fnmatchcase(serial, pattern) for pattern in native_patterns))
+
+    def test_service_runs_agent_directly_and_publishes_connector_report(self):
+        unit = configparser.ConfigParser()
+        unit.read(self.tools / "roadhog-agent.service")
+        service = unit["Service"]
+        self.assertEqual(service["User"], "roadhog-agent")
+        self.assertEqual(service["Group"], "roadhog-agent")
+        self.assertTrue(service.getboolean("NoNewPrivileges"))
+        command = shlex.split(service["ExecStart"])
+        self.assertEqual(command[:5], [
+            "/opt/roadhog-agent/venv/bin/python", "-E", "-s", "-B", "/opt/roadhog-agent/agent.py",
+        ])
+        self.assertNotIn("--rom-job", command)
+
+        with tempfile.TemporaryDirectory() as root:
+            github = FakeGH([request(app=CONNECTOR)])
+            github.account = lambda: 123
+            args = SimpleNamespace(
+                state_dir=Path(root), port="/dev/ttyACM0", usb_interface="qinheng",
+                rom_job=None, once=True,
+            )
+            with mock.patch.object(agent, "datetime", wraps=datetime) as clock, \
+                 mock.patch.object(agent, "run_worker", return_value="health-observed") as worker:
+                clock.now.return_value = NOW
+                agent.run_station(args, github)
+            worker.assert_called_once_with("/dev/ttyACM0", "read-only-health", 1, "qinheng")
+            self.assertEqual(github.posts[0][0], 21)
+            self.assertIn("Downstream chip identity was not verified.", github.posts[0][1])

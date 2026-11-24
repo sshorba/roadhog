@@ -20,6 +20,9 @@ from github import GitHub, GitHubError, REPO
 
 MAINTAINER = 43084949  # sshorba; use a stable GitHub ID, never a display name.
 BUILD = "build-validation"
+CONNECTOR_APP_ID = 1144995
+CONNECTOR_APP_SLUG = "chatgpt-codex-connector"
+CONNECTOR_OPERATIONS = frozenset({"read-only-health", "serial-capture", "build-validation"})
 TTL = timedelta(hours=24)
 MAX_GITHUB_ID = 2**63 - 1
 JOB_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
@@ -46,10 +49,21 @@ def unique_fields(pairs):
 
 
 def parse_job(comment, now):
-    user = comment.get("user") or {}
-    if user.get("type") != "User" or user.get("id") != MAINTAINER:
+    user = comment.get("user")
+    if (
+        type(user) is not dict or user.get("type") != "User"
+        or not positive_id(user.get("id")) or user["id"] != MAINTAINER
+    ):
         return None
-    if comment.get("performed_via_github_app") or not positive_id(comment.get("id")):
+    if "performed_via_github_app" not in comment or not positive_id(comment.get("id")):
+        return None
+    app = comment["performed_via_github_app"]
+    if app is not None and (
+        type(app) is not dict
+        or not positive_id(app.get("id"))
+        or app["id"] != CONNECTOR_APP_ID
+        or app.get("slug") != CONNECTOR_APP_SLUG
+    ):
         return None
     created = comment.get("created_at")
     if not isinstance(created, str) or created != comment.get("updated_at"):
@@ -79,6 +93,9 @@ def parse_job(comment, now):
     ):
         return None
     operation, plan, artifact = job["operation"], job["plan"], job["artifact"]
+    # Keep this allowlist independent of the supported bench operations.
+    if app is not None and operation not in CONNECTOR_OPERATIONS:
+        return None
     if operation in SERIAL_OPERATIONS:
         if set(plan) == {"seconds"} and type(plan["seconds"]) is int and 1 <= plan["seconds"] <= 30 and artifact is None:
             return job

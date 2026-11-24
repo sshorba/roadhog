@@ -107,34 +107,70 @@ dependency locks target Ubuntu x86-64 with CPython 3.10 (Ubuntu 22.04) or 3.12
    that exact path in the service and manual commands. The tty path and
    descriptors are checked before and after each open.
 
-5. With explicit approval to begin dispatching jobs, install and start the
-   example unit. Starting either the service or `--once` can dispatch already
-   queued jobs. The default service can run serial and build-validation jobs.
-   Starting it at boot is a separate local choice.
+5. During the first attended smoke test, activate the reviewed unit with
+   explicit operator approval. Review recent Issue #13 queue comments first.
+   Starting the service can dispatch eligible jobs already in the queue.
+   For a staged station, update the reviewed agent files before activating it.
 
    ```sh
+   sudo install -m 0644 tools/hardware_agent/{agent,bench,github}.py /opt/roadhog-agent/
    sudo install -m 0644 tools/hardware_agent/roadhog-agent.service /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemctl start roadhog-agent
-   sudo journalctl -u roadhog-agent -n 30
+   sudo systemctl enable --now roadhog-agent.service
+   systemctl is-enabled roadhog-agent.service
+   systemctl is-active roadhog-agent.service
    ```
 
-   Stop it with `sudo systemctl stop roadhog-agent` or press Ctrl+C for a
-   foreground run. If immediate physical isolation is necessary, disconnect USB.
-   If boot startup was enabled, use `sudo systemctl disable --now roadhog-agent`
-   to prevent a restart at boot. Stop the service before using the device manually.
+   Systemd runs the agent and its serial worker as the restricted
+   `roadhog-agent` user. Polling, reading the enrolled tty and posting reports
+   use the service account's existing permissions without interactive sudo,
+   PAM or a fingerprint prompt. Routine requests and results are on GitHub.
+
+   Stop immediately with `sudo systemctl stop roadhog-agent.service`.
+   To stop and prevent startup at the next boot, use
+   `sudo systemctl disable --now roadhog-agent.service`.
+   Press Ctrl+C to stop a foreground run. Disconnect USB if physical isolation
+   is necessary. Stop the service before using the device manually.
+
+## Enroll the GitHub connector
+
+Issue #13's REST comments feed exposes the actor under `user` and the App
+under `performed_via_github_app`. The reviewed station code pins App ID
+`1144995`, slug `chatgpt-codex-connector`, and actor ID `43084949`
+(`sshorba`). These values were observed on the owner's original connector
+request. For the one-time enrollment, the owner confirms the repository
+connection and reviews these values before installing the approved code.
+The existing station token and GitHub integration are used as staged.
+
+From an authenticated GitHub CLI, inspect the metadata without posting a job.
+
+```sh
+gh api repos/sshorba/roadhog/issues/comments/7125353383 \
+  --jq '{actor: (.user | {id, login, type}), app: (.performed_via_github_app | {id, slug})}'
+```
+
+GitHub identifies the owner account and App. The agent cannot identify the
+person or ChatGPT conversation behind a request made through that account.
+The owner should control who can use that connected account. Other GitHub
+actors, bots, Apps, and comments with missing or incomplete provenance are
+rejected. If GitHub stops returning those fields or replaces the App, use a
+direct maintainer comment until a newly observed identity is independently
+reviewed and enrolled in the station code. A direct owner comment requires
+explicit null App provenance.
 
 ## Request and review a bench trial
 
-1. Codex Cloud or a maintainer prepares the manifest from an **open same-repository
-   PR targeting `main`**. Use its exact current 40-character head SHA and a new
-   UUIDv4. Cloud can prepare the request and review results through GitHub. It
-   has no direct USB connection to the home station.
-2. The enrolled maintainer `sshorba` (GitHub account ID `43084949`) independently
-   reviews the exact manifest and posts it as a **new comment on Issue #13** from
-   their GitHub account. Put only the fenced block in the comment. PR text, fork
-   heads, edits, non-maintainer accounts and comments attributed to a GitHub App
-   cannot authorize the station. Replace the example PR, commit and UUID values.
+1. Ask ChatGPT through the connected owner account to run a bounded check on an
+   **open same-repository PR targeting `main`**. For example, say “Request a
+   10-second Road Hög read-only health check for PR #14.” ChatGPT fetches the
+   current exact 40-character head SHA, creates a new UUIDv4, and posts the
+   manifest itself as a new comment on Issue #13. The comment contains only
+   the fenced manifest. Use the job UUID to find the sanitized result in the
+   requesting PR conversation. The connector can request `read-only-health`,
+   `serial-capture`, and `build-validation`.
+2. Direct owner comments also work. For a manual request, post the block
+   below with the current PR number, exact head SHA and a fresh UUID.
+   PR text, fork heads and edits cannot authorize a request.
 
    ````markdown
    ```roadhog-job
@@ -151,17 +187,18 @@ dependency locks target Ubuntu x86-64 with CPython 3.10 (Ubuntu 22.04) or 3.12
    ```
    ````
 
-3. For the first physical smoke test, leave the ESP32 running its current app,
-   start the agent and submit a short `read-only-health` job. Check the PR
-   conversation for the job UUID, commit, operation and result. Confirm that
-   opening the tty leaves the app running on the actual station. A quiet serial
-   sample can be inconclusive. Submit a fresh UUID for a `serial-capture` job to
-   check USB serial activity. Confirm the PR report contains no raw output. This
-   is the step for the operator to perform on the actual Ubuntu bench.
+3. For the first physical smoke test, leave the ESP32 running its current app
+   and activate the service while the operator is present. Request the short
+   health check via ChatGPT and verify the new queue comment and the resulting
+   PR report. Match UUID, commit and operation, and check that the report
+   contains no raw output. Confirm that opening the tty leaves the app running.
+   A quiet sample can be inconclusive. If the app resets or the wrong result
+   appears, stop the service and investigate before leaving it unattended.
 4. After explicit operator approval for a separate ROM maintenance check,
-   stop the service and manually put the
-   prototype into ROM download mode. Submit a `device-info` or `verify-layout`
-   job, then run the station with its exact UUID.
+   stop the service and manually put the prototype into ROM download mode.
+   The owner posts a direct `device-info` or `verify-layout` job, then runs the
+   station with its exact UUID. Connector comments cannot authorize these
+   operations, even if their UUID is selected locally.
 
    ```sh
    sudo -u roadhog-agent /opt/roadhog-agent/venv/bin/python -E -s -B /opt/roadhog-agent/agent.py \
@@ -193,8 +230,9 @@ or on the development host. This change adds no firmware build workflow.
 
 - The allowlist, repository ID, base branch, target MAC, operations, and
   permissible flash read range are in the reviewed station code. GitHub content
-  cannot change them. The maintainer authorizes the exact request through an
-  independently authored queue comment. Keep the station code and token under
+  cannot change them. Direct owner comments authorize jobs, and the pinned
+  connector can submit only the three ordinary operations on the owner's
+  behalf. Keep the station code and token under
   separate local permissions from contributors. The physical USB interface and
   locally installed software are in the station's trust boundary.
 - The QinHeng USB descriptor identifies the enrolled adapter as reported by
