@@ -85,6 +85,7 @@
         <div><dt>GPS fix</dt><dd id="gps">Checking…</dd></div>
         <div><dt>Registered owner phone number</dt><dd id="owner">Checking…</dd></div>
         <div><dt>SIM phone number</dt><dd id="sim">Checking…</dd></div>
+        <div><dt>Wi-Fi password</dt><dd id="wifi_password">Checking…</dd></div>
       </dl>
       <details>
         <summary>Change password</summary>
@@ -107,7 +108,7 @@
     const login = document.getElementById('login');
     const password = document.getElementById('password');
     const logout = document.getElementById('logout');
-    const fields = ['lte', 'data', 'gps', 'owner', 'sim'];
+    const fields = ['lte', 'data', 'gps', 'owner', 'sim', 'wifi_password'];
     const factory = document.getElementById('factory');
     const setup = document.getElementById('setup');
     const beginSetup = document.getElementById('begin-setup');
@@ -129,6 +130,7 @@
     }
 
     function showSignin() {
+      document.getElementById("wifi_password").textContent = "—";
       if (signin.hidden) {
         password.reset();
         dashboard.querySelector('details').open = false;

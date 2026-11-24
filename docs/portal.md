@@ -9,8 +9,10 @@ seconds. Save the new configured-device Wi-Fi password shown after the
 write and restart. See [factory provisioning](factory-provisioning.md).
 
 On a configured device the setup AP starts off while the modem checks LTE registration. When the
-modem is registered, the owner can text `APON` to enable it or `APOFF` to
-disable it immediately. The AP shuts down after five minutes with no Wi-Fi
+modem is registered, an authorized SMS user can text `APON` to enable it.
+The owner can text `APOFF` to disable it immediately. An owner
+`APON` reply includes the current SSID and configured Wi-Fi password, even
+if the AP is already enabled. Additional users receive only the AP status. The AP shuts down after five minutes with no Wi-Fi
 stations associated. The idle timer restarts after the last station leaves.
 
 If the modem loses LTE registration or cannot be reached, the AP stays
@@ -32,7 +34,8 @@ internet connectivity.
 Sign in as `admin` with the password created during setup. Under **Change
 password**, enter the current password and confirm the new one. The new
 password must contain 12 to 64 UTF-8 bytes. Saving signs you out and stores
-a salted password hash in NVS. The portal accepts one session at a time
+a salted password hash in NVS. The authenticated dashboard displays the configured Wi-Fi password.
+The portal accepts one session at a time
 for up to 30 minutes. HTTP traffic relies on the private Wi-Fi's link
 protection. Use the device AP directly and keep its Wi-Fi credential private.
 

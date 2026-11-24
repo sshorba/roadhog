@@ -66,11 +66,13 @@ static esp_err_t status_response(httpd_req_t *request)
     portEXIT_CRITICAL(&status_lock);
 
     const char *owner = provisioning_owner();
-    char body[224];
+    const char *wifi_password = provisioning_state() == PROVISION_CONFIGURED
+                                ? provisioning_wifi_password() : NULL;
+    char body[320];
     snprintf(body, sizeof(body),
-             "{\"lte\":\"%s\",\"data\":\"%s\",\"gps\":\"%s\",\"sim\":\"%s\",\"owner\":\"%s\"}",
+             "{\"lte\":\"%s\",\"data\":\"%s\",\"gps\":\"%s\",\"sim\":\"%s\",\"owner\":\"%s\",\"wifi_password\":\"%s\"}",
              lte_label(lte), data, gps_label(gps), number[0] ? number : sim_unavailable,
-             owner ? owner : "Not configured");
+             owner ? owner : "Not configured", wifi_password ? wifi_password : "Not available");
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_sendstr(request, body);
 }
@@ -316,18 +318,24 @@ static esp_err_t start_services(void)
     return error;
 }
 
-static esp_err_t start_first_ap(void)
+esp_err_t portal_get_ssid(char ssid[PORTAL_SSID_CAPACITY])
 {
     uint8_t mac[6];
     ESP_RETURN_ON_ERROR(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP), TAG, "AP MAC");
+    snprintf(ssid, PORTAL_SSID_CAPACITY, "ROADHOG-%02X%02X", mac[4], mac[5]);
+    return ESP_OK;
+}
+
+static esp_err_t start_first_ap(void)
+{
     wifi_config_t wifi = {.ap = {.channel = 1, .max_connection = 4, .authmode = WIFI_AUTH_WPA2_PSK}};
     const char *passphrase = provisioning_wifi_password();
     if (!passphrase) {
         return ESP_ERR_INVALID_STATE;
     }
     memcpy(wifi.ap.password, passphrase, strlen(passphrase) + 1);
-    wifi.ap.ssid_len = snprintf((char *)wifi.ap.ssid, sizeof(wifi.ap.ssid),
-                               "ROADHOG-%02X%02X", mac[4], mac[5]);
+    ESP_RETURN_ON_ERROR(portal_get_ssid((char *)wifi.ap.ssid), TAG, "AP SSID");
+    wifi.ap.ssid_len = strlen((const char *)wifi.ap.ssid);
 
     if (provisioning_state() == PROVISION_FACTORY) {
         wifi.ap.max_connection = 1;

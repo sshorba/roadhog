@@ -285,6 +285,7 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
             } else {
                 ESP_LOGW(TAG, "SMS reply failed");
             }
+            mbedtls_platform_zeroize(reply, sizeof(reply));
         }
     }
 #else

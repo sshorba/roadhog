@@ -12,5 +12,8 @@ void portal_set_status(lte_status_t lte, const char *data, gps_status_t gps);
 // An offline fallback overrides requests to disable the AP.
 esp_err_t portal_request(bool enabled);
 
+enum { PORTAL_SSID_CAPACITY = sizeof("ROADHOG-FFFF") };
+esp_err_t portal_get_ssid(char ssid[PORTAL_SSID_CAPACITY]);
+
 void portal_set_sim_number(const char *number);
 esp_err_t portal_sim_response(httpd_req_t *request);

@@ -214,6 +214,81 @@ typedef struct {
 
 #include "sms_authorization_under_test.inc"
 
+enum { SMS_TEXT_CAPACITY = 161, PORTAL_SSID_CAPACITY = sizeof("ROADHOG-FFFF") };
+typedef struct { char sender[SMS_NUMBER_CAPACITY], text[SMS_TEXT_CAPACITY]; } sms_request_t;
+static const char *const unknown = "Unknown command";
+static bool ap_running;
+static unsigned ap_starts;
+
+static esp_err_t portal_request(bool enabled)
+{
+    if (enabled && !ap_running) {
+        ++ap_starts;
+    }
+    ap_running = enabled;
+    return ESP_OK;
+}
+
+static esp_err_t portal_get_ssid(char ssid[PORTAL_SSID_CAPACITY])
+{
+    strcpy(ssid, "ROADHOG-ABCD");
+    return ESP_OK;
+}
+
+static void status_reply(modem_t *modem, char reply[SMS_TEXT_CAPACITY])
+{
+    (void)modem;
+    strcpy(reply, "ROAD HOG ONLINE");
+}
+
+static void gps_reply(modem_t *modem, bool map, char reply[SMS_TEXT_CAPACITY])
+{
+    (void)modem;
+    (void)map;
+    strcpy(reply, "GPS unavailable");
+}
+
+#include "sms_commands_under_test.inc"
+
+static void test_ap_credentials(sms_control_t *sms, const char *password)
+{
+    unsigned previous_writes = writes;
+    uint8_t previous_entropy = entropy;
+    char reply[SMS_TEXT_CAPACITY];
+    sms_request_t request = {.sender = "+9876", .text = "APON"};
+    sms_command_reply(sms, NULL, &request, reply);
+    assert(!strcmp(reply, "Unauthorized") && !ap_running && !strstr(reply, password));
+
+    strcpy(request.sender, "+5678");
+    sms_command_reply(sms, NULL, &request, reply);
+    assert(ap_running && ap_starts == 1 && !strcmp(reply, "AP enabled"));
+    assert(!strstr(reply, password));
+    strcpy(request.text, "APOFF");
+    sms_command_reply(sms, NULL, &request, reply);
+    assert(ap_running && !strcmp(reply, "Owner only"));
+
+    strcpy(request.sender, "+1234");
+    strcpy(request.text, "APON");
+    sms_command_reply(sms, NULL, &request, reply);
+    assert(ap_running && ap_starts == 1);
+    assert(strstr(reply, "SSID: ROADHOG-ABCD") && strstr(reply, password));
+    strcpy(request.text, "APOFF");
+    sms_command_reply(sms, NULL, &request, reply);
+    assert(!ap_running && !strstr(reply, password));
+    strcpy(request.text, "APON");
+    sms_command_reply(sms, NULL, &request, reply);
+    assert(ap_running && ap_starts == 2 && strstr(reply, password));
+
+    const char *unrelated[] = {"STATUS", "?", "GPS", "MAP", "USERS", "UNKNOWN"};
+    for (size_t i = 0; i < sizeof(unrelated) / sizeof(*unrelated); ++i) {
+        strcpy(request.text, unrelated[i]);
+        sms_command_reply(sms, NULL, &request, reply);
+        assert(!strstr(reply, password));
+    }
+    assert(writes == previous_writes && entropy == previous_entropy);
+    assert(!strcmp(provisioning_wifi_password(), password));
+}
+
 static void reboot(void)
 {
     state = PROVISION_CORRUPT;
@@ -310,6 +385,7 @@ int main(void)
     assert(!strcmp(change_user(&sms, "+5678", "+9876", true), "Owner only"));
     assert(!strcmp(change_user(&sms, "+1234", "+1234", false), "Owner is permanent"));
     assert(!strcmp(provisioning_wifi_password(), ap_key));
+    test_ap_credentials(&sms, ap_key);
     assert(!provisioning_setup_authorized(token));
     assert(provisioning_save_admin(&updated) == ESP_OK);
     reboot();

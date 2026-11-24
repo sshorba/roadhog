@@ -18,7 +18,7 @@ and trailing spaces are ignored. Road Hog responds to an authorized sender. An u
 | `USERS` | Owner and authorized numbers |
 | `ADDUSER +number` | Add a number, owner only |
 | `DELUSER +number` | Remove a number, owner only |
-| `APON` | Enable the setup AP, owner only |
+| `APON` | Enable the setup AP. The owner receives its SSID and current Wi-Fi password, even if it is already enabled. |
 | `APOFF` | Disable the setup AP while LTE is registered, owner only |
 
 Use a single space before the international number. The six additional
