@@ -1,8 +1,18 @@
 # Wi-Fi setup portal
 
-The setup AP starts off while the modem checks LTE registration. When the
-modem is registered, the owner can text `APON` to enable it or `APOFF` to
-disable it immediately. The AP shuts down after five minutes with no Wi-Fi
+On a factory device the WPA2 setup AP starts on boot with password
+`012345678`, accepts one station, and stays up until a provisioned reboot.
+Select **Start setup**, enter the E.164 owner number, carrier APN and a
+separate administrator password, and verify the code sent by SMS. When your
+own browser prompts you, press the external GPIO4 setup button within 30
+seconds. Save the new configured-device Wi-Fi password shown after the
+write and restart. See [factory provisioning](factory-provisioning.md).
+
+On a configured device the setup AP starts off while the modem checks LTE registration. When the
+modem is registered, an authorized SMS user can text `APON` to enable it.
+The owner can text `APOFF` to disable it immediately. An owner
+`APON` reply includes the current SSID and configured Wi-Fi password, even
+if the AP is already enabled. Additional users receive only the AP status. The AP shuts down after five minutes with no Wi-Fi
 stations associated. The idle timer restarts after the last station leaves.
 
 If the modem loses LTE registration or cannot be reached, the AP stays
@@ -12,8 +22,8 @@ The fallback uses cellular registration and does not depend on an active data
 context or internet access.
 
 When enabled, the network is `ROADHOG-XXXX`, using the last four hexadecimal
-characters of the Wi-Fi AP MAC address. The network is open and supplies an
-IPv4 address, gateway, and DNS server by DHCP.
+characters of the Wi-Fi AP MAC address. The configured WPA2 network uses its generated
+Wi-Fi credential and supplies an IPv4 address, gateway and DNS by DHCP.
 
 Join the network on a phone or laptop. Phones that use HTTP captive network
 checks should offer to open the setup page. If the prompt does not appear,
@@ -21,13 +31,17 @@ open `http://192.168.4.1/` directly. The AP has no internet uplink. The page ref
 every five seconds after sign-in. An active data context does not verify
 internet connectivity.
 
-The initial sign-in is username `admin` and password `roadhog`. Under
-**Change password**, enter the current password and confirm the new one.
-The new password must contain 8 to 64 UTF-8 bytes. Saving signs you out
-and stores a salted password hash in NVS so the new password survives a
-restart. The portal accepts one session at a time, for up to 30 minutes.
-The prototype AP is open and the portal uses HTTP, so traffic on the
-local Wi-Fi has no transport encryption.
+Sign in as `admin` with the password created during setup. Under **Change
+password**, enter the current password and confirm the new one. The new
+password must contain 12 to 64 UTF-8 bytes. Saving signs you out and stores
+a salted password hash in NVS. The authenticated dashboard displays the configured Wi-Fi password.
+The portal accepts one session at a time
+for up to 30 minutes. HTTP traffic relies on the private Wi-Fi's link
+protection. Use the device AP directly and keep its Wi-Fi credential private.
+
+The authenticated dashboard shows the registered owner SMS control number
+and a separate SIM phone number when the modem reports one. Missing SIM
+number information is shown as “Not available from SIM/carrier.”
 
 To check the portal from a connected computer:
 
@@ -49,3 +63,39 @@ is absent after boot. Send `APON`, join, then disconnect and check that the
 SSID disappears after roughly five minutes. Send `APON` again, then
 `APOFF` to confirm it can be stopped immediately. With the modem offline,
 verify the SSID remains available beyond five minutes.
+
+## Diagnosing factory HTTP connections
+
+Use the ESP32 serial console and connect to the setup Wi-Fi before testing.
+
+```sh
+curl -v --max-time 5 http://192.168.4.1/
+curl -i --max-time 5 http://192.168.4.1/api/status
+curl -i --max-time 5 -H 'Host: captive.example' http://192.168.4.1/generate_204
+curl -v -L --max-redirs 2 --max-time 5 http://192.168.4.1/generate_204
+```
+
+Expect HTTP 200 for the direct root, 401 for unauthenticated status, and
+one HTTP 302 to the root for a captive probe. A direct root request must
+never redirect to itself.
+
+- `HTTP server ready` and `HTTP connection accepted` identify startup and
+  TCP acceptance. An accept without `HTTP GET begin` points to a connection
+  that closed or failed before GET dispatch. Look for the SDK parser error
+  response and disconnect messages.
+- `HTTP GET sent` includes the status. An unexpected 302 is a routing or
+  Host issue. An invalid socket address fails closed with HTTP 403. A
+  `getsockname failed` or unexpected family message identifies that check.
+- `HTTP GET failed` reports the intended status and send error. A failed
+  handler response can close the socket. A GET begin without a subsequent
+  result needs the surrounding logs. Look for an ESP-IDF panic or a new boot
+  banner to establish a crash or reset. The stack watermark at GET entry is
+  the task's minimum observed stack headroom.
+- The IPv6-enabled ESP-IDF listener may return the local IPv4 address as
+  an IPv4-mapped IPv6 address. The portal accepts the exact AP address in
+  either representation. POST still requires the local socket, canonical
+  Host and matching Origin. Private status additionally requires login.
+
+Run `sh tests/portal/run.sh` to exercise the request routing and diagnostic
+events in both socket configurations. The host fixture does not reproduce
+ESP32 TCP or task failures.

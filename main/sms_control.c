@@ -1,17 +1,18 @@
 #include "sms_control.h"
 #include "sms_commands.h"
+#include "provisioning.h"
+#include "owner_verification.h"
 
 #include <limits.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
+#include "mbedtls/platform_util.h"
 #include "sdkconfig.h"
 
-#ifdef CONFIG_ROADHOG_SMS_CONTROL
-static const char *TAG = "sms";
-static const char owner[] = CONFIG_ROADHOG_SMS_OWNER;
 static const char hex[] = "0123456789ABCDEF";
 
 enum { MAX_PDU_BYTES = 190 };
@@ -22,6 +23,9 @@ static bool command_ok(modem_t *modem, const char *command)
     return modem_command(modem, command, NULL, 5000, NULL, 0, &result) == ESP_OK &&
            result.final == MODEM_FINAL_OK;
 }
+
+#ifdef CONFIG_ROADHOG_SMS_CONTROL
+static const char *TAG = "sms";
 
 static int nibble(char c)
 {
@@ -99,6 +103,8 @@ static bool decode_request(const uint8_t *pdu, size_t length, size_t tpdu_length
     return true;
 }
 
+#endif
+
 static esp_err_t send_reply(modem_t *modem, const char *number, const char *message)
 {
     const char *digits = number + 1;
@@ -129,9 +135,26 @@ static esp_err_t send_reply(modem_t *modem, const char *number, const char *mess
     }
     text[2 * used] = '\0';
     modem_result_t result;
-    return modem_submit_sms(modem, used - 1, text, &result);
+    esp_err_t error = modem_submit_sms(modem, used - 1, text, &result);
+    mbedtls_platform_zeroize(text, sizeof(text));
+    mbedtls_platform_zeroize(pdu, sizeof(pdu));
+    return error;
 }
-#endif
+
+void sms_owner_verification_service(modem_t *modem)
+{
+    owner_verify_message_t request;
+    if (!owner_verification_take(&request)) {
+        return;
+    }
+    char message[48];
+    snprintf(message, sizeof(message), "Road Hog owner verification code: %s", request.code);
+    bool accepted = command_ok(modem, "ATE0") && command_ok(modem, "AT+CMGF=0") &&
+                    send_reply(modem, request.owner, message) == ESP_OK;
+    owner_verification_finish(accepted);
+    mbedtls_platform_zeroize(&request, sizeof(request));
+    mbedtls_platform_zeroize(message, sizeof(message));
+}
 
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
 static void configure_sms(sms_control_t *sms, modem_t *modem)
@@ -145,8 +168,11 @@ static void configure_sms(sms_control_t *sms, modem_t *modem)
 void sms_control_start(sms_control_t *sms, modem_t *modem)
 {
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
-    sms->owner = owner;
-    if (!sms_number_valid(owner) || !sms_users_load(sms)) {
+    sms->owner = provisioning_owner();
+    if (!sms->owner) {
+        return;
+    }
+    if (!sms_users_load(sms)) {
         ESP_LOGE(TAG, "SMS owner or user storage is unavailable");
         return;
     }
@@ -259,6 +285,7 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
             } else {
                 ESP_LOGW(TAG, "SMS reply failed");
             }
+            mbedtls_platform_zeroize(reply, sizeof(reply));
         }
     }
 #else
