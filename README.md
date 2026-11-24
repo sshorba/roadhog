@@ -38,3 +38,4 @@ by SMS and is available automatically when LTE registration is unavailable.
 - [Modem bring-up](docs/modem.md) covers the component API, build, flash, and UART bench checks.
 - [SMS commands](docs/sms.md) covers handset setup, the command list, and user management.
 - [Wi-Fi setup portal](docs/portal.md) covers DHCP, captive redirects, and AP control.
+- [Read-only hardware test station](docs/hardware-test-agent.md) covers Ubuntu setup, GitHub authentication, and bench requests.
