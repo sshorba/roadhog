@@ -94,6 +94,10 @@ configure ESP32 Secure Boot.
 
 ## Bench procedure
 
+Start with the [attended preflight](lte-ota-preflight.md) to identify the current
+image, decide whether installer provisioning is needed, and stop after the
+signed dry run.
+
 1. In an owner-approved maintenance window, confirm stable power for the
    modem and ESP32, a verified private recovery backup, the expected 16 MiB
    A/B layout and a selected VALID application. Check STATUS, GPS and portal
