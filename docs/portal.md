@@ -60,3 +60,39 @@ is absent after boot. Send `APON`, join, then disconnect and check that the
 SSID disappears after roughly five minutes. Send `APON` again, then
 `APOFF` to confirm it can be stopped immediately. With the modem offline,
 verify the SSID remains available beyond five minutes.
+
+## Diagnosing factory HTTP connections
+
+Use the ESP32 serial console and connect to the setup Wi-Fi before testing.
+
+```sh
+curl -v --max-time 5 http://192.168.4.1/
+curl -i --max-time 5 http://192.168.4.1/api/status
+curl -i --max-time 5 -H 'Host: captive.example' http://192.168.4.1/generate_204
+curl -v -L --max-redirs 2 --max-time 5 http://192.168.4.1/generate_204
+```
+
+Expect HTTP 200 for the direct root, 401 for unauthenticated status, and
+one HTTP 302 to the root for a captive probe. A direct root request must
+never redirect to itself.
+
+- `HTTP server ready` and `HTTP connection accepted` identify startup and
+  TCP acceptance. An accept without `HTTP GET begin` points to a connection
+  that closed or failed before GET dispatch. Look for the SDK parser error
+  response and disconnect messages.
+- `HTTP GET sent` includes the status. An unexpected 302 is a routing or
+  Host issue. An invalid socket address fails closed with HTTP 403. A
+  `getsockname failed` or unexpected family message identifies that check.
+- `HTTP GET failed` reports the intended status and send error. A failed
+  handler response can close the socket. A GET begin without a subsequent
+  result needs the surrounding logs. Look for an ESP-IDF panic or a new boot
+  banner to establish a crash or reset. The stack watermark at GET entry is
+  the task's minimum observed stack headroom.
+- The IPv6-enabled ESP-IDF listener may return the local IPv4 address as
+  an IPv4-mapped IPv6 address. The portal accepts the exact AP address in
+  either representation. POST still requires the local socket, canonical
+  Host and matching Origin. Private status additionally requires login.
+
+Run `sh tests/portal/run.sh` to exercise the request routing and diagnostic
+events in both socket configurations. The host fixture does not reproduce
+ESP32 TCP or task failures.

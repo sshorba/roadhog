@@ -4,6 +4,7 @@
 #include "sim_number.h"
 #include "status_led.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -83,19 +84,44 @@ static bool local_host(httpd_req_t *request)
         host[strlen(host) - 3] = '\0';
     }
 
-    struct sockaddr_in local;
+    return host_result == ESP_OK && strcmp(host, portal_host) == 0;
+}
+
+static bool socket_on_ap(httpd_req_t *request)
+{
+    int fd = httpd_req_to_sockfd(request);
+    union {
+        struct sockaddr address;
+        struct sockaddr_in ipv4;
+#if CONFIG_LWIP_IPV6
+        struct sockaddr_in6 ipv6;
+#endif
+    } local = {0};
     socklen_t length = sizeof(local);
-    return host_result == ESP_OK && strcmp(host, portal_host) == 0 &&
-           getsockname(httpd_req_to_sockfd(request), (struct sockaddr *)&local, &length) == 0 &&
-           length == sizeof(local) && local.sin_family == AF_INET &&
-           local.sin_addr.s_addr == dns_address.sin_addr.s_addr;
+    if (getsockname(fd, &local.address, &length) != 0) {
+        ESP_LOGW(TAG, "HTTP fd=%d getsockname failed, errno=%d", fd, errno);
+        return false;
+    }
+    if (length == sizeof(local.ipv4) && local.address.sa_family == AF_INET) {
+        return local.ipv4.sin_addr.s_addr == dns_address.sin_addr.s_addr;
+    }
+#if CONFIG_LWIP_IPV6
+    // ESP-IDF's dual-stack listener presents IPv4 clients as ::ffff:a.b.c.d.
+    if (length == sizeof(local.ipv6) && local.address.sa_family == AF_INET6 &&
+        IN6_IS_ADDR_V4MAPPED(&local.ipv6.sin6_addr)) {
+        return memcmp(local.ipv6.sin6_addr.s6_addr + 12, &dns_address.sin_addr.s_addr, 4) == 0;
+    }
+#endif
+    ESP_LOGW(TAG, "HTTP fd=%d unexpected local socket family=%d length=%u",
+             fd, local.address.sa_family, (unsigned)length);
+    return false;
 }
 
 static esp_err_t auth_post(httpd_req_t *request)
 {
     char origin[sizeof("http://255.255.255.255")];
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    if (!local_host(request) ||
+    if (!socket_on_ap(request) || !local_host(request) ||
         httpd_req_get_hdr_value_str(request, "Origin", origin, sizeof(origin)) != ESP_OK ||
         strncmp(origin, portal_url, strlen(portal_url) - 1) != 0 ||
         strlen(origin) != strlen(portal_url) - 1) {
@@ -104,16 +130,26 @@ static esp_err_t auth_post(httpd_req_t *request)
     return portal_auth_post(request);
 }
 
-static esp_err_t landing_page(httpd_req_t *request)
+static esp_err_t get_response(httpd_req_t *request, int *status)
 {
-    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    if (local_host(request)) {
+    if (!socket_on_ap(request)) {
+        *status = 403;
+        return httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Use the setup Wi-Fi network.");
+    }
+    bool canonical = local_host(request);
+    bool api = strncmp(request->uri, "/api/", 5) == 0;
+    if (api && !canonical) {
+        *status = 403;
+        return httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Open the local setup portal.");
+    }
+    if (canonical) {
         if (strcmp(request->uri, "/api/setup/state") == 0) {
             httpd_resp_set_type(request, "text/plain");
             return httpd_resp_sendstr(request, provisioning_state() == PROVISION_FACTORY ? "factory" : "configured");
         }
         if (strcmp(request->uri, "/api/status") == 0) {
-            if (!local_host(request) || !portal_authenticated(request)) {
+            if (!portal_authenticated(request)) {
+                *status = 401;
                 httpd_resp_set_status(request, "401 Unauthorized");
                 return httpd_resp_sendstr(request, "Sign in to view device status.");
             }
@@ -123,11 +159,34 @@ static esp_err_t landing_page(httpd_req_t *request)
             httpd_resp_set_type(request, "text/html; charset=utf-8");
             return httpd_resp_sendstr(request, portal_html_start);
         }
+        if (api) {
+            *status = 404;
+            return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Unknown API endpoint.");
+        }
     }
 
+    *status = 302;
     httpd_resp_set_status(request, "302 Found");
     httpd_resp_set_hdr(request, "Location", portal_url);
     return httpd_resp_sendstr(request, "Open the Road Hog setup portal.");
+}
+
+static esp_err_t landing_page(httpd_req_t *request)
+{
+    // Do not log client-controlled URIs, headers, or credentials.
+    int fd = httpd_req_to_sockfd(request);
+    ESP_LOGI(TAG, "HTTP GET begin fd=%d stack_free=%u", fd,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    int status = 200;
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    esp_err_t error = get_response(request, &status);
+    if (error == ESP_OK) {
+        ESP_LOGI(TAG, "HTTP GET sent fd=%d status=%d", fd, status);
+    } else {
+        ESP_LOGW(TAG, "HTTP GET failed fd=%d intended_status=%d error=%s",
+                 fd, status, esp_err_to_name(error));
+    }
+    return error;
 }
 
 enum { DNS_HEADER = 12, DNS_MAX_QUERY = 512, DNS_A_RECORD = 16 };
@@ -190,6 +249,26 @@ static void dns_task(void *context)
     }
 }
 
+static esp_err_t http_open(httpd_handle_t server, int fd)
+{
+    (void)server;
+    ESP_LOGI(TAG, "HTTP connection accepted fd=%d", fd);
+    return ESP_OK;
+}
+
+static void http_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    (void)base;
+    if (id == HTTP_SERVER_EVENT_ERROR && data) {
+        ESP_LOGW(TAG, "HTTP server generated error response code=%d", *(const httpd_err_code_t *)data);
+    } else if (id == HTTP_SERVER_EVENT_STOP) {
+        ESP_LOGW(TAG, "HTTP server stopped");
+    } else if (id == HTTP_SERVER_EVENT_DISCONNECTED && data) {
+        ESP_LOGI(TAG, "HTTP connection closed fd=%d", *(const int *)data);
+    }
+}
+
 static esp_err_t start_services(void)
 {
     httpd_handle_t http;
@@ -197,8 +276,17 @@ static esp_err_t start_services(void)
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.lru_purge_enable = true;
     config.stack_size = 8192;
-    esp_err_t error = httpd_start(&http, &config);
+    config.open_fn = http_open;
+    esp_event_handler_instance_t diagnostics;
+    esp_err_t error = esp_event_handler_instance_register(
+        ESP_HTTP_SERVER_EVENT, ESP_EVENT_ANY_ID, http_event, NULL, &diagnostics);
     if (error != ESP_OK) {
+        return error;
+    }
+    error = httpd_start(&http, &config);
+    if (error != ESP_OK) {
+        ESP_LOGE(TAG, "HTTP server start failed: %s", esp_err_to_name(error));
+        esp_event_handler_instance_unregister(ESP_HTTP_SERVER_EVENT, ESP_EVENT_ANY_ID, diagnostics);
         return error;
     }
     const httpd_uri_t route = {.uri = "/*", .method = HTTP_GET, .handler = landing_page};
@@ -219,7 +307,11 @@ static esp_err_t start_services(void)
         }
     }
     if (error != ESP_OK) {
+        ESP_LOGE(TAG, "Portal service setup failed: %s", esp_err_to_name(error));
         httpd_stop(http);
+        esp_event_handler_instance_unregister(ESP_HTTP_SERVER_EVENT, ESP_EVENT_ANY_ID, diagnostics);
+    } else {
+        ESP_LOGI(TAG, "HTTP server ready on port %u", (unsigned)config.server_port);
     }
     return error;
 }
