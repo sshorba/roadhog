@@ -12,7 +12,9 @@ import sqlite3
 import stat
 import time
 
-from bench import RESULTS, ROM_OPERATIONS, SERIAL_OPERATIONS, TARGET, run_worker
+from bench import (
+    DEFAULT_USB_INTERFACE, RESULTS, ROM_OPERATIONS, SERIAL_OPERATIONS, TARGET, USB_INTERFACES, run_worker,
+)
 from github import GitHub, GitHubError, REPO
 
 
@@ -100,6 +102,8 @@ def report_for(job, result):
         f"- Operation `{job['operation']}`\n"
         f"- Result: {RESULTS[result]}\n"
     )
+    if job["operation"] in SERIAL_OPERATIONS:
+        report += "- Scope: passive UART observation. Downstream chip identity was not verified.\n"
     if job["artifact"]:
         archive_digest = job["artifact"]["sha256"]
         label = "Verified" if result == "artifact-ok" else "Requested"
@@ -186,29 +190,41 @@ def stop(signum, frame):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--state-dir", required=True, type=Path)
+    parser.add_argument("--state-dir", type=Path)
     parser.add_argument("--token-file", required=True, type=Path)
     parser.add_argument("--port", default="/dev/ttyACM0")
-    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--usb-interface", choices=USB_INTERFACES, default=DEFAULT_USB_INTERFACE)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true")
+    mode.add_argument("--check-auth", action="store_true", help="Check GitHub authentication and issue connectivity only")
     parser.add_argument("--rom-job", help="Run only this UUID after manually entering ROM download mode")
     args = parser.parse_args()
     if not re.fullmatch(r"/dev/ttyACM[0-9]+", args.port):
-        parser.error("port must be a local native USB ttyACM device")
+        parser.error("port must be a local USB ttyACM device")
     if args.rom_job is not None and (not args.once or not matches(JOB_ID, args.rom_job)):
         parser.error("--rom-job requires a job UUID and --once")
+    if not args.check_auth and args.state_dir is None:
+        parser.error("--state-dir is required when polling")
     os.umask(0o077)
     signal.signal(signal.SIGTERM, stop)
     try:
-        args.state_dir.mkdir(mode=0o700, exist_ok=True)
-        private_path(args.state_dir, directory=True)
         private_path(args.token_file)
         with args.token_file.open() as token_file:
             token = token_file.read(1025).strip()
         if not re.fullmatch(r"[A-Za-z0-9_]{1,1024}", token):
             raise ValueError("Invalid token file.")
+        github = GitHub(token)
+        if args.check_auth:
+            github.check_auth()
+            print("GitHub authentication and queue issue connectivity verified.")
+            return
+        args.state_dir.mkdir(mode=0o700, exist_ok=True)
+        private_path(args.state_dir, directory=True)
         with (args.state_dir / "agent.lock").open("a") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            run_station(args, GitHub(token))
+            run_station(args, github)
+    except GitHubError as error:
+        parser.exit(1, f"GitHub authentication or connectivity failed (HTTP {error.status or 'unavailable'}).\n")
     except (OSError, sqlite3.Error, ValueError):
         parser.exit(1, "Station startup or local state failed. Check private paths, credential and lock.\n")
 
@@ -226,7 +242,7 @@ def run_station(args, github):
                     account = github.account()
                 poll(
                     ledger, github, account,
-                    lambda operation, seconds: run_worker(args.port, operation, seconds),
+                    lambda operation, seconds: run_worker(args.port, operation, seconds, args.usb_interface),
                     args.rom_job,
                 )
             except GitHubError as error:

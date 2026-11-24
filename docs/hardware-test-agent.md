@@ -7,13 +7,15 @@ for build validation, to GitHub Actions archive storage. It has no listener.
 
 ## Install on the Ubuntu station
 
-These are manual instructions for the bench operator after reviewing the branch
-and approving the host setup. Use Ubuntu with systemd and Python 3.10 or newer.
-Run the commands from a reviewed checkout. ESP-IDF is optional for the agent
-itself.
+These are manual instructions for the bench operator after approving the host
+setup and reviewing the exact checkout commit and installation files. The
+dependency locks target Ubuntu x86-64 with CPython 3.10 (Ubuntu 22.04) or 3.12
+(Ubuntu 24.04). ESP-IDF is optional for the agent itself.
 
-1. Install the Python venv package if needed. Create a dedicated local account
-   and install a root-owned copy of the reviewed agent.
+1. Install the distro's Python venv package if needed. Review the tracked
+   agent modules, both dependency locks, the udev rules, and the systemd unit
+   before copying files. Use a clean checkout of the approved commit. The
+   command sequence assumes a fresh install and an ordinary operator shell.
 
    ```sh
    sudo apt-get install python3-venv
@@ -21,32 +23,34 @@ itself.
      --shell /usr/sbin/nologin roadhog-agent
    sudo install -d -m 0755 /opt/roadhog-agent
    sudo install -d -o roadhog-agent -g roadhog-agent -m 0700 /var/lib/roadhog-agent
-   sudo install -m 0644 tools/hardware_agent/{agent,bench,github}.py \
-     tools/hardware_agent/requirements.txt /opt/roadhog-agent/
-   sudo python3 -m venv /opt/roadhog-agent/venv
-   sudo /opt/roadhog-agent/venv/bin/python -m pip install -r /opt/roadhog-agent/requirements.txt
+   sudo install -m 0644 tools/hardware_agent/{agent,bench,github}.py /opt/roadhog-agent/
+   sudo install -d -o "$(id -un)" -m 0755 /opt/roadhog-agent/venv
+   (
+     set -e
+     umask 022
+     python3 -m venv /opt/roadhog-agent/venv
+     python=/opt/roadhog-agent/venv/bin/python
+     "$python" -m pip --isolated install --no-cache-dir --index-url https://pypi.org/simple \
+       --require-hashes --only-binary=:all: -r tools/hardware_agent/requirements-build.txt
+     "$python" -m pip --isolated install --no-cache-dir --index-url https://pypi.org/simple \
+       --require-hashes --only-binary=:all: --no-binary=esptool --no-build-isolation \
+       -r tools/hardware_agent/requirements.txt
+     "$python" -m pip check
+   ) && sudo chown -hR root:root /opt/roadhog-agent/venv
    ```
 
-2. Confirm the physical prototype uses the native Espressif USB Serial/JTAG
-   interface. Look up its descriptors with
-   `udevadm info --attribute-walk --name=/dev/ttyACM0`. Expect VID/PID
-   `303a:1001` and an iSerial matching the enrolled MAC
-   `98:c3:77:b4:1a:10`. Use the exact iSerial spelling and case reported by
-   udev in the following root-owned `/etc/udev/rules.d/99-roadhog-agent.rules`
-   example. Stop if the interface or identifier differs.
+   The runtime lock lists accepted upstream filenames and SHA-256 hashes for
+   all direct and transitive dependencies. Esptool 5.2.0 is available as a
+   source archive, so it is built locally from the hash-pinned archive using
+   the separately hash-pinned build tools. Build isolation is disabled to
+   prevent pip from resolving build dependencies separately. All other
+   artifacts must be wheels. Run Python, pip and package build hooks as the
+   ordinary operator. The privileged commands create directories, copy
+   the reviewed files or finalize ownership. Never run pip, setup hooks or
+   a checkout-provided installer with sudo. Treat changes to either lock or
+   service/rules files as part of the next installation review.
 
-   ```udev
-   SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ATTRS{serial}=="98:C3:77:B4:1A:10", GROUP="roadhog-agent", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
-   ```
-
-   Reload the rules with `sudo udevadm control --reload-rules` and replug the
-   USB cable when it is safe to do so. Check `ls -l /dev/ttyACM0`. The
-   account needs no broad `dialout` membership. Close IDE monitors, esptool,
-   and any other process using the port. If the kernel assigns another
-   `ttyACM` number, add `--port /dev/ttyACM1` (or the assigned path) to
-   the service and manual commands. Identity is checked for each operation.
-
-3. On GitHub, create a short-lived [fine-grained personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
+2. On GitHub, create a short-lived [fine-grained personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
    for resource owner `sshorba` and select only `roadhog`. Grant **Issues:
    read** for the queue, **Pull requests: read and write** for PR eligibility
    checks and report comments, and **Actions: read** if using build validation.
@@ -62,9 +66,9 @@ itself.
    sudo -u roadhog-agent bash -c '
      umask 077
      read -rsp "GitHub token: " token || exit 1
-     printf "\\n"
+     printf "\n"
      test -n "$token" || exit 1
-     printf "%s\\n" "$token" > /var/lib/roadhog-agent/github.token
+     printf "%s\n" "$token" > /var/lib/roadhog-agent/github.token
    '
    sudo chmod 0600 /var/lib/roadhog-agent/github.token
    ```
@@ -72,17 +76,41 @@ itself.
    Rotate the token by stopping the agent, replacing the file and starting the
    agent again. Revoke the token in GitHub if the station is compromised.
 
-4. Run one poll manually before starting a long-running service. Use the same
-   private state directory for every invocation.
+3. Verify credentials before dispatching any jobs. This command makes
+   read-only requests for the authenticated account and Issue #13 metadata.
+   It never reads queue comments, starts polling, writes reports or opens USB.
+   It confirms authentication and connectivity, with no validation of write
+   permission for PR reports.
 
    ```sh
    sudo -u roadhog-agent /opt/roadhog-agent/venv/bin/python -E -s -B /opt/roadhog-agent/agent.py \
-     --state-dir /var/lib/roadhog-agent --token-file /var/lib/roadhog-agent/github.token --once
+     --token-file /var/lib/roadhog-agent/github.token --check-auth
    ```
 
-5. When approved, install the example unit and start it manually. The default
-   service can run serial and build-validation jobs. Starting it at boot is a
-   separate local choice.
+4. When approved for the bench, confirm descriptors with
+   `udevadm info --attribute-walk --name=/dev/ttyACM0`. The observed connection
+   uses QinHeng VID/PID `1a86:55d3` and USB serial `5CF9174631`, the default
+   enrollment. The alternate native Espressif interface uses VID/PID
+   `303a:1001` and an iSerial matching `98:c3:77:b4:1a:10`. Select the latter
+   explicitly with `--usb-interface native` in the service and manual dispatch
+   commands. Stop if the descriptors differ from the chosen enrollment.
+
+   ```sh
+   sudo install -m 0644 tools/hardware_agent/99-roadhog-agent.rules /etc/udev/rules.d/
+   sudo udevadm control --reload-rules
+   ```
+
+   With operator approval, replug USB at a safe time and confirm the tty
+   belongs to group `roadhog-agent` with mode `0660`. The account needs no
+   broad `dialout` membership. Close IDE monitors, esptool and other serial
+   clients. If the kernel assigns another ttyACM number, use `--port` with
+   that exact path in the service and manual commands. The tty path and
+   descriptors are checked before and after each open.
+
+5. With explicit approval to begin dispatching jobs, install and start the
+   example unit. Starting either the service or `--once` can dispatch already
+   queued jobs. The default service can run serial and build-validation jobs.
+   Starting it at boot is a separate local choice.
 
    ```sh
    sudo install -m 0644 tools/hardware_agent/roadhog-agent.service /etc/systemd/system/
@@ -125,11 +153,13 @@ itself.
 
 3. For the first physical smoke test, leave the ESP32 running its current app,
    start the agent and submit a short `read-only-health` job. Check the PR
-   conversation for the job UUID, commit, operation and result. A quiet serial
+   conversation for the job UUID, commit, operation and result. Confirm that
+   opening the tty leaves the app running on the actual station. A quiet serial
    sample can be inconclusive. Submit a fresh UUID for a `serial-capture` job to
    check USB serial activity. Confirm the PR report contains no raw output. This
    is the step for the operator to perform on the actual Ubuntu bench.
-4. For a separately scheduled ROM check, stop the service and manually put the
+4. After explicit operator approval for a separate ROM maintenance check,
+   stop the service and manually put the
    prototype into ROM download mode. Submit a `device-info` or `verify-layout`
    job, then run the station with its exact UUID.
 
@@ -147,7 +177,7 @@ itself.
 | --- | --- | --- | --- |
 | `read-only-health` | `{"seconds": 1}` through 30 seconds | `null` | Samples up to 64 KiB of serial for fixed startup or fault markers. |
 | `serial-capture` | `{"seconds": 1}` through 30 seconds | `null` | Reports whether serial activity was seen. |
-| `device-info` | `{}` | `null` | Verifies the native USB descriptor, ROM chip ID, eFuse MAC and 16 MiB JEDEC flash capacity. |
+| `device-info` | `{}` | `null` | Verifies the enrolled USB interface, ROM chip ID, eFuse MAC, 16 MiB JEDEC flash capacity and expected security baseline. |
 | `verify-layout` | `{}` | `null` | Performs device-info checks and reads only the 3 KiB partition table at `0x8000`. Verifies the full checksummed table against the A/B layout. |
 | `build-validation` | `{}` | `{"id": 123, "sha256": "<64 lowercase hex characters>"}` | Streams and hashes the GitHub Actions artifact ZIP and checks GitHub's digest, artifact ID and originating repository and head SHA. |
 
@@ -167,13 +197,20 @@ or on the development host. This change adds no firmware build workflow.
   independently authored queue comment. Keep the station code and token under
   separate local permissions from contributors. The physical USB interface and
   locally installed software are in the station's trust boundary.
-- The running app receives no serial command during capture. The agent
-  suppresses pyserial's DTR/RTS ioctls and issues no reset sequence.
-  Opening or closing a Linux tty can still change host control lines. Confirm behavior on
-  the enrolled bench during the first smoke test. ROM operations send only
-  synchronization and read/volatile flash-interface setup commands. They reject
-  a resident stub and do not upload a stub or issue a reset. Encrypted layouts
-  are unavailable through this plaintext check.
+- The QinHeng USB descriptor identifies the enrolled adapter as reported by
+  the host. Its serial does not identify the downstream ESP32. The native
+  iSerial is also a USB descriptor, not cryptographic hardware authentication.
+  Both passive operations report UART observations only. They send no app or
+  ROM commands, suppress pyserial DTR/RTS ioctls and issue no reset sequence.
+  The Linux tty driver can still change lines on open or close. Verify the
+  behavior during an approved, attended passive smoke test before enabling
+  unattended operation.
+- ROM inspection separately checks the ESP32-S3 chip ID and eFuse MAC and
+  expects 16 MiB flash, unrestricted ROM download, secure boot disabled, and
+  flash encryption disabled, matching the documented plaintext bench profile.
+  An unexpected security state stops inspection. ROM operations send only
+  synchronization, reads, and volatile flash-interface setup commands. They
+  reject a resident stub and neither upload a stub nor issue a reset.
 - A report contains only schema-constrained job metadata and a fixed result. It
   cannot include SIM/SMS contents, owner numbers, AP passwords, verification
   codes, tokens, arbitrary tool output, or NVS bytes. Serial buffers, partition

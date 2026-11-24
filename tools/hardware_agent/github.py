@@ -93,6 +93,12 @@ class GitHub:
         user, _ = self.request("/user")
         return user["id"]
 
+    def check_auth(self):
+        account = self.account()
+        issue, _ = self.request(f"/repos/{REPO}/issues/{QUEUE}")
+        if type(account) is not int or account <= 0 or issue.get("number") != QUEUE:
+            raise GitHubError()
+
     def report(self, number, body, account):
         path = f"/issues/{number}/comments"
         # Recover from a successful POST whose response was lost before the

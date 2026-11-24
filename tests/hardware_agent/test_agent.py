@@ -123,6 +123,7 @@ class PollTests(TestCase):
         number, report = github.posts[0]
         self.assertEqual(number, 21)
         self.assertIn("startup success marker", report)
+        self.assertIn("Downstream chip identity was not verified.", report)
         for secret in ("123456", "secret", "private", "ghp_example"):
             self.assertNotIn(secret, report)
 
@@ -214,13 +215,27 @@ class DeviceTests(TestCase):
         rom = loader.return_value.__enter__.return_value
         rom.sync_stub_detected = False
         rom.get_security_info.return_value = {
-            "chip_id": 9, "parsed_flags": {"SECURE_DOWNLOAD_ENABLE": False}, "flash_crypt_cnt": 0,
+            "chip_id": 9,
+            "parsed_flags": {"SECURE_DOWNLOAD_ENABLE": False, "SECURE_BOOT_EN": False},
+            "flash_crypt_cnt": 0,
         }
         with mock.patch.dict(sys.modules, modules):
             rom.read_mac.return_value = bytes(6)
             self.assertEqual(bench.rom_operation(mock.sentinel.serial, "verify-layout"), "identity-mismatch")
             rom.flash_spi_attach.assert_not_called()
             rom.read_mac.return_value = bytes.fromhex(bench.TARGET.replace(":", ""))
+            security = rom.get_security_info.return_value
+            for flag in ("SECURE_BOOT_EN", "SECURE_DOWNLOAD_ENABLE"):
+                security["parsed_flags"][flag] = True
+                self.assertEqual(bench.rom_operation(mock.sentinel.serial, "device-info"), "security-mismatch")
+                security["parsed_flags"][flag] = False
+            security["flash_crypt_cnt"] = 1
+            self.assertEqual(bench.rom_operation(mock.sentinel.serial, "verify-layout"), "security-mismatch")
+            security["flash_crypt_cnt"] = 0
+            rom.flash_spi_attach.assert_not_called()
+            modules["esptool.cmds"].detect_flash_size.return_value = "8MB"
+            self.assertEqual(bench.rom_operation(mock.sentinel.serial, "verify-layout"), "flash-mismatch")
+            modules["esptool.cmds"].detect_flash_size.return_value = "16MB"
             self.assertEqual(bench.rom_operation(mock.sentinel.serial, "verify-layout"), "layout-mismatch")
         rom.connect.assert_called_with(mode="no-reset", attempts=1, detecting=True)
         modules["esptool.cmds"].read_flash.assert_called_once_with(
@@ -246,6 +261,99 @@ class DeviceTests(TestCase):
         self.assertEqual(bench.run_worker("/dev/ttyACM0", "serial-capture", 1), "device-timeout")
         self.assertEqual(run.call_args.kwargs["timeout"], 6)
         self.assertEqual(set(run.call_args.kwargs["env"]), {"PATH", "HOME"})
+
+
+class USBEnrollmentTests(TestCase):
+    port = "/dev/ttyACM0"
+
+    def setUp(self):
+        self.ports = mock.Mock()
+        self.io = mock.Mock()
+        io = self.io
+
+        class FakeSerial:
+            def __init__(self, **kwargs):
+                io.configure(**kwargs)
+
+            def __enter__(self):
+                io.open(self.port)
+                self._update_dtr_state()
+                self._update_rts_state()
+                return self
+
+            def __exit__(self, *args):
+                io.close()
+
+            def _update_dtr_state(self):
+                io.dtr()
+
+            def _update_rts_state(self):
+                io.rts()
+
+            def fileno(self):
+                return 123
+
+            def read(self, size):
+                return b"passive output"
+
+            def write(self, data):
+                io.write(data)
+
+        modules = {
+            "serial": SimpleNamespace(Serial=FakeSerial),
+            "serial.tools.list_ports": SimpleNamespace(comports=self.ports),
+        }
+        patches = (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch("os.stat", return_value=mock.sentinel.node),
+            mock.patch("os.fstat", return_value=mock.sentinel.node),
+            mock.patch("os.path.samestat", side_effect=lambda a, b: a is b),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def descriptor(self, **changes):
+        return SimpleNamespace(**dict(
+            {"device": self.port, "vid": 0x1A86, "pid": 0x55D3, "serial_number": "5CF9174631"},
+            **changes,
+        ))
+
+    def test_mismatched_descriptor_is_rejected_before_open(self):
+        for change in (
+            {"serial_number": None}, {"serial_number": "5CF9174632"},
+            {"pid": 0x55D4}, {"vid": 0x303A}, {"device": "/dev/ttyACM1"},
+        ):
+            self.ports.return_value = [self.descriptor(**change)]
+            self.assertEqual(bench.inspect(self.port, "read-only-health", 1, "qinheng"), "usb-mismatch")
+        self.io.open.assert_not_called()
+
+    def test_passive_bridge_capture_suppresses_control_lines_and_never_enters_rom(self):
+        self.ports.return_value = [self.descriptor()]
+        with mock.patch.object(bench.time, "monotonic", side_effect=[0, 0, 1]), \
+             mock.patch.object(bench, "rom_operation") as rom:
+            result = bench.inspect(self.port, "serial-capture", 1, "qinheng")
+        self.assertEqual(result, "serial-active")
+        self.io.open.assert_called_once_with(self.port)
+        self.io.dtr.assert_not_called()
+        self.io.rts.assert_not_called()
+        self.io.write.assert_not_called()
+        rom.assert_not_called()
+        self.assertEqual(self.ports.call_count, 2)
+
+    def test_native_interface_requires_explicit_selection(self):
+        self.ports.return_value = [self.descriptor(vid=0x303A, pid=0x1001, serial_number=bench.TARGET.upper())]
+        self.assertEqual(bench.inspect(self.port, "device-info", 0, "qinheng"), "usb-mismatch")
+        with mock.patch.object(bench, "rom_operation", return_value="device-ok") as rom:
+            self.assertEqual(bench.inspect(self.port, "device-info", 0, "native"), "device-ok")
+        self.assertEqual(rom.call_args.args[1], "device-info")
+
+    def test_descriptor_is_rechecked_after_open_before_rom(self):
+        self.ports.side_effect = [[self.descriptor()], [self.descriptor(serial_number="replacement")]]
+        with mock.patch.object(bench, "rom_operation") as rom:
+            self.assertEqual(bench.inspect(self.port, "device-info", 0, "qinheng"), "usb-mismatch")
+        self.io.open.assert_called_once_with(self.port)
+        rom.assert_not_called()
 
 
 class GitHubTests(TestCase):
@@ -322,7 +430,7 @@ class LocalSecurityTests(TestCase):
             private = Path(root)
             token = private / "token"
             token.touch(mode=0o600)
-            token.write_text("never-print-me")
+            token.write_text("never_print_me")
             with (private / "agent.lock").open("a") as lock:
                 agent.fcntl.flock(lock.fileno(), agent.fcntl.LOCK_EX | agent.fcntl.LOCK_NB)
                 completed = subprocess.run(
@@ -334,5 +442,39 @@ class LocalSecurityTests(TestCase):
                 )
             self.assertEqual(completed.returncode, 1)
             self.assertIn("credential and lock", completed.stderr)
-            self.assertNotIn("never-print-me", completed.stdout + completed.stderr)
+            self.assertNotIn("never_print_me", completed.stdout + completed.stderr)
             self.assertFalse((private / "jobs.sqlite3").exists())
+
+    def test_auth_check_only_reads_account_and_issue_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            token = Path(root) / "token"
+            token.touch(mode=0o600)
+            token.write_text("never_print_me")
+            argv = ["agent.py", "--token-file", str(token), "--check-auth"]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(agent.GitHub, "request", side_effect=[({"id": 123}, {}), ({"number": 13}, {})]) as request, \
+                 mock.patch.object(agent, "run_station") as station, \
+                 mock.patch.object(agent, "run_worker") as worker:
+                agent.main()
+            self.assertEqual(request.call_args_list, [
+                mock.call("/user"), mock.call("/repos/sshorba/roadhog/issues/13"),
+            ])
+            station.assert_not_called()
+            worker.assert_not_called()
+            self.assertEqual(list(Path(root).iterdir()), [token])
+
+    def test_auth_check_rejects_dispatch_flags_and_reports_github_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            token = Path(root) / "token"
+            token.touch(mode=0o600)
+            token.write_text("never_print_me")
+            argv = ["agent.py", "--token-file", str(token), "--check-auth"]
+            with mock.patch.object(agent, "run_station") as station, \
+                 mock.patch.object(agent.GitHub, "request", side_effect=GitHubError(401)) as request, \
+                 mock.patch("sys.stderr"):
+                for flag in (["--once"], ["--rom-job", ID], []):
+                    with mock.patch.object(sys, "argv", argv + flag), self.assertRaises(SystemExit) as error:
+                        agent.main()
+                    self.assertEqual(error.exception.code, 2 if flag else 1)
+            request.assert_called_once_with("/user")
+            station.assert_not_called()
