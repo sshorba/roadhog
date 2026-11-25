@@ -243,7 +243,8 @@ typedef struct {
     nvs_handle_t users_store;
 } sms_control_t;
 
-static void users_lock(void) {}
+static bool users_lock_ok = true;
+static bool users_lock(void) { return users_lock_ok; }
 static void users_unlock(void) {}
 
 #include "sms_authorization_under_test.inc"
@@ -405,6 +406,16 @@ static void test_portal_sms_users(void)
     }
     assert(!strcmp(sms_users_request(&after_reboot, true, "add", "+1009"), "User list full"));
     assert(!sms_sender_allowed(&after_reboot, "+1009"));
+    users_lock_ok = false;
+    before = writes;
+    assert(!strcmp(sms_users_request(&after_reboot, true, "add", "+1666"),
+                   "SMS users are unavailable."));
+    assert(writes == before);
+    assert(sms_sender_allowed(&after_reboot, "+1234"));
+    assert(!sms_sender_allowed(&after_reboot, "+1777"));
+    assert(!sms_users_json(&after_reboot, json, sizeof(json)));
+    users_lock_ok = true;
+    assert(sms_sender_allowed(&after_reboot, "+1777"));
     assert(sms_users_json(&after_reboot, json, sizeof(json)));
     assert(!sms_users_json(&after_reboot, json, 32));
 

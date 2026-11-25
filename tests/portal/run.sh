@@ -12,3 +12,4 @@ for ipv6 in 0 1; do
         "$root/tests/portal/test_http.c" -o "$tmp/portal"
     "$tmp/portal"
 done
+node "$root/tests/portal/test_users_refresh.js"

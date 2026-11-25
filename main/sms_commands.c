@@ -16,26 +16,34 @@ static const char *const unknown = "Unknown command, send \"?\" for help.";
 
 // The HTTP task and the modem task both read and write the additional-user list.
 static SemaphoreHandle_t users_mu;
+#ifdef CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION
+static StaticSemaphore_t users_mu_storage;
+#endif
 
-static void users_lock(void)
+// False means the list must not be touched. A missing lock is that failure.
+static bool users_lock(void)
 {
-    if (users_mu) {
-        xSemaphoreTake(users_mu, portMAX_DELAY);
+    if (!users_mu) {
+        return false;
     }
+    return xSemaphoreTake(users_mu, portMAX_DELAY) == pdTRUE;
 }
 
 static void users_unlock(void)
 {
-    if (users_mu) {
-        xSemaphoreGive(users_mu);
-    }
+    xSemaphoreGive(users_mu);
 }
 
 void sms_users_lock_init(void)
 {
-    if (!users_mu) {
-        users_mu = xSemaphoreCreateMutex();
+    if (users_mu) {
+        return;
     }
+#ifdef CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION
+    users_mu = xSemaphoreCreateMutexStatic(&users_mu_storage);
+#else
+    users_mu = xSemaphoreCreateMutex();
+#endif
 }
 
 bool sms_number_valid(const char *number)
@@ -51,7 +59,9 @@ bool sms_sender_allowed(const sms_control_t *sms, const char *sender)
     if (strcmp(sms->owner, sender) == 0) {
         return true;
     }
-    users_lock();
+    if (!users_lock()) {
+        return false;
+    }
     bool allowed = false;
     for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
         if (strcmp(sms->users[i], sender) == 0) {
@@ -142,7 +152,9 @@ static const char *sms_users_change(sms_control_t *sms, const char *number, bool
     if (!sms || !number) {
         return "SMS users are unavailable.";
     }
-    users_lock();
+    if (!users_lock()) {
+        return "SMS users are unavailable.";
+    }
     const char *message = apply_user_change(sms, number, add);
     users_unlock();
     return message;
@@ -171,11 +183,15 @@ const char *sms_users_request(sms_control_t *sms, bool authenticated, const char
     return sms_users_change(sms, number, add);
 }
 
-static void sms_users_copy(const sms_control_t *sms, char copied[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY])
+static bool sms_users_copy(const sms_control_t *sms, char copied[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY])
 {
-    users_lock();
+    if (!users_lock()) {
+        memset(copied, 0, sizeof(sms->users));
+        return false;
+    }
     memcpy(copied, sms->users, sizeof(sms->users));
     users_unlock();
+    return true;
 }
 
 bool sms_users_json(const sms_control_t *sms, char *json, size_t capacity)
@@ -184,7 +200,9 @@ bool sms_users_json(const sms_control_t *sms, char *json, size_t capacity)
         return false;
     }
     char copied[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY];
-    sms_users_copy(sms, copied);
+    if (!sms_users_copy(sms, copied)) {
+        return false;
+    }
     int used = snprintf(json, capacity, "{\"owner\":\"%s\",\"users\":[", sms->owner);
     if (used < 0 || (size_t)used >= capacity) {
         return false;
@@ -296,7 +314,10 @@ void sms_command_reply(sms_control_t *sms, modem_t *modem, const sms_request_t *
         return;
     } else if (strcmp(command, "USERS") == 0) {
         char listed[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY];
-        sms_users_copy(sms, listed);
+        if (!sms_users_copy(sms, listed)) {
+            strcpy(reply, "Could not read the user list");
+            return;
+        }
         snprintf(reply, SMS_TEXT_CAPACITY, "Authorized numbers:\n%s (owner)", sms->owner);
         for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
             if (listed[i][0]) {
