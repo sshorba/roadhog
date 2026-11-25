@@ -380,7 +380,7 @@ static esp_err_t cellular_net_session(const cellular_net_config_t *config, bool 
     esp_err_t result = operation(&netif, context);
     ppp_active = false;
     *recovered = !is_case("pdp-cleanup-failure");
-    return result;
+    return is_case("pdp-cleanup-deferred") ? ESP_FAIL : result;
 }
 
 enum { MODEM_FINAL_OK = 1 };
@@ -445,9 +445,18 @@ static int xSemaphoreTake(SemaphoreHandle_t done, unsigned timeout_ms)
 static int xTaskCreate(void (*worker)(void *), const char *name, unsigned stack_size,
                        void *context, unsigned priority, void *handle)
 {
-    assert(name && stack_size && priority && !handle);
+    assert(strcmp(name, "ota_session") == 0 && stack_size == 24 * 1024);
+    assert(priority == 4 && !handle);
+    if (is_case("task-allocation-failure")) {
+        return 0;
+    }
     worker(context);
     return pdPASS;
+}
+static unsigned uxTaskGetStackHighWaterMark(void *task)
+{
+    assert(!task);
+    return 4096;
 }
 static void vTaskDelete(void *task) { assert(!task); }
 
@@ -617,6 +626,14 @@ static esp_err_t esp_http_client_cleanup(host_http_t *client)
     return ESP_OK;
 }
 
+static bool cellular_modem_maintenance(modem_t **modem, const char *line, const char *apn)
+{
+    (void)modem;
+    (void)line;
+    (void)apn;
+    return false;
+}
+
 #include "installer.inc"
 
 int main(int argc, char **argv)
@@ -638,14 +655,21 @@ int main(int argc, char **argv)
     uart_open = true;
     modem_config_t config = {0};
     sms_control_t sms = {.configured = !is_case("factory")};
-    const char *command = is_case("dry-run") ? "ota check 2" : "ota install powered 2";
+    bool repeated_check = is_case("dry-run-repeated");
+    const char *command = is_case("dry-run") || repeated_check ? "ota check 2" : "ota install powered 2";
     modem_t *result = run_update(&fixture_modem, &config, &sms, command);
+    if (repeated_check) {
+        assert(result == &fixture_modem && selected == running && touched_sectors == 0);
+        assert(at_ready && sms_ready && gps_ready && requests == 4);
+        result = run_update(result, &config, &sms, command);
+    }
 
     bool success = is_case("success") || is_case("success-from-b") || is_case("chunked-image");
     bool modem_unavailable = is_case("at-failure") || is_case("pdp-cleanup-failure") ||
                              is_case("uart-reopen-failure") || is_case("session-timeout");
     bool staged = success || modem_unavailable || is_case("sms-failure") ||
-                  is_case("gnss-failure") || is_case("readback-digest") || is_case("invalid-image");
+                  is_case("gnss-failure") || is_case("readback-digest") || is_case("invalid-image") ||
+                  is_case("pdp-cleanup-deferred");
     assert((result == NULL) == modem_unavailable);
     assert(uart_open == !modem_unavailable);
     assert(selected == (success ? inactive : running) && selections == (unsigned)success);
@@ -672,10 +696,12 @@ int main(int argc, char **argv)
         assert(touched_sectors == 0 && ended == 0 && aborted == 0);
         assert(!memcmp(flash + inactive->address, baseline + inactive->address, inactive->size));
     }
-    if (is_case("dry-run")) {
-        assert(at_ready && sms_ready && gps_ready && requests == 4);
+    if (is_case("dry-run") || repeated_check) {
+        assert(at_ready && sms_ready && gps_ready && requests == (repeated_check ? 8 : 4));
+    } else if (is_case("pdp-cleanup-deferred")) {
+        assert(at_ready && sms_ready && gps_ready && requests == 6);
     } else if (is_case("link-down") || is_case("missing-slot") ||
-               is_case("factory") || is_case("missing-apn")) {
+               is_case("factory") || is_case("missing-apn") || is_case("task-allocation-failure")) {
         assert(requests == 0);
     } else if (is_case("redirect-loop")) {
         assert(requests == 4);

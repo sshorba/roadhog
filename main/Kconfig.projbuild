@@ -59,6 +59,13 @@ config ROADHOG_OTA_UPDATE_BENCH
     depends on !ROADHOG_OTA_BENCH_BOOT_PEER && !ROADHOG_OTA_BENCH_REJECT_PENDING && ESP_CONSOLE_UART
     default n
 
+config ROADHOG_MODEM_MAINTENANCE_BENCH
+    bool "Enable constrained local SIM7600 maintenance commands"
+    depends on ROADHOG_OTA_UPDATE_BENCH && ESP_MAIN_TASK_STACK_SIZE >= 6144
+    default n
+    help
+        Bench only. Uses the normal UART owner with a larger main stack.
+
 config ROADHOG_OTA_RELEASE_BASE
     string "Release asset base URL (without trailing slash)"
     depends on ROADHOG_OTA_UPDATE_BENCH

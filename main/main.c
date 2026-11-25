@@ -103,6 +103,13 @@ void app_main(void)
         ota_boot_health_finish(false);
         return;
     }
+    if (modem_sync_startup(modem) != ESP_OK) {
+        portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
+        ESP_LOGE(TAG, "Modem command mode unavailable after startup recovery");
+        ota_boot_health_finish(false);
+        modem_close(modem);
+        return;
+    }
     modem_final_t at = probe(modem, "AT", NULL);
     status_led_set_connections(at != MODEM_FINAL_NONE, false, false);
     portal_set_status(read_lte_registration(modem), NULL, GPS_UNAVAILABLE);

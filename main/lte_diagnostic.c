@@ -12,6 +12,12 @@
 
 static const char *TAG = "lte_diagnostic";
 
+enum {
+    LTE_DIAGNOSTIC_STACK_BYTES = 8 * 1024,
+    OTA_SESSION_STACK_BYTES = 24 * 1024,
+    STACK_MARGIN_BYTES = 2 * 1024,
+};
+
 typedef struct {
     cellular_net_config_t config;
     SemaphoreHandle_t done;
@@ -26,6 +32,12 @@ static void run_diagnostic(void *context)
     diagnostic_t *diagnostic = context;
     diagnostic->result = cellular_net_session(&diagnostic->config, &diagnostic->at_ready,
                                               diagnostic->operation, diagnostic->context);
+    unsigned remaining = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "%s minimum free stack: %u bytes",
+             diagnostic->operation ? "OTA session" : "LTE diagnostic", remaining);
+    if (remaining < STACK_MARGIN_BYTES) {
+        ESP_LOGW(TAG, "LTE worker stack margin is below %u bytes", (unsigned)STACK_MARGIN_BYTES);
+    }
     xSemaphoreGive(diagnostic->done);
     vTaskDelete(NULL);
 }
@@ -60,7 +72,9 @@ modem_t *lte_session_run(modem_t *modem, const modem_config_t *config, bool *uar
     };
     ESP_LOGI(TAG, "Releasing AT UART for PPP; SMS and GPS queries paused");
     modem_close(modem);
-    if (xTaskCreate(run_diagnostic, "lte_diagnostic", 8192, &diagnostic, 4, NULL) == pdPASS) {
+    const char *worker_name = operation ? "ota_session" : "lte_diagnostic";
+    unsigned stack_bytes = operation ? OTA_SESSION_STACK_BYTES : LTE_DIAGNOSTIC_STACK_BYTES;
+    if (xTaskCreate(run_diagnostic, worker_name, stack_bytes, &diagnostic, 4, NULL) == pdPASS) {
         if (xSemaphoreTake(diagnostic.done, pdMS_TO_TICKS(operation ? 480000 : 180000)) != pdTRUE) {
             ESP_LOGE(TAG, "LTE session deadline exceeded; AT UART will stay closed");
             return NULL;

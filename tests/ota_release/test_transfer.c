@@ -74,7 +74,8 @@ static esp_err_t run(fixture_t *fixture, esp_netif_t *netif, int64_t length, int
 {
     body_t body = {.maximum = maximum, .exact = exact, .consume = consume, .context = &output};
     fixture->offset = 0;
-    return read_body(fixture, length, netif, deadline, &body);
+    uint8_t buffer[HTTP_BUFFER];
+    return read_body(fixture, length, netif, deadline, &body, buffer);
 }
 
 int main(void)

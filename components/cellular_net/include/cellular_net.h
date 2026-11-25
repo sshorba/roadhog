@@ -18,6 +18,9 @@ typedef struct {
     const char *apn;
 } cellular_net_config_t;
 
+struct modem;
+// Called exclusively by the existing local UART console owner.
+bool cellular_modem_maintenance(struct modem **modem, const char *line, const char *apn);
 bool cellular_apn_valid(const char *apn);
 
 // Caller releases the AT UART before this call. The driver is released on

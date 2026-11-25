@@ -4,6 +4,7 @@
 #include "ota_manifest.h"
 #include "connection_status.h"
 #include "lte_diagnostic.h"
+#include "provisioning.h"
 
 #include <inttypes.h>
 #include <fcntl.h>
@@ -57,6 +58,7 @@ typedef struct {
 typedef struct {
     char location[OTA_URL_MAX];
     bool invalid;
+    uint8_t body_buffer[HTTP_BUFFER];
 } redirect_t;
 
 static esp_err_t on_header(esp_http_client_event_t *event)
@@ -80,16 +82,15 @@ static bool transfer_ready(esp_netif_t *netif, int64_t deadline)
 }
 
 static esp_err_t read_body(esp_http_client_handle_t client, int64_t content_length,
-                           esp_netif_t *netif, int64_t deadline, body_t *body)
+                           esp_netif_t *netif, int64_t deadline, body_t *body, uint8_t *buffer)
 {
     if (content_length > (int64_t)body->maximum ||
         (content_length > 0 && body->exact && content_length != (int64_t)body->exact)) {
         return ESP_ERR_INVALID_SIZE;
     }
 
-    uint8_t buffer[HTTP_BUFFER];
     while (transfer_ready(netif, deadline)) {
-        int count = esp_http_client_read(client, (char *)buffer, sizeof(buffer));
+        int count = esp_http_client_read(client, (char *)buffer, HTTP_BUFFER);
         if (!transfer_ready(netif, deadline)) {
             return ESP_ERR_TIMEOUT;
         }
@@ -157,7 +158,8 @@ static esp_err_t download(esp_netif_t *netif, char *url, int64_t deadline, body_
             break;
         }
         snprintf(numeric_url, OTA_URL_MAX + 16, "https://%s%s", address, path);
-        *redirect = (redirect_t){0};
+        redirect->location[0] = '\0';
+        redirect->invalid = false;
         esp_http_client_config_t config = {
             .url = numeric_url,
             .common_name = host,
@@ -187,7 +189,7 @@ static esp_err_t download(esp_netif_t *netif, char *url, int64_t deadline, body_
             if (length < 0 || !transfer_ready(netif, deadline)) {
                 error = ESP_ERR_INVALID_RESPONSE;
             } else if (status == 200) {
-                error = read_body(client, length, netif, deadline, body);
+                error = read_body(client, length, netif, deadline, body, redirect->body_buffer);
             } else {
                 follow = redirect_status(status) && hop < MAX_REDIRECTS &&
                          !redirect->invalid && redirect->location[0];
@@ -410,36 +412,43 @@ static esp_err_t update_over_ppp(esp_netif_t *netif, void *context)
     if (deadline > update->staging_deadline) {
         deadline = update->staging_deadline;
     }
-    uint8_t manifest_bytes[OTA_MANIFEST_MAX], signature[SIGNATURE_MAX];
-    body_t manifest_body = {.maximum = sizeof(manifest_bytes)};
-    body_t signature_body = {.maximum = sizeof(signature)};
-    char *url = malloc(OTA_URL_MAX);
-    if (!url) {
+    struct {
+        uint8_t manifest_bytes[OTA_MANIFEST_MAX];
+        uint8_t signature[SIGNATURE_MAX];
+        ota_manifest_t manifest;
+        char url[OTA_URL_MAX];
+    } *workspace = malloc(sizeof(*workspace));
+    if (!workspace) {
         return ESP_ERR_NO_MEM;
     }
-    esp_err_t error = download_bytes(netif, update, deadline, manifest_bytes, &manifest_body, "manifest", url);
+    body_t manifest_body = {.maximum = sizeof(workspace->manifest_bytes)};
+    body_t signature_body = {.maximum = sizeof(workspace->signature)};
+    esp_err_t error = download_bytes(netif, update, deadline, workspace->manifest_bytes,
+                                     &manifest_body, "manifest", workspace->url);
     if (error == ESP_OK) {
-        error = download_bytes(netif, update, deadline, signature, &signature_body, "sig", url);
+        error = download_bytes(netif, update, deadline, workspace->signature,
+                               &signature_body, "sig", workspace->url);
     }
-    ota_manifest_t manifest;
+    ota_manifest_t *manifest = &workspace->manifest;
     if (error == ESP_OK &&
-        (!verify_signature(manifest_bytes, manifest_body.used, signature, signature_body.used) ||
-         !ota_manifest_parse(manifest_bytes, manifest_body.used, &manifest) ||
-         manifest.sequence != update->sequence || manifest.size < IMAGE_PREFIX)) {
+        (!verify_signature(workspace->manifest_bytes, manifest_body.used,
+                           workspace->signature, signature_body.used) ||
+         !ota_manifest_parse(workspace->manifest_bytes, manifest_body.used, manifest) ||
+         manifest->sequence != update->sequence || manifest->size < IMAGE_PREFIX)) {
         error = ESP_ERR_INVALID_RESPONSE;
     }
     if (error == ESP_OK) {
         char digest[65];
-        for (size_t i = 0; i < sizeof(manifest.digest); ++i) {
-            snprintf(digest + 2 * i, 3, "%02x", manifest.digest[i]);
+        for (size_t i = 0; i < sizeof(manifest->digest); ++i) {
+            snprintf(digest + 2 * i, 3, "%02x", manifest->digest[i]);
         }
         ESP_LOGI(TAG, "Verified manifest v%" PRIu32 ", %s, %" PRIu32 " bytes, SHA-256 %s",
-                 manifest.sequence, update->target->label, manifest.size, digest);
+                 manifest->sequence, update->target->label, manifest->size, digest);
         if (update->install) {
-            error = stage_image(netif, update, deadline, &manifest, url);
+            error = stage_image(netif, update, deadline, manifest, workspace->url);
         }
     }
-    free(url);
+    free(workspace);
     return error == ESP_OK && !transfer_ready(netif, deadline) ? ESP_ERR_TIMEOUT : error;
 }
 
@@ -548,6 +557,9 @@ modem_t *ota_update_poll(modem_t *modem, const modem_config_t *config, sms_contr
             used = 0;
             discarded = false;
             if (ready) {
+                if (cellular_modem_maintenance(&modem, line, provisioning_apn())) {
+                    return modem;
+                }
                 return run_update(modem, config, sms, line);
             }
         } else if (used == sizeof(line) - 1 || byte < ' ' || byte > '~') {

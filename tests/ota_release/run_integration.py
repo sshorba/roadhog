@@ -20,9 +20,9 @@ S3 = "release-assets.githubusercontent.com"
 IMAGE_SIZE = 10003
 
 CASES = (
-    "success", "success-from-b", "chunked-image", "dry-run", "bad-signature", "altered", "truncated",
-    "http-failure", "at-failure", "pdp-cleanup-failure", "uart-reopen-failure",
-    "session-timeout", "sms-failure", "gnss-failure", "wrong-cert",
+    "success", "success-from-b", "chunked-image", "dry-run", "dry-run-repeated", "bad-signature", "altered", "truncated",
+    "http-failure", "at-failure", "pdp-cleanup-failure", "pdp-cleanup-deferred", "uart-reopen-failure",
+    "session-timeout", "task-allocation-failure", "sms-failure", "gnss-failure", "wrong-cert",
     "untrusted-cert", "redirect-http", "redirect-host", "redirect-loop",
     "duplicate-location", "invalid-image", "readback-digest", "link-down", "missing-slot",
     "factory", "missing-apn",

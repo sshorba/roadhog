@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 
 struct modem {
     modem_config_t config;
@@ -61,8 +62,10 @@ static void handle_line(modem_t *modem, transaction_t *transaction)
         if (strcmp(line, modem->pending_command) == 0) {
             return;
         }
-        if (modem->pending_prefix[0] &&
-            strncmp(line, modem->pending_prefix, strlen(modem->pending_prefix)) == 0) {
+        bool serial_number = !strcmp(modem->pending_command, "AT+CGSN") &&
+                             modem->line_length == 15 && strspn(line, "0123456789") == 15;
+        if (serial_number || (modem->pending_prefix[0] &&
+            strncmp(line, modem->pending_prefix, strlen(modem->pending_prefix)) == 0)) {
             size_t length = modem->line_length;
             if (transaction && transaction->response && !transaction->incomplete) {
                 if (length + 2 > transaction->capacity - transaction->used) {
@@ -224,6 +227,12 @@ esp_err_t modem_poll(modem_t *modem, uint32_t duration_ms)
     return receive(modem, NULL, duration_ms);
 }
 
+bool modem_maintenance_ready(modem_t *modem)
+{
+    return modem && receive(modem, NULL, 20) == ESP_OK &&
+           !modem->waiting_for_final && !modem->line_length && !modem->discard_line;
+}
+
 static esp_err_t run_command(modem_t *modem, const char *command, const char *response_prefix,
                              uint32_t timeout_ms, char *response, size_t response_size,
                              modem_result_t *result, const char *pdu)
@@ -307,6 +316,80 @@ esp_err_t modem_command(modem_t *modem, const char *command, const char *respons
 {
     return run_command(modem, command, response_prefix, timeout_ms, response,
                        response_size, result, NULL);
+}
+
+// A typed response plus a final distinguishes command mode from a stale OK.
+static bool command_mode_confirmed(modem_t *modem)
+{
+    char response[24];
+    modem_result_t result;
+    return modem_command(modem, "AT+CMGF?", "+CMGF:", 2000,
+                         response, sizeof(response), &result) == ESP_OK &&
+           result.final == MODEM_FINAL_OK &&
+           (!strcmp(response, "+CMGF: 0\n") || !strcmp(response, "+CMGF: 1\n"));
+}
+
+static esp_err_t sync_startup(modem_t *modem)
+{
+    if (command_mode_confirmed(modem)) {
+        return ESP_OK;
+    }
+    if (modem->uart_fault) {
+        return ESP_FAIL;
+    }
+
+    // Startup has no live transactions to preserve. A previous ESP32 boot
+    // may have left the powered modem in PPP while our UART parser timed out.
+    // SIM7600 requires a quiet TX guard interval on each side of bare +++.
+    uart_port_t port = modem->config.port;
+    if (uart_wait_tx_done(port, pdMS_TO_TICKS(200)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    if (uart_flush_input(port) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    modem->waiting_for_final = false;
+    modem->line_length = 0;
+    modem->discard_line = false;
+    if (uart_write_bytes(port, "+++", 3) != 3 ||
+        uart_wait_tx_done(port, pdMS_TO_TICKS(200)) != ESP_OK) {
+        modem->uart_fault = true;
+        return ESP_FAIL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1200));
+
+    modem_result_t result = {0};
+    transaction_t escape = {.result = &result};
+    modem->waiting_for_final = true;
+    modem->pending_command[0] = '\0';
+    modem->pending_prefix[0] = '\0';
+    if (receive(modem, &escape, 2000) != ESP_OK || result.final != MODEM_FINAL_OK ||
+        !command_mode_confirmed(modem)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Escape preserves the original data call. End it only after the
+    // acknowledged escape and a solicited command-mode payload.
+    if (modem_command(modem, "ATH", NULL, 10000, NULL, 0, &result) != ESP_OK ||
+        result.final != MODEM_FINAL_OK || !command_mode_confirmed(modem)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_LOGI("modem", "Recovered command mode and ended stale data call");
+    return ESP_OK;
+}
+
+esp_err_t modem_sync_startup(modem_t *modem)
+{
+    if (!modem) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Do not deliver PPP fragments or stale notifications during recovery.
+    modem_notification_fn notify = modem->config.on_notification;
+    modem->config.on_notification = NULL;
+    esp_err_t error = sync_startup(modem);
+    modem->config.on_notification = notify;
+    return error;
 }
 
 esp_err_t modem_submit_sms(modem_t *modem, unsigned tpdu_length, const char *pdu,
