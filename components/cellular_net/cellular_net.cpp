@@ -1,5 +1,6 @@
 #include "cellular_net.h"
 
+#include <atomic>
 #include <charconv>
 #include <cinttypes>
 #include <new>
@@ -685,6 +686,10 @@ static esp_err_t wait_for_ppp(esp_netif_t *netif)
 }
 
 struct dns_lookup_t {
+    // Both the waiting task and the lwIP callback hold the slot until they
+    // finish. The callback may outlive the task's deadline.
+    std::atomic<unsigned> references{};
+    StaticSemaphore_t storage;
     SemaphoreHandle_t done;
     ip4_addr_t address;
     char host[254];
@@ -697,6 +702,7 @@ static void dns_complete(const char *, const ip_addr_t *address, void *context)
         lookup.address = *ip_2_ip4(address);
     }
     xSemaphoreGive(lookup.done);
+    lookup.references.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 static void start_dns(void *context)
@@ -712,32 +718,33 @@ static void start_dns(void *context)
 
 esp_err_t cellular_resolve_ipv4(const char *host, char *address, size_t size)
 {
-    // A timed-out lookup may complete later. Those slots are never reused.
-    static StaticSemaphore_t storage[2];
     static dns_lookup_t slots[2];
-    static bool expired[2];
-    for (unsigned i = 0; i < 2; ++i) {
-        if (expired[i]) {
+    if (strlen(host) >= sizeof(slots[0].host)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (auto &lookup : slots) {
+        unsigned unused = 0;
+        if (!lookup.references.compare_exchange_strong(unused, 2, std::memory_order_acq_rel)) {
             continue;
         }
-        auto &lookup = slots[i];
-        if (strlen(host) >= sizeof(lookup.host)) {
-            return ESP_ERR_INVALID_ARG;
-        }
         if (!lookup.done) {
-            lookup.done = xSemaphoreCreateBinaryStatic(&storage[i]);
+            lookup.done = xSemaphoreCreateBinaryStatic(&lookup.storage);
         }
+        // A callback after the previous caller's timeout may have left a signal.
+        xSemaphoreTake(lookup.done, 0);
         strcpy(lookup.host, host);
         lookup.address = {};
+        esp_err_t result = ESP_ERR_TIMEOUT;
         if (tcpip_try_callback(start_dns, &lookup) != ERR_OK) {
+            lookup.references.store(0, std::memory_order_release);
             return ESP_FAIL;
         }
-        if (xSemaphoreTake(lookup.done, pdMS_TO_TICKS(12000)) != pdTRUE) {
-            expired[i] = true;
-            return ESP_ERR_TIMEOUT;
+        if (xSemaphoreTake(lookup.done, pdMS_TO_TICKS(12000)) == pdTRUE) {
+            result = lookup.address.addr && ip4addr_ntoa_r(&lookup.address, address, size)
+                     ? ESP_OK : ESP_ERR_NOT_FOUND;
         }
-        return lookup.address.addr && ip4addr_ntoa_r(&lookup.address, address, size)
-               ? ESP_OK : ESP_ERR_NOT_FOUND;
+        lookup.references.fetch_sub(1, std::memory_order_acq_rel);
+        return result;
     }
     return ESP_ERR_TIMEOUT;
 }

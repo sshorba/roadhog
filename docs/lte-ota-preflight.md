@@ -5,6 +5,12 @@ provisioning, a maintenance-console session, reboot and any SMS test each
 require the owner's approval before they happen. The local hardware agent is
 used for passive observation. [Signed release format](github-releases-ota.md)
 
+**Bench only, default off.** With Secure Boot disabled, bootloader fallback
+may load unverified inactive-slot bytes if the selected app fails to load.
+This remains unresolved even when application-level OTA verification reports
+failure and leaves boot selection unchanged. Keep OTA disabled for unattended
+deployments, fielded vehicles and assembled units. [Trust and rollback](github-releases-ota.md#trust-and-rollback)
+
 ## Identify the baseline before choosing an installer target
 
 Use the most recent verified boot and readback as historical evidence. The

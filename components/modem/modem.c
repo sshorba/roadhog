@@ -47,7 +47,7 @@ static modem_final_t final_code(const char *line)
 
 static void handle_line(modem_t *modem, transaction_t *transaction)
 {
-    const char *line = modem->line;
+    const char *line = modem->line + strspn(modem->line, " \t");
     modem_final_t final = final_code(line);
     if (final != MODEM_FINAL_NONE) {
         if (modem->waiting_for_final && transaction) {
@@ -63,10 +63,10 @@ static void handle_line(modem_t *modem, transaction_t *transaction)
             return;
         }
         bool serial_number = !strcmp(modem->pending_command, "AT+CGSN") &&
-                             modem->line_length == 15 && strspn(line, "0123456789") == 15;
+                             strlen(line) == 15 && strspn(line, "0123456789") == 15;
         if (serial_number || (modem->pending_prefix[0] &&
             strncmp(line, modem->pending_prefix, strlen(modem->pending_prefix)) == 0)) {
-            size_t length = modem->line_length;
+            size_t length = strlen(line);
             if (transaction && transaction->response && !transaction->incomplete) {
                 if (length + 2 > transaction->capacity - transaction->used) {
                     transaction->incomplete = true;
@@ -97,8 +97,14 @@ static void consume_byte(modem_t *modem, uint8_t byte, transaction_t *transactio
     }
     if (byte == '\r' || byte == '\n') {
         if (!modem->discard_line && modem->line_length > 0) {
-            modem->line[modem->line_length] = '\0';
-            handle_line(modem, transaction);
+            size_t end = modem->line_length;
+            while (end && (modem->line[end - 1] == ' ' || modem->line[end - 1] == '\t')) {
+                --end;
+            }
+            modem->line[end] = '\0';
+            if (end) {
+                handle_line(modem, transaction);
+            }
         }
         modem->line_length = 0;
         modem->discard_line = false;
@@ -321,12 +327,23 @@ esp_err_t modem_command(modem_t *modem, const char *command, const char *respons
 // A typed response plus a final distinguishes command mode from a stale OK.
 static bool command_mode_confirmed(modem_t *modem)
 {
-    char response[24];
-    modem_result_t result;
-    return modem_command(modem, "AT+CMGF?", "+CMGF:", 2000,
-                         response, sizeof(response), &result) == ESP_OK &&
-           result.final == MODEM_FINAL_OK &&
-           (!strcmp(response, "+CMGF: 0\n") || !strcmp(response, "+CMGF: 1\n"));
+    for (unsigned attempt = 0; attempt < 3 && !modem->uart_fault; ++attempt) {
+        char response[24];
+        modem_result_t result;
+        if (modem_command(modem, "AT+CMGF?", "+CMGF:", 2000,
+                          response, sizeof(response), &result) == ESP_OK &&
+            result.final == MODEM_FINAL_OK && !strncmp(response, "+CMGF:", 6)) {
+            const char *value = response + 6;
+            value += strspn(value, " \t");
+            if ((*value == '0' || *value == '1') && !strcmp(value + 1, "\n")) {
+                return true;
+            }
+        }
+        if (attempt < 2 && receive(modem, NULL, 750) != ESP_OK) {
+            break;
+        }
+    }
+    return false;
 }
 
 static esp_err_t sync_startup(modem_t *modem)

@@ -74,6 +74,16 @@ candidate sequence, which still needs signed-manifest verification.
 
 ## Trust and rollback
 
+**Experimental, default-off bench feature.** With Secure Boot disabled, ESP-IDF
+bootloader fallback can consider the inactive slot if it cannot load the
+selected image. The inactive slot can contain a complete unauthenticated or
+partially written image from an interrupted or rejected transfer, even
+though the application never selected it. Signed manifest and readback
+verification guard normal boot selection. They do not enforce authenticity
+in bootloader fallback. Keep OTA disabled for unattended deployments, fielded
+vehicles and assembled units until the fallback trust boundary is protected
+and hardware power-loss tests pass.
+
 Manifest signing authenticates the content even if release hosting changes or is
 compromised. This is application-level authentication. The policy compares the
 signed sequence to the running application's decimal project version. It does
@@ -162,15 +172,20 @@ Only the final ESP-IDF boot selection updates OTA metadata.
 The OTA session owns the modem UART from PPP setup through AT recovery.
 Its dedicated 24 KiB worker logs the minimum free stack in bytes. The plain
 LTE diagnostic keeps its original stack budget. After an ESP32 restart,
-startup confirms typed AT responses and can use one guarded PPP escape and
-hangup before handing back the UART. Modem recovery is checked separately
+startup retries a typed AT probe up to three times per check, allowing late
+responses to drain and tolerating whitespace and unrelated URCs. It can use
+one guarded PPP escape and hangup before handing back the UART. A pending
+image still requires all startup health checks before it can become VALID. Modem recovery is checked separately
 from PDP cleanup so SMS and GNSS can resume when AT mode is confirmed.
 
 The firmware journals intent before defining a confirmed-free diagnostic
 CID 8. The record is tied to the modem identity and provisioned APN. Only
 an inactive compatible context with matching ownership can be reused after
 a crash. Active, incompatible, secondary-dependent, or unowned contexts
-are preserved. The journal is cleared after verified cleanup. Physical NVS
+are preserved. Active CID 8 left by a crash can block a later diagnostic
+even with a matching journal. Recovery for that case is deferred and may
+require attended modem maintenance or reboot. The journal is cleared after
+verified cleanup. Physical NVS
 bytes can change during journaling. Compare live provisioning records and
 verify that no temporary journal entry remains.
 
@@ -195,6 +210,7 @@ esp_modem component, and libcurl and OpenSSL development packages available.
 sh tests/ota_release/run.sh
 python3 tests/ota_release/run_integration.py /path/to/esp-idf-v6.1.1
 sh components/cellular_net/tests/run_cid8.sh
+sh components/cellular_net/tests/run_dns.sh
 sh tests/modem/run.sh
 sh tests/ota_boot_health/run.sh
 python3 tests/ota_boot_health/run_sdk_lifecycle.py /path/to/esp-idf-v6.1.1
@@ -218,7 +234,13 @@ unavailable slot, factory/no-APN state, lost data link, or failed LTE/AT/SMS/GNS
 select a candidate. All cases compare the complete flash outside the inactive
 application byte for byte, including the running image and NVS. Boot selection
 is modeled separately, and the SDK lifecycle fixture exercises the real
-boot-selection and rollback logic.
+boot-selection and rollback logic. The installer tests inject an erase
+failure, a partial app write, and a boot-selection error. They check
+transaction cleanup, modem restoration, reporting, and unchanged bytes
+outside the inactive application. The SDK metadata tests verify that the
+running VALID record survives an erase failure and a torn peer record with
+no valid CRC. The peer sector may change. These cases do not establish
+behavior for every flash fault or power-loss point.
 
 ## Observed bench results
 

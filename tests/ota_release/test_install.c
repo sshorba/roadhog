@@ -5,6 +5,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +16,23 @@
 
 #include "ota_manifest.h"
 
-#define ESP_LOGI(tag, ...) do { (void)(tag); if (getenv("OTA_TEST_VERBOSE")) { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+static char update_report[160];
+
+static void fixture_log(const char *tag, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    if (!strncmp(format, "Update stopped", 14) || !strncmp(format, "Could not select", 16)) {
+        vsnprintf(update_report, sizeof(update_report), format, args);
+    } else if (getenv("OTA_TEST_VERBOSE")) {
+        fprintf(stderr, "%s: ", tag);
+        vfprintf(stderr, format, args);
+        fputc('\n', stderr);
+    }
+    va_end(args);
+}
+
+#define ESP_LOGI fixture_log
 #define ESP_LOGW ESP_LOGI
 #define ESP_LOGD ESP_LOGI
 #define ESP_LOGE ESP_LOGI
@@ -31,12 +48,12 @@ enum {
     ESP_ERR_INVALID_RESPONSE, ESP_ERR_INVALID_VERSION, ESP_ERR_INVALID_CRC, ESP_ERR_TIMEOUT,
     ESP_ERR_NO_MEM, ESP_ERR_NOT_FOUND, ESP_ERR_OTA_PARTITION_CONFLICT,
     ESP_ERR_OTA_ROLLBACK_INVALID_STATE, ESP_ERR_OTA_ALREADY_IN_PROGRESS, ESP_ERR_OTA_VALIDATE_FAILED,
+    ESP_ERR_FLASH_OP_FAIL,
 };
 
 static const char *esp_err_to_name(esp_err_t error)
 {
-    (void)error;
-    return "fixture status";
+    return error == ESP_ERR_FLASH_OP_FAIL ? "ESP_ERR_FLASH_OP_FAIL" : "fixture status";
 }
 
 typedef int esp_partition_subtype_t;
@@ -77,7 +94,7 @@ static uint8_t flash[16 * 1024 * 1024];
 static uint8_t baseline[sizeof(flash)];
 static uint8_t expected[IMAGE_SIZE];
 static const esp_partition_t *running, *inactive, *selected;
-static unsigned touched_sectors, requests, selections, ended, aborted;
+static unsigned touched_sectors, requests, selections, selection_attempts, ended, aborted;
 static bool ppp_active, uart_open, at_ready, sms_ready, gps_ready;
 static const char *scenario;
 
@@ -192,6 +209,10 @@ static esp_err_t esp_partition_erase_range(const esp_partition_t *part, size_t o
 {
     assert(ppp_active && part == inactive && offset + size <= part->size);
     assert(selected == running && offset % SECTOR == 0 && size % SECTOR == 0);
+    if (is_case("flash-erase")) {
+        assert(offset == 0);
+        return ESP_ERR_FLASH_OP_FAIL;
+    }
     touched_sectors += size / SECTOR;
     memset(flash + part->address + offset, 0xff, size);
     return ESP_OK;
@@ -202,11 +223,16 @@ static esp_err_t esp_partition_write(const esp_partition_t *part, size_t offset,
     const uint8_t *bytes = data;
     assert(ppp_active && part == inactive && offset + size <= part->size);
     uint8_t *dest = flash + part->address + offset;
+    bool interrupted = is_case("flash-partial-write") && offset != 0;
+    if (interrupted) {
+        assert(size >= 2);
+        size /= 2;
+    }
     for (size_t i = 0; i < size; ++i) {
         assert((dest[i] & bytes[i]) == bytes[i]);
         dest[i] = bytes[i];
     }
-    return ESP_OK;
+    return interrupted ? ESP_ERR_FLASH_OP_FAIL : ESP_OK;
 }
 
 static esp_err_t esp_partition_read(const esp_partition_t *part, size_t offset, void *data, size_t size)
@@ -244,6 +270,10 @@ static esp_err_t esp_ota_set_boot_partition(const esp_partition_t *part)
     assert(part == inactive && !ppp_active && at_ready && sms_ready && gps_ready && ended == 1);
     assert(!memcmp(flash + part->address, expected, sizeof(expected)));
     assert(!LIST_FIRST(&s_ota_ops_entries_head));
+    ++selection_attempts;
+    if (is_case("selection-metadata")) {
+        return ESP_ERR_FLASH_OP_FAIL;
+    }
     ++selections;
     selected = part;
     return ESP_OK;
@@ -667,12 +697,21 @@ int main(int argc, char **argv)
     bool success = is_case("success") || is_case("success-from-b") || is_case("chunked-image");
     bool modem_unavailable = is_case("at-failure") || is_case("pdp-cleanup-failure") ||
                              is_case("uart-reopen-failure") || is_case("session-timeout");
-    bool staged = success || modem_unavailable || is_case("sms-failure") ||
+    bool selection_failure = is_case("selection-metadata");
+    bool staging_failure = is_case("flash-erase") || is_case("flash-partial-write");
+    bool staged = success || selection_failure || modem_unavailable || is_case("sms-failure") ||
                   is_case("gnss-failure") || is_case("readback-digest") || is_case("invalid-image") ||
                   is_case("pdp-cleanup-deferred");
     assert((result == NULL) == modem_unavailable);
     assert(uart_open == !modem_unavailable);
     assert(selected == (success ? inactive : running) && selections == (unsigned)success);
+    assert(selection_attempts == (unsigned)(success || selection_failure));
+    if (staging_failure) {
+        assert(at_ready && sms_ready && gps_ready);
+        assert(!strcmp(update_report, "Update stopped (ESP_ERR_FLASH_OP_FAIL, SMS ready=1, GNSS ready=1); boot selection unchanged"));
+    } else if (selection_failure) {
+        assert(!strcmp(update_report, "Could not select the candidate: ESP_ERR_FLASH_OP_FAIL"));
+    }
     assert(!ppp_active && !LIST_FIRST(&s_ota_ops_entries_head));
     // The fixture models metadata selection separately. All other flash, including NVS,
     // the full running image and the bootloader, must retain its original contents.
@@ -687,6 +726,25 @@ int main(int argc, char **argv)
         }
         assert(!memcmp(flash + inactive->address + 3 * SECTOR,
                        baseline + inactive->address + 3 * SECTOR, inactive->size - 3 * SECTOR));
+    } else if (staging_failure) {
+        assert(aborted == 1 && ended == 0);
+        const uint8_t *target = flash + inactive->address;
+        if (is_case("flash-erase")) {
+            assert(touched_sectors == 0 && !memcmp(target, baseline + inactive->address, inactive->size));
+        } else {
+            assert(touched_sectors > 0 && touched_sectors < 3);
+            size_t prefix = 0;
+            while (prefix < sizeof(expected) && target[prefix] == expected[prefix]) {
+                ++prefix;
+            }
+            assert(prefix > 288 && prefix < sizeof(expected));
+            size_t erased_end = touched_sectors * SECTOR;
+            for (size_t i = prefix; i < erased_end; ++i) {
+                assert(target[i] == 0xff);
+            }
+            assert(!memcmp(target + erased_end, baseline + inactive->address + erased_end,
+                           inactive->size - erased_end));
+        }
     } else if (is_case("altered") || is_case("truncated")) {
         assert(aborted == 1 && ended == 0 && touched_sectors == (is_case("altered") ? 3U : 2U));
         size_t untouched = touched_sectors * SECTOR;
