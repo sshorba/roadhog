@@ -95,8 +95,8 @@ configure ESP32 Secure Boot.
 ## Bench procedure
 
 Start with the [attended preflight](lte-ota-preflight.md) to identify the current
-image, decide whether installer provisioning is needed, and stop after the
-signed dry run.
+image and decide whether installer provisioning is needed. The dry run,
+installation and first normal boot each require owner approval.
 
 1. In an owner-approved maintenance window, confirm stable power for the
    modem and ESP32, a verified private recovery backup, the expected 16 MiB
@@ -128,12 +128,18 @@ signed dry run.
    boot selection. Once selected, the candidate will boot on the next reset,
    including an unexpected power cycle. SMS service and GNSS AT queries pause
    while PPP holds the UART. The Wi-Fi portal stays up.
-6. Reboot manually only after a separate owner decision. Release the local
-   console before resuming passive capture with the station. Verify the
-   candidate moves from PENDING_VERIFY to VALID, remains selected after a
-   later approved reboot, preserves provisioning, and passes STATUS/GPS
-   and portal checks. If the candidate fails, verify the prior VALID slot
-   returns and follow the separate recovery procedure if needed.
+6. Rehearse the console-to-ROM handoff while the old slot is still selected.
+   Before allowing a normal boot of the candidate, enter ROM directly without
+   releasing the serial connection or permitting an unintended normal reset.
+   Read the exact signed image length from the newly selected slot and compare
+   its SHA-256 with the manifest. Check that the new OTA record is NEW, the
+   previous VALID record and full fallback slot are intact, and the protected
+   regions and provisioning records match. Stop on any discrepancy.
+7. After the readback gates pass, allow one controlled normal boot. Verify
+   the candidate goes from PENDING_VERIFY to VALID and that provisioning,
+   modem AT, SMS startup, GNSS, and the console resume. If the candidate
+   fails or rolls back on its own, capture the evidence and stop for review.
+   Manual recovery requires separate approval.
 
 The Phase 1 hardware agent remains read-only. The operator handles any
 console input, installer provisioning, and resets locally.
@@ -151,16 +157,49 @@ the next attempt overwrites. ESP-IDF v6.1.1 sequential OTA resumption at
 offset zero avoids the inactive metadata erase performed by esp_ota_begin().
 Only the final ESP-IDF boot selection updates OTA metadata.
 
+## Modem ownership and bench console
+
+The OTA session owns the modem UART from PPP setup through AT recovery.
+Its dedicated 24 KiB worker logs the minimum free stack in bytes. The plain
+LTE diagnostic keeps its original stack budget. After an ESP32 restart,
+startup confirms typed AT responses and can use one guarded PPP escape and
+hangup before handing back the UART. Modem recovery is checked separately
+from PDP cleanup so SMS and GNSS can resume when AT mode is confirmed.
+
+The firmware journals intent before defining a confirmed-free diagnostic
+CID 8. The record is tied to the modem identity and provisioned APN. Only
+an inactive compatible context with matching ownership can be reused after
+a crash. Active, incompatible, secondary-dependent, or unowned contexts
+are preserved. The journal is cleared after verified cleanup. Physical NVS
+bytes can change during journaling. Compare live provisioning records and
+verify that no temporary journal entry remains.
+
+Both `CONFIG_ROADHOG_OTA_UPDATE_BENCH` and
+`CONFIG_ROADHOG_MODEM_MAINTENANCE_BENCH` default to off. The optional
+maintenance console requires the OTA bench option and a 6 KiB main-task
+stack. Use `modem inspect` for a sanitized inventory. If the owner separately
+approves removal of a verified inactive legacy CID 8, issue
+`modem cleanup 8` to arm cleanup and enter the one-time confirmation locally.
+The console rechecks the modem identity, exact profile, activity, secondary
+dependencies and journal state before issuing the targeted deletion.
+Keep the token and raw logs local. Never treat an unexplained CID 8 as owned.
+The console provides no general AT passthrough and is unavailable over SMS
+or the portal.
+
 ## Local verification
 
-Run these commands with a C toolchain, Python 3, OpenSSL, and the libcurl
-and OpenSSL development packages available.
+Run these commands with C and C++ toolchains, Python 3, OpenSSL, the locked
+esp_modem component, and libcurl and OpenSSL development packages available.
 
 ```sh
 sh tests/ota_release/run.sh
 python3 tests/ota_release/run_integration.py /path/to/esp-idf-v6.1.1
+sh components/cellular_net/tests/run_cid8.sh
+sh tests/modem/run.sh
 sh tests/ota_boot_health/run.sh
 python3 tests/ota_boot_health/run_sdk_lifecycle.py /path/to/esp-idf-v6.1.1
+sh tests/provisioning/run.sh
+sh tests/portal/run.sh
 ```
 
 The integration runner binds a temporary localhost HTTPS server and generates
@@ -181,26 +220,38 @@ application byte for byte, including the running image and NVS. Boot selection
 is modeled separately, and the SDK lifecycle fixture exercises the real
 boot-selection and rollback logic.
 
-## Remaining hardware validation
+## Observed bench results
 
-Use a private, signed test candidate on the existing generic-provisioned
-prototype. After separate approval:
+- The private signed-manifest dry run established PPP, retrieved and verified
+  the manifest and detached signature over authenticated HTTPS, and restored
+  AT/SMS/GNSS without staging an app. It recorded 18,864 bytes of minimum OTA
+  worker stack. [Dry-run report](https://github.com/sshorba/roadhog/pull/10#issuecomment-7170933525)
+- One `ota install powered 2` transferred a 1,078,528-byte signed image from A
+  to B and logged 17,324 bytes of minimum free stack. A bare-ROM read of the
+  exact signed length at `0x410000` matched SHA-256 before B was allowed to
+  boot. The OTA record selected B as NEW and preserved VALID A. The app,
+  protected regions and provisioning records were checked. One controlled
+  normal boot confirmed v2 moved from PENDING_VERIFY to VALID with modem
+  registration, SMS startup, GNSS and console readiness.
+  [Install report](https://github.com/sshorba/roadhog/pull/10#issuecomment-7171430168)
 
-1. Confirm the currently selected VALID image, stable bench power and usable
-   SMS, GPS and portal. Capture partition and NVS baselines as needed.
-2. Run the dry run over SIM7600 PPP using the ESP-IDF certificate bundle.
-   Exercise a hostname mismatch, untrusted CA and a private endpoint that
-   returns an allowlisted HTTPS redirect. Confirm TLS failures abort and that
-   redirects keep the intended TLS peer name and Host header.
-3. Install a valid candidate to the already populated inactive slot. Verify
-   the image hash, contents of the running slot, and boot metadata. Confirm
-   successful LTE teardown and working SMS and GPS before manually rebooting.
-4. With separate authorization as needed, exercise a truncated or tampered
-   private transfer, link loss and a modem recovery failure. Confirm the
-   running slot stays selected. Check NVS byte for byte in trials without
-   intentional configuration changes and check the existing SMS permissions.
-5. Verify ESP-IDF image validation, pending verification and a persistent
-   VALID boot on the prototype. Test rollback with an approved rejecting
-   candidate. A controlled brownout test needs a separate procedure and
-   approval. Live GitHub CDN certificate and redirect behavior also remains
-   unverified and is outside the first private installation trial.
+The installed v2 candidate was built from an earlier revision. It predates
+the 24 KiB OTA worker, startup modem recovery, CID ownership journal and
+maintenance console used by the v1 installer. Its successful boot does not
+validate those improvements in v2.
+
+## Remaining hardware and release validation
+
+- Schedule a separate attended trial with a signed, deliberately rejecting
+  candidate and a verified recovery backup. Verify the bootloader returns to
+  the old VALID slot, and confirm provisioning and modem health afterward.
+  Forced rollback from the signed LTE path is covered offline and remains
+  untested on hardware.
+- Exercise rejected TLS peer names, allowlisted redirects with per-hop server
+  SNI/Host evidence, and interrupted transfers on the ESP32. The successful
+  private endpoint trial did not capture per-hop SNI or exercise the GitHub CDN.
+  Brownout and repeated-boot validation require separate approval.
+- Treat local authorization, trust-anchor lifecycle, distribution, and tested
+  recovery as release gates. The bench console and disposable bench key are
+  development tools. A passing private trial alone does not qualify a public
+  firmware release.

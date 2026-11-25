@@ -7,11 +7,11 @@ used for passive observation. [Signed release format](github-releases-ota.md)
 
 ## Identify the baseline before choosing an installer target
 
-The historical provisioning notes recorded selected VALID A at `0x10000`
-and rejected B at `0x410000`. The newer passive station report confirms UART
-activity. The report's commit identifies the request. It provides no running
-app digest, Kconfig, or boot-slot evidence. Current slot, image and installer
-status remain unconfirmed. [Historical readback](factory-provisioning.md#prototype-reset-proposal-for-security-review) · [Passive report](https://github.com/sshorba/roadhog/pull/14#issuecomment-7137869618)
+Use the most recent verified boot and readback as historical evidence. The
+first signed LTE session independently verified v2 in B before boot, then
+observed B become VALID and preserved A as fallback. A passive station
+report can show UART activity but does not identify the live image, slot or
+configuration. [Signed bench report](https://github.com/sshorba/roadhog/pull/10#issuecomment-7171430168)
 
 1. Use existing local boot logs and the most recent accepted flash or OTA
    record before doing anything with the device. Record the latest booted
@@ -42,9 +42,8 @@ status remain unconfirmed. [Historical readback](factory-provisioning.md#prototy
    lacks the bench option or cannot accept the bench key, endpoint or sequence.
    The first trial needs a selected VALID installer with decimal version
    `1`, the matching bench public key and the chosen HTTPS base and hosts.
-   Reuse an installer that already meets those conditions. Current evidence
-   supports planning for a provision, with the decision deferred until the
-   baseline is verified.
+   Reuse an installer that already meets those conditions. Make the decision
+   using the current verified baseline.
 
 ## Prepare an installer and candidate offline
 
@@ -199,10 +198,10 @@ common-name setter, `mbedtls_ssl_set_hostname` and X.509 verification.
   hostname for both TLS and HTTP. No hostname fix is indicated by this audit.
 
 This verifies the tagged SDK's implementation and target build configuration.
-A live PPP handshake has not been observed. Before a live OTA write, use the
-attended dry run to confirm two allowlisted hostname hops with HTTPS server
-logs showing distinct TLS server names and matching HTTP Host headers.
-In a separate dry run, route an allowlisted host to a certificate valid only
-for a different name. Require the download to fail with no staging or boot
-selection. The libcurl fixture covers matching and mismatching TLS peers,
-but the attended test exercises the device's ESP-TLS traffic.
+The first private trial established live PPP and retrieved the signed
+manifest and image over the authenticated HTTPS path. The two-hop SNI
+comparison and deliberate hostname rejection remain to be exercised on
+ESP32. In approved dry runs, compare the server's TLS server name and HTTP
+Host at each allowlisted hop, then require a certificate valid only for a
+different name to fail before staging or boot selection. The libcurl
+fixture checks these cases offline.
