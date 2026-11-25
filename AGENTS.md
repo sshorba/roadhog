@@ -7,7 +7,7 @@ These instructions apply to AI coding agents working in this repository. Read th
 - Road Hög is an open-source ESP32-S3 vehicle tracking, telemetry, and security platform. No mandatory cloud service.
 - Primary target: ESP32-S3 N16R8 (16 MB flash, 8 MB PSRAM); ESP-IDF **v6.1.1**; C.
 - Bench modem: Waveshare SIM7600NA-H, UART1 TX GPIO17 / RX GPIO18 at 115200 8N1, common ground and independently powered modem.
-- Repository references: `README.md`, `docs/architecture.md`, `docs/decisions.md`, `docs/roadmap.md`, `docs/modem.md`, `docs/sms.md`, `docs/portal.md`, `docs/connectivity.md`.
+- Repository references: `README.md`, `ROADMAP.md`, `docs/architecture.md`, `docs/decisions.md`, `docs/modem.md`, `docs/sms.md`, `docs/portal.md`, `docs/connectivity.md`.
 - Current firmware implements SMS commands, GNSS queries, modem AT transport, a captive setup portal, and status LEDs. Preserve tested capabilities unless a task explicitly authorizes a change.
 
 ## Collaboration workflow (Stage 1: human-triggered Codex CLI)
