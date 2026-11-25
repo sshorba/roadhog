@@ -2,6 +2,7 @@
 #include "portal_auth.h"
 #include "provisioning.h"
 #include "sim_number.h"
+#include "sms_commands.h"
 #include "status_led.h"
 
 #include <errno.h>
@@ -37,6 +38,17 @@ static gps_status_t gps_status;
 static const char *data_status = "Unknown";
 static char sim_number[SIM_NUMBER_CAPACITY];
 static const char sim_unavailable[] = "Not available from SIM/carrier";
+static sms_control_t *portal_sms;
+
+void portal_bind_sms(struct sms_control *sms)
+{
+    portal_sms = sms;
+}
+
+struct sms_control *portal_bound_sms(void)
+{
+    return portal_sms;
+}
 
 void portal_set_sim_number(const char *number)
 {
@@ -73,6 +85,23 @@ static esp_err_t status_response(httpd_req_t *request)
              "{\"lte\":\"%s\",\"data\":\"%s\",\"gps\":\"%s\",\"sim\":\"%s\",\"owner\":\"%s\",\"wifi_password\":\"%s\"}",
              lte_label(lte), data, gps_label(gps), number[0] ? number : sim_unavailable,
              owner ? owner : "Not configured", wifi_password ? wifi_password : "Not available");
+    httpd_resp_set_type(request, "application/json");
+    return httpd_resp_sendstr(request, body);
+}
+
+static esp_err_t users_response(httpd_req_t *request)
+{
+    if (!portal_sms || !portal_sms->owner || !portal_sms->users_store) {
+        httpd_resp_set_status(request, "503 Service Unavailable");
+        httpd_resp_set_type(request, "text/plain; charset=utf-8");
+        return httpd_resp_sendstr(request, "SMS users are unavailable.");
+    }
+    char body[512];
+    if (!sms_users_json(portal_sms, body, sizeof(body))) {
+        httpd_resp_set_status(request, "500 Internal Server Error");
+        httpd_resp_set_type(request, "text/plain; charset=utf-8");
+        return httpd_resp_sendstr(request, "Could not read the user list.");
+    }
     httpd_resp_set_type(request, "application/json");
     return httpd_resp_sendstr(request, body);
 }
@@ -156,6 +185,14 @@ static esp_err_t get_response(httpd_req_t *request, int *status)
                 return httpd_resp_sendstr(request, "Sign in to view device status.");
             }
             return status_response(request);
+        }
+        if (strcmp(request->uri, "/api/users") == 0) {
+            if (!portal_authenticated(request)) {
+                *status = 401;
+                httpd_resp_set_status(request, "401 Unauthorized");
+                return httpd_resp_sendstr(request, "Sign in to manage SMS users.");
+            }
+            return users_response(request);
         }
         if (strcmp(request->uri, "/") == 0 || strncmp(request->uri, "/?", 2) == 0) {
             httpd_resp_set_type(request, "text/html; charset=utf-8");
@@ -293,7 +330,8 @@ static esp_err_t start_services(void)
     }
     const httpd_uri_t route = {.uri = "/*", .method = HTTP_GET, .handler = landing_page};
     error = httpd_register_uri_handler(http, &route);
-    const char *auth_paths[] = {"/api/login", "/api/password", "/api/logout", "/api/setup", "/api/setup/sim"};
+    const char *auth_paths[] = {"/api/login", "/api/password", "/api/logout", "/api/users",
+                                 "/api/setup", "/api/setup/sim"};
     for (size_t i = 0; error == ESP_OK && i < sizeof(auth_paths) / sizeof(auth_paths[0]); i++) {
         const httpd_uri_t auth_route = {.uri = auth_paths[i], .method = HTTP_POST, .handler = auth_post};
         error = httpd_register_uri_handler(http, &auth_route);

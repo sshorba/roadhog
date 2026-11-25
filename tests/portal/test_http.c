@@ -104,6 +104,7 @@ static esp_err_t httpd_resp_send_err(httpd_req_t *req, int status, const char *b
 }
 static bool portal_authenticated(httpd_req_t *req) { return req->authenticated; }
 static esp_err_t status_response(httpd_req_t *req) { return httpd_resp_sendstr(req, "private status"); }
+static esp_err_t users_response(httpd_req_t *req) { return httpd_resp_sendstr(req, "sms users"); }
 static esp_err_t portal_auth_post(httpd_req_t *req)
 {
     ++posts;
@@ -158,6 +159,9 @@ int main(void)
     get("/api/status", portal_host, false, 401);
     get("/api/status", portal_host, true, 200);
     get("/api/status", "other.example", true, 403);
+    get("/api/users", portal_host, false, 401);
+    get("/api/users", portal_host, true, 200);
+    get("/api/users", "other.example", true, 403);
     get("/api/unknown", portal_host, true, 404);
 
     fixture_socket_error = true;
@@ -166,12 +170,15 @@ int main(void)
     ipv4("192.168.5.1");
     get("/", portal_host, false, 403);
     get("/api/status", portal_host, true, 403);
+    get("/api/users", portal_host, true, 403);
 
 #if CONFIG_LWIP_IPV6
     ipv6("::ffff:192.168.4.1");
     get("/", portal_host, false, 200);
     get("/api/status", portal_host, false, 401);
     get("/api/status", portal_host, true, 200);
+    get("/api/users", portal_host, false, 401);
+    get("/api/users", portal_host, true, 200);
     ipv6("::ffff:192.168.5.1");
     get("/", portal_host, false, 403);
     ipv6("fe80::1");
@@ -185,6 +192,8 @@ int main(void)
     assert(auth_post(&post) == ESP_OK && posts == 1);
     post.origin = "http://other.example";
     assert(auth_post(&post) == ESP_OK && post.status == 403 && posts == 1);
+    httpd_req_t users = {.uri = "/api/users", .host = portal_host, .origin = "http://evil.example"};
+    assert(auth_post(&users) == ESP_OK && users.status == 403 && posts == 1);
     fixture_socket_error = true;
     post.origin = "http://192.168.4.1";
     assert(auth_post(&post) == ESP_OK && post.status == 403 && posts == 1);

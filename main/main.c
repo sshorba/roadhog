@@ -106,6 +106,7 @@ void app_main(void)
     status_led_set_connections(at != MODEM_FINAL_NONE, false, false);
     portal_set_status(read_lte_registration(modem), NULL, GPS_UNAVAILABLE);
     sms_control_start(&sms, modem);
+    portal_bind_sms(&sms);
     bool gps_started = start_gps(modem);
 
 #ifdef CONFIG_ROADHOG_SMS_CONTROL

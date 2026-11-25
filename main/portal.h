@@ -17,3 +17,7 @@ esp_err_t portal_get_ssid(char ssid[PORTAL_SSID_CAPACITY]);
 
 void portal_set_sim_number(const char *number);
 esp_err_t portal_sim_response(httpd_req_t *request);
+
+struct sms_control;
+void portal_bind_sms(struct sms_control *sms);
+struct sms_control *portal_bound_sms(void);

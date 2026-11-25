@@ -9,8 +9,34 @@
 
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *const unknown = "Unknown command, send \"?\" for help.";
+
+// The HTTP task and the modem task both read and write the additional-user list.
+static SemaphoreHandle_t users_mu;
+
+static void users_lock(void)
+{
+    if (users_mu) {
+        xSemaphoreTake(users_mu, portMAX_DELAY);
+    }
+}
+
+static void users_unlock(void)
+{
+    if (users_mu) {
+        xSemaphoreGive(users_mu);
+    }
+}
+
+void sms_users_lock_init(void)
+{
+    if (!users_mu) {
+        users_mu = xSemaphoreCreateMutex();
+    }
+}
 
 bool sms_number_valid(const char *number)
 {
@@ -25,12 +51,15 @@ bool sms_sender_allowed(const sms_control_t *sms, const char *sender)
     if (strcmp(sms->owner, sender) == 0) {
         return true;
     }
+    users_lock();
+    bool allowed = false;
     for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
         if (strcmp(sms->users[i], sender) == 0) {
-            return true;
+            allowed = true;
         }
     }
-    return false;
+    users_unlock();
+    return allowed;
 }
 
 bool sms_users_load(sms_control_t *sms)
@@ -56,20 +85,18 @@ bool sms_users_load(sms_control_t *sms)
     return true;
 
 invalid:
+    memset(sms->users, 0, sizeof(sms->users));
     nvs_close(sms->users_store);
+    sms->users_store = 0;
     return false;
 }
 
-static const char *change_user(sms_control_t *sms, const char *sender,
-                               const char *number, bool add)
+static const char *apply_user_change(sms_control_t *sms, const char *number, bool add)
 {
-    if (strcmp(sender, sms->owner) != 0) {
-        return "Owner only";
-    }
     if (!sms_number_valid(number)) {
         return "Use a number with + and country code.";
     }
-    if (strcmp(number, sms->owner) == 0) {
+    if (!sms->owner || strcmp(number, sms->owner) == 0) {
         return "Owner is permanent";
     }
 
@@ -99,12 +126,97 @@ static const char *change_user(sms_control_t *sms, const char *sender,
     } else if (!existing) {
         return "User not found";
     }
+    if (!sms->users_store) {
+        return "SMS users are unavailable.";
+    }
     if (nvs_set_blob(sms->users_store, "users_v1", updated, sizeof(updated)) != ESP_OK ||
         nvs_commit(sms->users_store) != ESP_OK) {
         return "Could not save user list";
     }
     memcpy(sms->users, updated, sizeof(updated));
     return add ? "User added" : "User removed";
+}
+
+static const char *sms_users_change(sms_control_t *sms, const char *number, bool add)
+{
+    if (!sms || !number) {
+        return "SMS users are unavailable.";
+    }
+    users_lock();
+    const char *message = apply_user_change(sms, number, add);
+    users_unlock();
+    return message;
+}
+
+const char *sms_users_request(sms_control_t *sms, bool authenticated, const char *action,
+                              const char *number)
+{
+    if (!authenticated) {
+        return "Sign in again.";
+    }
+    if (!sms || !sms->owner || !sms->users_store) {
+        return "SMS users are unavailable.";
+    }
+    bool add;
+    if (action && strcmp(action, "add") == 0) {
+        add = true;
+    } else if (action && strcmp(action, "remove") == 0) {
+        add = false;
+    } else {
+        return "Enter add or remove and a phone number.";
+    }
+    if (!number) {
+        return "Enter add or remove and a phone number.";
+    }
+    return sms_users_change(sms, number, add);
+}
+
+static void sms_users_copy(const sms_control_t *sms, char copied[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY])
+{
+    users_lock();
+    memcpy(copied, sms->users, sizeof(sms->users));
+    users_unlock();
+}
+
+bool sms_users_json(const sms_control_t *sms, char *json, size_t capacity)
+{
+    if (!sms || !sms->owner || !sms_number_valid(sms->owner) || !json) {
+        return false;
+    }
+    char copied[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY];
+    sms_users_copy(sms, copied);
+    int used = snprintf(json, capacity, "{\"owner\":\"%s\",\"users\":[", sms->owner);
+    if (used < 0 || (size_t)used >= capacity) {
+        return false;
+    }
+    bool first = true;
+    for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
+        if (!copied[i][0]) {
+            continue;
+        }
+        if (!sms_number_valid(copied[i])) {
+            return false;
+        }
+        int wrote = snprintf(json + used, capacity - (size_t)used,
+                             "%s{\"number\":\"%s\",\"role\":\"authorized\"}",
+                             first ? "" : ",", copied[i]);
+        if (wrote < 0 || (size_t)wrote >= capacity - (size_t)used) {
+            return false;
+        }
+        used += wrote;
+        first = false;
+    }
+    int end = snprintf(json + used, capacity - (size_t)used, "]}");
+    return end > 0 && (size_t)end < capacity - (size_t)used;
+}
+
+static const char *change_user(sms_control_t *sms, const char *sender,
+                               const char *number, bool add)
+{
+    if (strcmp(sender, sms->owner) != 0) {
+        return "Owner only";
+    }
+    return sms_users_change(sms, number, add);
 }
 
 static void gps_reply(modem_t *modem, bool map, char reply[SMS_TEXT_CAPACITY])
@@ -183,11 +295,13 @@ void sms_command_reply(sms_control_t *sms, modem_t *modem, const sms_request_t *
         gps_reply(modem, command[0] == 'M', reply);
         return;
     } else if (strcmp(command, "USERS") == 0) {
+        char listed[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY];
+        sms_users_copy(sms, listed);
         snprintf(reply, SMS_TEXT_CAPACITY, "Authorized numbers:\n%s (owner)", sms->owner);
         for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
-            if (sms->users[i][0]) {
+            if (listed[i][0]) {
                 size_t used = strlen(reply);
-                snprintf(reply + used, SMS_TEXT_CAPACITY - used, "\n%s", sms->users[i]);
+                snprintf(reply + used, SMS_TEXT_CAPACITY - used, "\n%s", listed[i]);
             }
         }
         return;

@@ -168,6 +168,7 @@ static void configure_sms(sms_control_t *sms, modem_t *modem)
 void sms_control_start(sms_control_t *sms, modem_t *modem)
 {
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
+    sms_users_lock_init();
     sms->owner = provisioning_owner();
     if (!sms->owner) {
         return;

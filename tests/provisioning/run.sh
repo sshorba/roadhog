@@ -7,8 +7,7 @@ trap 'rm -r "$tmp"' EXIT
 sed '/^#include "/d' "$root/main/setup_button.c" > "$tmp/setup_button_under_test.inc"
 sed '/^#include "/d' "$root/main/provisioning.c" > "$tmp/provisioning_under_test.inc"
 sed '/^#include "/d' "$root/main/owner_verification.c" > "$tmp/owner_verification_under_test.inc"
-sed -n '/^bool sms_number_valid/,/^bool sms_users_load/{ /^bool sms_users_load/!p; }
-        /^static const char \*change_user/,/^static void gps_reply/{ /^static void gps_reply/!p; }' \
+sed -n '/^bool sms_number_valid/,/^static void gps_reply/{ /^static void gps_reply/!p; }' \
     "$root/main/sms_commands.c" > "$tmp/sms_authorization_under_test.inc"
 sed -n '/^static const char hex\[\]/p;
         /^static bool command_ok/,/^#ifdef CONFIG_ROADHOG_SMS_CONTROL/{ /^#ifdef/!p; }

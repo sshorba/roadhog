@@ -22,7 +22,7 @@ and trailing spaces are ignored. Road Hog responds to an authorized sender. An u
 | `APOFF` | Disable the setup AP while LTE is registered, owner only |
 
 Use a single space before the international number. The six additional
-numbers persist in the existing `sms/users_v1` NVS record across reboots. SMS sender numbers can be spoofed. Anyone accepted as an
+numbers persist in the existing `sms/users_v1` NVS record across reboots. The signed-in setup portal edits that same record. See [Wi-Fi setup portal](portal.md). SMS sender numbers can be spoofed. Anyone accepted as an
 authorized sender can request location and the sender list.
 
 STATUS checks the modem when requested. An active data context indicates a
@@ -35,6 +35,8 @@ modem bearer is up. It does not verify internet reachability or activate data.
   replies and confirm `STATUS` still works.
 - Check `GPS` and `MAP` before a fix. With the GPS antenna connected and
   under open sky, repeat after a fix and open the returned link.
+- From the setup portal, add and remove a handset and confirm the same
+  results as `ADDUSER` and `DELUSER`, including across a reboot.
 - Send `ADDUSER +number` for a second handset you control. Confirm `USERS`
   includes it before and after an ESP32 reset. The boot log reports the
   number of additional users loaded from storage. From that handset confirm `STATUS` works
