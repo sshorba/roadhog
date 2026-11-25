@@ -35,7 +35,7 @@ static int xQueueReceive(QueueHandle_t queue, uart_event_t *event, int ticks);
 static int uart_read_bytes(uart_port_t port, uint8_t *byte, int size, int ticks);
 static int uart_write_bytes(uart_port_t port, const char *data, size_t size);
 static esp_err_t uart_wait_tx_done(uart_port_t port, unsigned ticks);
-static esp_err_t uart_flush_input(uart_port_t port);
+esp_err_t uart_flush_input(uart_port_t port);
 static void vTaskDelay(unsigned ticks);
 
 #include "modem_header.inc"
@@ -43,7 +43,7 @@ static void vTaskDelay(unsigned ticks);
 
 typedef enum {
     HEALTHY, STALE_PPP, BARE_OK, NO_ESCAPE, HANGUP_FAILED, FINAL_PROBE_FAILED,
-    UART_FAULT, LATE, TRANSIENT, INVALID_TYPED, DROPPED, STALE_RETRY, STALE_ONLY, SILENT,
+    UART_FAULT, LATE, TRANSIENT, INVALID_TYPED, DROPPED, STALE_RETRY, STALE_ONLY, SILENT, STALE_AFTER_PAYLOAD, STALE_ESCAPE,
 } case_t;
 static case_t scenario;
 static int64_t elapsed, last_write, response_at;
@@ -107,7 +107,7 @@ static esp_err_t uart_wait_tx_done(uart_port_t port, unsigned ticks)
     return ESP_OK;
 }
 
-static esp_err_t uart_flush_input(uart_port_t port)
+esp_err_t uart_flush_input(uart_port_t port)
 {
     assert(port == 1);
     incoming = "";
@@ -119,7 +119,11 @@ static int uart_write_bytes(uart_port_t port, const char *data, size_t size)
     assert(port == 1 && !*incoming);
     if (size == 3 && !memcmp(data, "+++", 3)) {
         assert(++escapes == 1 && elapsed - last_write >= 1200000);
-        if (scenario != NO_ESCAPE && scenario != SILENT && scenario != STALE_ONLY) {
+        if (scenario == STALE_ESCAPE) {
+            // This belongs to an earlier probe. The escape emits no ACK.
+            response_at = elapsed + 1300000;
+            incoming = "\r\nOK\r\n";
+        } else if (scenario != NO_ESCAPE && scenario != SILENT && scenario != STALE_ONLY) {
             incoming = "\r\nOK\r\n";
         }
     } else if (size == 9 && (!memcmp(data, "AT+CMGF?\r", 9) || !memcmp(data, "AT+CMEE?\r", 9))) {
@@ -145,6 +149,12 @@ static int uart_write_bytes(uart_port_t port, const char *data, size_t size)
             incoming = scenario == STALE_RETRY
                        ? "\r\n+CMGF: 1\r\nOK\r\nERROR\r\n+CEREG: 1\r\n+CMEE: 2\r\nOK\r\n"
                        : "\r\n+CMGF: 1\r\nOK\r\nERROR\r\n";
+        } else if (scenario == STALE_AFTER_PAYLOAD && retry) {
+            // The new query sends its payload only. The retired query sends OK.
+            incoming = "\r\n+CMEE: 2\r\nOK\r\n";
+        } else if (!escapes && (scenario == STALE_PPP || scenario == HANGUP_FAILED ||
+                                scenario == FINAL_PROBE_FAILED || scenario == NO_ESCAPE)) {
+            incoming = "\r\nERROR\r\n";
         } else if (scenario == HEALTHY || scenario == LATE || scenario == TRANSIENT || scenario == DROPPED ||
                    (escapes && scenario != BARE_OK && scenario != INVALID_TYPED &&
                     !(scenario == FINAL_PROBE_FAILED && hangups))) {
@@ -156,6 +166,13 @@ static int uart_write_bytes(uart_port_t port, const char *data, size_t size)
             incoming = retry ? "\r\n+CMEE: 3\r\nOK\r\n" : "\r\n+CMGF: 10\r\nOK\r\n";
         } else if (scenario != SILENT) {
             incoming = "partial PPP data without a final";
+        }
+    } else if (size == 9 && !memcmp(data, "AT+CFUN?\r", 9)) {
+        assert(++queries == 3);
+        if (scenario == DROPPED || scenario == STALE_RETRY) {
+            incoming = "\r\n+CFUN: 1\r\nOK\r\n";
+        } else {
+            assert(scenario == STALE_AFTER_PAYLOAD);
         }
     } else if (size == 8 && !memcmp(data, "AT+CGSN\r", 8)) {
         incoming = "\r\n123456789012345\r\nOK\r\n";
@@ -190,19 +207,20 @@ static esp_err_t run_case(case_t test, esp_err_t expected, unsigned expected_que
     assert(elapsed < 30000000);
     if (result == ESP_OK) {
         assert(modem_maintenance_ready(&modem));
-    } else if (test == FINAL_PROBE_FAILED) {
-        assert(!modem.waiting_for_final && !modem.line_length && !modem.discard_line);
+    } else if (test == FINAL_PROBE_FAILED || test == STALE_AFTER_PAYLOAD || test == STALE_ESCAPE) {
+        assert(!modem_maintenance_ready(&modem));
     }
     return result;
 }
 
-static void boot_case(esp_ota_img_states_t initial, bool recovers, bool other_checks_pass,
+static void boot_case(esp_ota_img_states_t initial, case_t test, bool other_checks_pass,
                       unsigned expected_marks, unsigned expected_rollbacks)
 {
     boot_state = initial;
     marks = rollbacks = 0;
-    esp_err_t startup = recovers ? run_case(DROPPED, ESP_OK, 2, 0, 0)
-                                 : run_case(NO_ESCAPE, ESP_ERR_INVALID_STATE, 2, 1, 0);
+    bool recovers = test == DROPPED;
+    esp_err_t startup = run_case(test, recovers ? ESP_OK : ESP_ERR_INVALID_STATE,
+                                 test == STALE_ESCAPE ? 2 : 3, 0, 0);
     ota_boot_health_finish(startup == ESP_OK && other_checks_pass);
     assert(marks == expected_marks && rollbacks == expected_rollbacks);
     assert(boot_state == (expected_marks ? ESP_OTA_IMG_VALID : initial));
@@ -220,15 +238,17 @@ int main(void)
     run_case(LATE, ESP_OK, 2, 0, 0);
     run_case(TRANSIENT, ESP_OK, 2, 0, 0);
     run_case(INVALID_TYPED, ESP_ERR_INVALID_STATE, 4, 1, 0);
-    run_case(DROPPED, ESP_OK, 2, 0, 0);
-    run_case(STALE_RETRY, ESP_OK, 2, 0, 0);
-    run_case(STALE_ONLY, ESP_ERR_INVALID_STATE, 2, 1, 0);
-    run_case(SILENT, ESP_ERR_INVALID_STATE, 2, 1, 0);
-    boot_case(ESP_OTA_IMG_VALID, true, true, 0, 0);
-    boot_case(ESP_OTA_IMG_VALID, false, true, 0, 0);
-    boot_case(ESP_OTA_IMG_PENDING_VERIFY, true, true, 1, 0);
-    boot_case(ESP_OTA_IMG_PENDING_VERIFY, true, false, 0, 1);
-    boot_case(ESP_OTA_IMG_PENDING_VERIFY, false, true, 0, 1);
+    run_case(DROPPED, ESP_OK, 3, 0, 0);
+    run_case(STALE_RETRY, ESP_OK, 3, 0, 0);
+    run_case(STALE_ONLY, ESP_ERR_INVALID_STATE, 2, 0, 0);
+    run_case(SILENT, ESP_ERR_INVALID_STATE, 2, 0, 0);
+    boot_case(ESP_OTA_IMG_VALID, DROPPED, true, 0, 0);
+    boot_case(ESP_OTA_IMG_VALID, STALE_AFTER_PAYLOAD, true, 0, 0);
+    boot_case(ESP_OTA_IMG_VALID, STALE_ESCAPE, true, 0, 0);
+    boot_case(ESP_OTA_IMG_PENDING_VERIFY, DROPPED, true, 1, 0);
+    boot_case(ESP_OTA_IMG_PENDING_VERIFY, DROPPED, false, 0, 1);
+    boot_case(ESP_OTA_IMG_PENDING_VERIFY, STALE_AFTER_PAYLOAD, true, 0, 1);
+    boot_case(ESP_OTA_IMG_PENDING_VERIFY, STALE_ESCAPE, true, 0, 1);
     modem_t modem = {.config = {.port = 1, .on_notification = notify}};
     char identity[20];
     modem_result_t result;
@@ -242,5 +262,5 @@ int main(void)
     modem.waiting_for_final = false;
     assert(modem_command(&modem, "AT+CGSN", "+CGSN:", 1000, identity, sizeof(identity), &result) == ESP_OK);
     assert(!strcmp(identity, "123456789012345\n") && result.final == MODEM_FINAL_OK && !notifications);
-    puts("Fourteen modem startup recovery cases, VALID/PENDING health, and private identity capture passed");
+    puts("Modem startup and stale-final regressions, VALID/PENDING health, and private identity capture passed");
 }

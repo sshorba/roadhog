@@ -172,13 +172,17 @@ Only the final ESP-IDF boot selection updates OTA metadata.
 The OTA session owns the modem UART from PPP setup through AT recovery.
 Its dedicated 24 KiB worker logs the minimum free stack in bytes. The plain
 LTE diagnostic keeps its original stack budget. After an ESP32 restart,
-startup allows up to two typed AT probes per check. After a failed probe, it
-gives late input time to drain, retires the startup transaction and uses a
-different typed query for the retry. The retry requires its own typed payload
-followed by OK. Startup can use one guarded PPP escape and hangup before
-handing back the UART. A pending image still requires all startup health
-checks before it can become VALID. Modem recovery is checked separately from
-PDP cleanup so SMS and GNSS can resume when AT mode is confirmed.
+startup drains late input after a failed probe and retries with a different
+read-only query. If the first final is still outstanding, startup requires
+another distinct typed confirmation before releasing the UART to normal
+traffic. Generic finals on the UART carry no transaction identity, so no
+timing window or flush can prove which command produced an OK. The extra
+typed confirmation corroborates command mode under normal ordered replies.
+When probes leave the result ambiguous, startup skips PPP escape and hangup.
+An ESP32 restart with a modem still in silent PPP can therefore require
+attended recovery. A pending image still requires the full startup health
+checks before it can become VALID. PDP cleanup is checked separately from
+AT mode so SMS and GNSS can resume when command mode is confirmed.
 
 The firmware journals intent before defining a confirmed-free diagnostic
 CID 8. The record is tied to the modem identity and provisioned APN. Only

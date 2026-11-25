@@ -340,43 +340,67 @@ static void retire_startup_probe(modem_t *modem)
     modem->pending_prefix[0] = '\0';
 }
 
-static bool command_mode_confirmed(modem_t *modem)
+static bool startup_probe(modem_t *modem, const char *command, const char *prefix,
+                          char max_value, bool retry)
 {
-    static const struct {
-        const char *command;
-        const char *prefix;
-        char max_value;
-    } probes[] = {{"AT+CMGF?", "+CMGF:", '1'}, {"AT+CMEE?", "+CMEE:", '2'}};
+    char response[24];
+    modem_result_t result;
+    if (run_command(modem, command, prefix, 2000, response, sizeof(response),
+                    &result, NULL, retry) != ESP_OK || result.final != MODEM_FINAL_OK ||
+        !response[0]) {
+        return false;
+    }
+    const char *value = response + strlen(prefix);
+    value += strspn(value, " \t");
+    return *value >= '0' && *value <= max_value && !strcmp(value + 1, "\n");
+}
 
-    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]) && !modem->uart_fault; ++i) {
-        char response[24];
-        modem_result_t result;
-        // The retry has a distinct payload, so a late reply to the first
-        // query cannot satisfy it. Ignore bare finals until that payload.
-        esp_err_t error = run_command(modem, probes[i].command, probes[i].prefix, 2000,
-                                      response, sizeof(response), &result, NULL, i != 0);
-        if (error == ESP_OK && result.final == MODEM_FINAL_OK && response[0]) {
-            const char *value = response + strlen(probes[i].prefix);
-            value += strspn(value, " \t");
-            if (*value >= '0' && *value <= probes[i].max_value && !strcmp(value + 1, "\n")) {
-                return true;
-            }
+static bool command_mode_confirmed(modem_t *modem, bool *ambiguous)
+{
+    if (startup_probe(modem, "AT+CMGF?", "+CMGF:", '1', false)) {
+        return true;
+    }
+    if (receive(modem, NULL, 750) != ESP_OK) {
+        return false;
+    }
+    bool retired = modem->waiting_for_final;
+    retire_startup_probe(modem);
+
+    if (startup_probe(modem, "AT+CMEE?", "+CMEE:", '2', retired)) {
+        if (!retired) {
+            return true;
         }
-        if (receive(modem, NULL, 750) != ESP_OK) {
-            break;
+        // The retry's OK could belong to the retired probe. Require another
+        // distinct solicited response and final to corroborate AT readiness.
+        *ambiguous = true;
+        if (startup_probe(modem, "AT+CFUN?", "+CFUN:", '9', true)) {
+            return true;
         }
-        retire_startup_probe(modem);
+    }
+
+    if (receive(modem, NULL, 750) == ESP_OK) {
+        *ambiguous |= retired || modem->waiting_for_final;
+        if (!*ambiguous) {
+            retire_startup_probe(modem);
+        }
     }
     return false;
 }
 
 static esp_err_t sync_startup(modem_t *modem)
 {
-    if (command_mode_confirmed(modem)) {
+    bool ambiguous = false;
+    if (command_mode_confirmed(modem, &ambiguous)) {
         return ESP_OK;
     }
     if (modem->uart_fault) {
         return ESP_FAIL;
+    }
+
+    if (ambiguous) {
+        // Neither a flush nor a guard interval can label a future bare OK.
+        ESP_LOGE("modem", "Startup AT response ambiguous; skipping PPP escape and hangup");
+        return ESP_ERR_INVALID_STATE;
     }
 
     // Startup has no live transactions to preserve. A previous ESP32 boot
@@ -387,10 +411,11 @@ static esp_err_t sync_startup(modem_t *modem)
         return ESP_FAIL;
     }
     vTaskDelay(pdMS_TO_TICKS(1200));
-    if (uart_flush_input(port) != ESP_OK) {
-        return ESP_FAIL;
+    // Drain queued input before the escape without treating an RX flush
+    // as evidence that all responses have arrived.
+    if (receive(modem, NULL, 20) != ESP_OK || modem->line_length || modem->discard_line) {
+        return ESP_ERR_INVALID_STATE;
     }
-    retire_startup_probe(modem);
     if (uart_write_bytes(port, "+++", 3) != 3 ||
         uart_wait_tx_done(port, pdMS_TO_TICKS(200)) != ESP_OK) {
         modem->uart_fault = true;
@@ -402,14 +427,14 @@ static esp_err_t sync_startup(modem_t *modem)
     transaction_t escape = {.result = &result};
     modem->waiting_for_final = true;
     if (receive(modem, &escape, 2000) != ESP_OK || result.final != MODEM_FINAL_OK ||
-        !command_mode_confirmed(modem)) {
+        !command_mode_confirmed(modem, &ambiguous) || ambiguous) {
         return ESP_ERR_INVALID_STATE;
     }
 
     // Escape preserves the original data call. End it only after the
     // acknowledged escape and a solicited command-mode payload.
     if (modem_command(modem, "ATH", NULL, 10000, NULL, 0, &result) != ESP_OK ||
-        result.final != MODEM_FINAL_OK || !command_mode_confirmed(modem)) {
+        result.final != MODEM_FINAL_OK || !command_mode_confirmed(modem, &ambiguous)) {
         return ESP_ERR_INVALID_STATE;
     }
     ESP_LOGI("modem", "Recovered command mode and ended stale data call");
