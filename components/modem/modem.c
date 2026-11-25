@@ -28,6 +28,7 @@ typedef struct {
     size_t capacity;
     size_t used;
     bool incomplete;
+    bool ignore_final_before_payload;
     bool waiting_for_prompt;
     bool prompt_seen;
     modem_result_t *result;
@@ -50,6 +51,9 @@ static void handle_line(modem_t *modem, transaction_t *transaction)
     const char *line = modem->line + strspn(modem->line, " \t");
     modem_final_t final = final_code(line);
     if (final != MODEM_FINAL_NONE) {
+        if (transaction && transaction->ignore_final_before_payload && !transaction->used) {
+            return;
+        }
         if (modem->waiting_for_final && transaction) {
             transaction->result->final = final;
             strcpy(transaction->result->final_line, line);
@@ -241,7 +245,7 @@ bool modem_maintenance_ready(modem_t *modem)
 
 static esp_err_t run_command(modem_t *modem, const char *command, const char *response_prefix,
                              uint32_t timeout_ms, char *response, size_t response_size,
-                             modem_result_t *result, const char *pdu)
+                             modem_result_t *result, const char *pdu, bool ignore_final_before_payload)
 {
     if (!modem || !command || !result || timeout_ms == 0 ||
         (response_prefix && (!*response_prefix ||
@@ -274,6 +278,7 @@ static esp_err_t run_command(modem_t *modem, const char *command, const char *re
         .capacity = response_size,
         .result = result,
         .waiting_for_prompt = pdu != NULL,
+        .ignore_final_before_payload = ignore_final_before_payload,
     };
     strcpy(modem->pending_command, command);
     strcpy(modem->pending_prefix, response_prefix ? response_prefix : "");
@@ -321,27 +326,46 @@ esp_err_t modem_command(modem_t *modem, const char *command, const char *respons
                         modem_result_t *result)
 {
     return run_command(modem, command, response_prefix, timeout_ms, response,
-                       response_size, result, NULL);
+                       response_size, result, NULL, false);
 }
 
-// A typed response plus a final distinguishes command mode from a stale OK.
+// Only startup may abandon a read-only probe. Normal AT commands keep the
+// pending transaction guard until their final arrives.
+static void retire_startup_probe(modem_t *modem)
+{
+    modem->waiting_for_final = false;
+    modem->line_length = 0;
+    modem->discard_line = false;
+    modem->pending_command[0] = '\0';
+    modem->pending_prefix[0] = '\0';
+}
+
 static bool command_mode_confirmed(modem_t *modem)
 {
-    for (unsigned attempt = 0; attempt < 3 && !modem->uart_fault; ++attempt) {
+    static const struct {
+        const char *command;
+        const char *prefix;
+        char max_value;
+    } probes[] = {{"AT+CMGF?", "+CMGF:", '1'}, {"AT+CMEE?", "+CMEE:", '2'}};
+
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]) && !modem->uart_fault; ++i) {
         char response[24];
         modem_result_t result;
-        if (modem_command(modem, "AT+CMGF?", "+CMGF:", 2000,
-                          response, sizeof(response), &result) == ESP_OK &&
-            result.final == MODEM_FINAL_OK && !strncmp(response, "+CMGF:", 6)) {
-            const char *value = response + 6;
+        // The retry has a distinct payload, so a late reply to the first
+        // query cannot satisfy it. Ignore bare finals until that payload.
+        esp_err_t error = run_command(modem, probes[i].command, probes[i].prefix, 2000,
+                                      response, sizeof(response), &result, NULL, i != 0);
+        if (error == ESP_OK && result.final == MODEM_FINAL_OK && response[0]) {
+            const char *value = response + strlen(probes[i].prefix);
             value += strspn(value, " \t");
-            if ((*value == '0' || *value == '1') && !strcmp(value + 1, "\n")) {
+            if (*value >= '0' && *value <= probes[i].max_value && !strcmp(value + 1, "\n")) {
                 return true;
             }
         }
-        if (attempt < 2 && receive(modem, NULL, 750) != ESP_OK) {
+        if (receive(modem, NULL, 750) != ESP_OK) {
             break;
         }
+        retire_startup_probe(modem);
     }
     return false;
 }
@@ -366,9 +390,7 @@ static esp_err_t sync_startup(modem_t *modem)
     if (uart_flush_input(port) != ESP_OK) {
         return ESP_FAIL;
     }
-    modem->waiting_for_final = false;
-    modem->line_length = 0;
-    modem->discard_line = false;
+    retire_startup_probe(modem);
     if (uart_write_bytes(port, "+++", 3) != 3 ||
         uart_wait_tx_done(port, pdMS_TO_TICKS(200)) != ESP_OK) {
         modem->uart_fault = true;
@@ -379,8 +401,6 @@ static esp_err_t sync_startup(modem_t *modem)
     modem_result_t result = {0};
     transaction_t escape = {.result = &result};
     modem->waiting_for_final = true;
-    modem->pending_command[0] = '\0';
-    modem->pending_prefix[0] = '\0';
     if (receive(modem, &escape, 2000) != ESP_OK || result.final != MODEM_FINAL_OK ||
         !command_mode_confirmed(modem)) {
         return ESP_ERR_INVALID_STATE;
@@ -400,6 +420,9 @@ esp_err_t modem_sync_startup(modem_t *modem)
 {
     if (!modem) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (modem->waiting_for_final) {
+        return ESP_ERR_INVALID_STATE;
     }
     // Do not deliver PPP fragments or stale notifications during recovery.
     modem_notification_fn notify = modem->config.on_notification;
@@ -424,5 +447,5 @@ esp_err_t modem_submit_sms(modem_t *modem, unsigned tpdu_length, const char *pdu
     char command[24];
     char response[MODEM_LINE_CAPACITY];
     snprintf(command, sizeof(command), "AT+CMGS=%u", tpdu_length);
-    return run_command(modem, command, "+CMGS:", 60000, response, sizeof(response), result, pdu);
+    return run_command(modem, command, "+CMGS:", 60000, response, sizeof(response), result, pdu, false);
 }

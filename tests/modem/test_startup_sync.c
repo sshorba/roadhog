@@ -41,7 +41,10 @@ static void vTaskDelay(unsigned ticks);
 #include "modem_header.inc"
 #include "modem_source.inc"
 
-typedef enum { HEALTHY, STALE_PPP, BARE_OK, NO_ESCAPE, HANGUP_FAILED, FINAL_PROBE_FAILED, UART_FAULT, LATE, TRANSIENT, INVALID_TYPED } case_t;
+typedef enum {
+    HEALTHY, STALE_PPP, BARE_OK, NO_ESCAPE, HANGUP_FAILED, FINAL_PROBE_FAILED,
+    UART_FAULT, LATE, TRANSIENT, INVALID_TYPED, DROPPED, STALE_RETRY, STALE_ONLY, SILENT,
+} case_t;
 static case_t scenario;
 static int64_t elapsed, last_write, response_at;
 static const char *incoming;
@@ -116,12 +119,15 @@ static int uart_write_bytes(uart_port_t port, const char *data, size_t size)
     assert(port == 1 && !*incoming);
     if (size == 3 && !memcmp(data, "+++", 3)) {
         assert(++escapes == 1 && elapsed - last_write >= 1200000);
-        if (scenario != NO_ESCAPE) {
+        if (scenario != NO_ESCAPE && scenario != SILENT && scenario != STALE_ONLY) {
             incoming = "\r\nOK\r\n";
         }
-    } else if (size == 9 && !memcmp(data, "AT+CMGF?\r", 9)) {
+    } else if (size == 9 && (!memcmp(data, "AT+CMGF?\r", 9) || !memcmp(data, "AT+CMEE?\r", 9))) {
+        bool retry = data[6] == 'E';
         ++queries;
-        if (escapes && !hangups && queries == (scenario == BARE_OK || scenario == INVALID_TYPED ? 4U : 2U)) {
+        unsigned check_probe = hangups ? queries - 3 : escapes ? queries - 2 : queries;
+        assert(retry == (check_probe == 2));
+        if (escapes && !hangups && check_probe == 1) {
             assert(elapsed - last_write >= 1200000);
         }
         if (scenario == TRANSIENT && queries == 1) {
@@ -129,22 +135,33 @@ static int uart_write_bytes(uart_port_t port, const char *data, size_t size)
         } else if (scenario == LATE && queries == 1) {
             response_at = elapsed + 2250000;
             incoming = "\r\n+CMGF: 1\r\nOK\r\n";
-        } else if (scenario == HEALTHY || scenario == LATE || scenario == TRANSIENT ||
+        } else if ((scenario == DROPPED || scenario == STALE_RETRY || scenario == STALE_ONLY) && !retry) {
+            // The first query is dropped. In DROPPED, an unrelated URC comes
+            // in after the deadline but does not terminate that transaction.
+            response_at = elapsed + 2100000;
+            incoming = scenario == DROPPED ? "\r\n+CEREG: 1\r\n" : "";
+        } else if (scenario == STALE_RETRY || scenario == STALE_ONLY) {
+            assert(retry && elapsed - last_write >= 2100000);
+            incoming = scenario == STALE_RETRY
+                       ? "\r\n+CMGF: 1\r\nOK\r\nERROR\r\n+CEREG: 1\r\n+CMEE: 2\r\nOK\r\n"
+                       : "\r\n+CMGF: 1\r\nOK\r\nERROR\r\n";
+        } else if (scenario == HEALTHY || scenario == LATE || scenario == TRANSIENT || scenario == DROPPED ||
                    (escapes && scenario != BARE_OK && scenario != INVALID_TYPED &&
-                    !(scenario == FINAL_PROBE_FAILED && queries >= 3))) {
-            incoming = "\r\n +CMGF:\t1 \t\r\n+CEREG: 1\r\n  OK \t\r\n";
+                    !(scenario == FINAL_PROBE_FAILED && hangups))) {
+            incoming = retry ? "\r\n+CMEE: 2\r\nOK\r\n"
+                             : "\r\n +CMGF:\t1 \t\r\n+CEREG: 1\r\n  OK \t\r\n";
         } else if (scenario == BARE_OK) {
             incoming = "\r\nOK\r\n";
         } else if (scenario == INVALID_TYPED) {
-            incoming = "\r\n+CMGF: 10\r\nOK\r\n";
-        } else {
+            incoming = retry ? "\r\n+CMEE: 3\r\nOK\r\n" : "\r\n+CMGF: 10\r\nOK\r\n";
+        } else if (scenario != SILENT) {
             incoming = "partial PPP data without a final";
         }
     } else if (size == 8 && !memcmp(data, "AT+CGSN\r", 8)) {
         incoming = "\r\n123456789012345\r\nOK\r\n";
     } else {
         assert(size == 4 && !memcmp(data, "ATH\r", 4));
-        assert(escapes == 1 && queries == 2 && ++hangups == 1);
+        assert(escapes == 1 && queries == 3 && ++hangups == 1);
         incoming = scenario == HANGUP_FAILED ? "\r\nERROR\r\n" : "\r\nOK\r\n";
     }
     last_write = elapsed;
@@ -170,6 +187,12 @@ static esp_err_t run_case(case_t test, esp_err_t expected, unsigned expected_que
     assert(result == expected);
     assert(queries == expected_queries && escapes == expected_escapes && hangups == expected_hangups);
     assert(!notifications && modem.config.on_notification == notify);
+    assert(elapsed < 30000000);
+    if (result == ESP_OK) {
+        assert(modem_maintenance_ready(&modem));
+    } else if (test == FINAL_PROBE_FAILED) {
+        assert(!modem.waiting_for_final && !modem.line_length && !modem.discard_line);
+    }
     return result;
 }
 
@@ -178,8 +201,8 @@ static void boot_case(esp_ota_img_states_t initial, bool recovers, bool other_ch
 {
     boot_state = initial;
     marks = rollbacks = 0;
-    esp_err_t startup = recovers ? run_case(LATE, ESP_OK, 2, 0, 0)
-                                 : run_case(NO_ESCAPE, ESP_ERR_INVALID_STATE, 1, 1, 0);
+    esp_err_t startup = recovers ? run_case(DROPPED, ESP_OK, 2, 0, 0)
+                                 : run_case(NO_ESCAPE, ESP_ERR_INVALID_STATE, 2, 1, 0);
     ota_boot_health_finish(startup == ESP_OK && other_checks_pass);
     assert(marks == expected_marks && rollbacks == expected_rollbacks);
     assert(boot_state == (expected_marks ? ESP_OTA_IMG_VALID : initial));
@@ -188,16 +211,19 @@ static void boot_case(esp_ota_img_states_t initial, bool recovers, bool other_ch
 int main(void)
 {
     run_case(HEALTHY, ESP_OK, 1, 0, 0);
-    run_case(STALE_PPP, ESP_OK, 3, 1, 1);
-    run_case(BARE_OK, ESP_ERR_INVALID_STATE, 6, 1, 0);
-    run_case(NO_ESCAPE, ESP_ERR_INVALID_STATE, 1, 1, 0);
-    run_case(HANGUP_FAILED, ESP_ERR_INVALID_STATE, 2, 1, 1);
-    run_case(FINAL_PROBE_FAILED, ESP_ERR_INVALID_STATE, 3, 1, 1);
+    run_case(STALE_PPP, ESP_OK, 4, 1, 1);
+    run_case(BARE_OK, ESP_ERR_INVALID_STATE, 4, 1, 0);
+    run_case(NO_ESCAPE, ESP_ERR_INVALID_STATE, 2, 1, 0);
+    run_case(HANGUP_FAILED, ESP_ERR_INVALID_STATE, 3, 1, 1);
+    run_case(FINAL_PROBE_FAILED, ESP_ERR_INVALID_STATE, 5, 1, 1);
     run_case(UART_FAULT, ESP_FAIL, 0, 0, 0);
     run_case(LATE, ESP_OK, 2, 0, 0);
     run_case(TRANSIENT, ESP_OK, 2, 0, 0);
-    run_case(INVALID_TYPED, ESP_ERR_INVALID_STATE, 6, 1, 0);
-    assert(elapsed < 15000000);
+    run_case(INVALID_TYPED, ESP_ERR_INVALID_STATE, 4, 1, 0);
+    run_case(DROPPED, ESP_OK, 2, 0, 0);
+    run_case(STALE_RETRY, ESP_OK, 2, 0, 0);
+    run_case(STALE_ONLY, ESP_ERR_INVALID_STATE, 2, 1, 0);
+    run_case(SILENT, ESP_ERR_INVALID_STATE, 2, 1, 0);
     boot_case(ESP_OTA_IMG_VALID, true, true, 0, 0);
     boot_case(ESP_OTA_IMG_VALID, false, true, 0, 0);
     boot_case(ESP_OTA_IMG_PENDING_VERIFY, true, true, 1, 0);
@@ -209,8 +235,12 @@ int main(void)
     assert(modem_maintenance_ready(&modem));
     modem.waiting_for_final = true;
     assert(!modem_maintenance_ready(&modem));
+    assert(modem_sync_startup(&modem) == ESP_ERR_INVALID_STATE);
+    assert(modem_command(&modem, "AT+CGSN", "+CGSN:", 1000, identity, sizeof(identity), &result) ==
+           ESP_ERR_INVALID_STATE);
+    assert(modem.waiting_for_final);
     modem.waiting_for_final = false;
     assert(modem_command(&modem, "AT+CGSN", "+CGSN:", 1000, identity, sizeof(identity), &result) == ESP_OK);
     assert(!strcmp(identity, "123456789012345\n") && result.final == MODEM_FINAL_OK && !notifications);
-    puts("Ten modem startup recovery cases, VALID/PENDING health, and private identity capture passed");
+    puts("Fourteen modem startup recovery cases, VALID/PENDING health, and private identity capture passed");
 }
