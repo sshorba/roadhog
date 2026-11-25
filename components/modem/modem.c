@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 
 struct modem {
     modem_config_t config;
@@ -27,6 +28,7 @@ typedef struct {
     size_t capacity;
     size_t used;
     bool incomplete;
+    bool ignore_final_before_payload;
     bool waiting_for_prompt;
     bool prompt_seen;
     modem_result_t *result;
@@ -46,9 +48,12 @@ static modem_final_t final_code(const char *line)
 
 static void handle_line(modem_t *modem, transaction_t *transaction)
 {
-    const char *line = modem->line;
+    const char *line = modem->line + strspn(modem->line, " \t");
     modem_final_t final = final_code(line);
     if (final != MODEM_FINAL_NONE) {
+        if (transaction && transaction->ignore_final_before_payload && !transaction->used) {
+            return;
+        }
         if (modem->waiting_for_final && transaction) {
             transaction->result->final = final;
             strcpy(transaction->result->final_line, line);
@@ -61,9 +66,11 @@ static void handle_line(modem_t *modem, transaction_t *transaction)
         if (strcmp(line, modem->pending_command) == 0) {
             return;
         }
-        if (modem->pending_prefix[0] &&
-            strncmp(line, modem->pending_prefix, strlen(modem->pending_prefix)) == 0) {
-            size_t length = modem->line_length;
+        bool serial_number = !strcmp(modem->pending_command, "AT+CGSN") &&
+                             strlen(line) == 15 && strspn(line, "0123456789") == 15;
+        if (serial_number || (modem->pending_prefix[0] &&
+            strncmp(line, modem->pending_prefix, strlen(modem->pending_prefix)) == 0)) {
+            size_t length = strlen(line);
             if (transaction && transaction->response && !transaction->incomplete) {
                 if (length + 2 > transaction->capacity - transaction->used) {
                     transaction->incomplete = true;
@@ -94,8 +101,14 @@ static void consume_byte(modem_t *modem, uint8_t byte, transaction_t *transactio
     }
     if (byte == '\r' || byte == '\n') {
         if (!modem->discard_line && modem->line_length > 0) {
-            modem->line[modem->line_length] = '\0';
-            handle_line(modem, transaction);
+            size_t end = modem->line_length;
+            while (end && (modem->line[end - 1] == ' ' || modem->line[end - 1] == '\t')) {
+                --end;
+            }
+            modem->line[end] = '\0';
+            if (end) {
+                handle_line(modem, transaction);
+            }
         }
         modem->line_length = 0;
         modem->discard_line = false;
@@ -224,9 +237,15 @@ esp_err_t modem_poll(modem_t *modem, uint32_t duration_ms)
     return receive(modem, NULL, duration_ms);
 }
 
+bool modem_maintenance_ready(modem_t *modem)
+{
+    return modem && receive(modem, NULL, 20) == ESP_OK &&
+           !modem->waiting_for_final && !modem->line_length && !modem->discard_line;
+}
+
 static esp_err_t run_command(modem_t *modem, const char *command, const char *response_prefix,
                              uint32_t timeout_ms, char *response, size_t response_size,
-                             modem_result_t *result, const char *pdu)
+                             modem_result_t *result, const char *pdu, bool ignore_final_before_payload)
 {
     if (!modem || !command || !result || timeout_ms == 0 ||
         (response_prefix && (!*response_prefix ||
@@ -259,6 +278,7 @@ static esp_err_t run_command(modem_t *modem, const char *command, const char *re
         .capacity = response_size,
         .result = result,
         .waiting_for_prompt = pdu != NULL,
+        .ignore_final_before_payload = ignore_final_before_payload,
     };
     strcpy(modem->pending_command, command);
     strcpy(modem->pending_prefix, response_prefix ? response_prefix : "");
@@ -306,7 +326,135 @@ esp_err_t modem_command(modem_t *modem, const char *command, const char *respons
                         modem_result_t *result)
 {
     return run_command(modem, command, response_prefix, timeout_ms, response,
-                       response_size, result, NULL);
+                       response_size, result, NULL, false);
+}
+
+// Only startup may abandon a read-only probe. Normal AT commands keep the
+// pending transaction guard until their final arrives.
+static void retire_startup_probe(modem_t *modem)
+{
+    modem->waiting_for_final = false;
+    modem->line_length = 0;
+    modem->discard_line = false;
+    modem->pending_command[0] = '\0';
+    modem->pending_prefix[0] = '\0';
+}
+
+static bool startup_probe(modem_t *modem, const char *command, const char *prefix,
+                          char max_value, bool retry)
+{
+    char response[24];
+    modem_result_t result;
+    if (run_command(modem, command, prefix, 2000, response, sizeof(response),
+                    &result, NULL, retry) != ESP_OK || result.final != MODEM_FINAL_OK ||
+        !response[0]) {
+        return false;
+    }
+    const char *value = response + strlen(prefix);
+    value += strspn(value, " \t");
+    return *value >= '0' && *value <= max_value && !strcmp(value + 1, "\n");
+}
+
+static bool command_mode_confirmed(modem_t *modem, bool *ambiguous)
+{
+    if (startup_probe(modem, "AT+CMGF?", "+CMGF:", '1', false)) {
+        return true;
+    }
+    if (receive(modem, NULL, 750) != ESP_OK) {
+        return false;
+    }
+    bool retired = modem->waiting_for_final;
+    retire_startup_probe(modem);
+
+    if (startup_probe(modem, "AT+CMEE?", "+CMEE:", '2', retired)) {
+        if (!retired) {
+            return true;
+        }
+        // The retry's OK could belong to the retired probe. Require another
+        // distinct solicited response and final to corroborate AT readiness.
+        *ambiguous = true;
+        if (startup_probe(modem, "AT+CFUN?", "+CFUN:", '9', true)) {
+            return true;
+        }
+    }
+
+    if (receive(modem, NULL, 750) == ESP_OK) {
+        *ambiguous |= retired || modem->waiting_for_final;
+        if (!*ambiguous) {
+            retire_startup_probe(modem);
+        }
+    }
+    return false;
+}
+
+static esp_err_t sync_startup(modem_t *modem)
+{
+    bool ambiguous = false;
+    if (command_mode_confirmed(modem, &ambiguous)) {
+        return ESP_OK;
+    }
+    if (modem->uart_fault) {
+        return ESP_FAIL;
+    }
+
+    if (ambiguous) {
+        // Neither a flush nor a guard interval can label a future bare OK.
+        ESP_LOGE("modem", "Startup AT response ambiguous; skipping PPP escape and hangup");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Startup has no live transactions to preserve. A previous ESP32 boot
+    // may have left the powered modem in PPP while our UART parser timed out.
+    // SIM7600 requires a quiet TX guard interval on each side of bare +++.
+    uart_port_t port = modem->config.port;
+    if (uart_wait_tx_done(port, pdMS_TO_TICKS(200)) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    // Drain queued input before the escape without treating an RX flush
+    // as evidence that all responses have arrived.
+    if (receive(modem, NULL, 20) != ESP_OK || modem->line_length || modem->discard_line) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (uart_write_bytes(port, "+++", 3) != 3 ||
+        uart_wait_tx_done(port, pdMS_TO_TICKS(200)) != ESP_OK) {
+        modem->uart_fault = true;
+        return ESP_FAIL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1200));
+
+    modem_result_t result = {0};
+    transaction_t escape = {.result = &result};
+    modem->waiting_for_final = true;
+    if (receive(modem, &escape, 2000) != ESP_OK || result.final != MODEM_FINAL_OK ||
+        !command_mode_confirmed(modem, &ambiguous) || ambiguous) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Escape preserves the original data call. End it only after the
+    // acknowledged escape and a solicited command-mode payload.
+    if (modem_command(modem, "ATH", NULL, 10000, NULL, 0, &result) != ESP_OK ||
+        result.final != MODEM_FINAL_OK || !command_mode_confirmed(modem, &ambiguous)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_LOGI("modem", "Recovered command mode and ended stale data call");
+    return ESP_OK;
+}
+
+esp_err_t modem_sync_startup(modem_t *modem)
+{
+    if (!modem) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (modem->waiting_for_final) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Do not deliver PPP fragments or stale notifications during recovery.
+    modem_notification_fn notify = modem->config.on_notification;
+    modem->config.on_notification = NULL;
+    esp_err_t error = sync_startup(modem);
+    modem->config.on_notification = notify;
+    return error;
 }
 
 esp_err_t modem_submit_sms(modem_t *modem, unsigned tpdu_length, const char *pdu,
@@ -324,5 +472,5 @@ esp_err_t modem_submit_sms(modem_t *modem, unsigned tpdu_length, const char *pdu
     char command[24];
     char response[MODEM_LINE_CAPACITY];
     snprintf(command, sizeof(command), "AT+CMGS=%u", tpdu_length);
-    return run_command(modem, command, "+CMGS:", 60000, response, sizeof(response), result, pdu);
+    return run_command(modem, command, "+CMGS:", 60000, response, sizeof(response), result, pdu, false);
 }

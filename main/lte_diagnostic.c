@@ -12,30 +12,47 @@
 
 static const char *TAG = "lte_diagnostic";
 
+enum {
+    LTE_DIAGNOSTIC_STACK_BYTES = 8 * 1024,
+    OTA_SESSION_STACK_BYTES = 24 * 1024,
+    STACK_MARGIN_BYTES = 2 * 1024,
+};
+
 typedef struct {
     cellular_net_config_t config;
     SemaphoreHandle_t done;
     esp_err_t result;
     bool at_ready;
+    cellular_operation_t operation;
+    void *context;
 } diagnostic_t;
 
 static void run_diagnostic(void *context)
 {
     diagnostic_t *diagnostic = context;
-    diagnostic->result = cellular_net_test(&diagnostic->config, &diagnostic->at_ready);
+    diagnostic->result = cellular_net_session(&diagnostic->config, &diagnostic->at_ready,
+                                              diagnostic->operation, diagnostic->context);
+    unsigned remaining = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "%s minimum free stack: %u bytes",
+             diagnostic->operation ? "OTA session" : "LTE diagnostic", remaining);
+    if (remaining < STACK_MARGIN_BYTES) {
+        ESP_LOGW(TAG, "LTE worker stack margin is below %u bytes", (unsigned)STACK_MARGIN_BYTES);
+    }
     xSemaphoreGive(diagnostic->done);
     vTaskDelete(NULL);
 }
 
-modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *uart_reopened)
+modem_t *lte_session_run(modem_t *modem, const modem_config_t *config, bool *uart_reopened,
+                         cellular_operation_t operation, void *context, esp_err_t *session_result)
 {
     *uart_reopened = false;
+    *session_result = ESP_ERR_INVALID_ARG;
     const char *apn = provisioning_apn();
     if (!apn || !cellular_apn_valid(apn)) {
         ESP_LOGE(TAG, "Provision a valid carrier APN");
         return modem;
     }
-    // One diagnostic per boot. If the worker outlives the deadline it retains
+    // Calls are serialized by the AT owner. If a worker outlives its deadline it retains
     // valid storage and exclusive ownership of the UART until it exits.
     static diagnostic_t diagnostic;
     static StaticSemaphore_t done_storage;
@@ -50,12 +67,16 @@ modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *
         .done = xSemaphoreCreateBinaryStatic(&done_storage),
         .result = ESP_ERR_NO_MEM,
         .at_ready = true,
+        .operation = operation,
+        .context = context,
     };
     ESP_LOGI(TAG, "Releasing AT UART for PPP; SMS and GPS queries paused");
     modem_close(modem);
-    if (xTaskCreate(run_diagnostic, "lte_diagnostic", 8192, &diagnostic, 4, NULL) == pdPASS) {
-        if (xSemaphoreTake(diagnostic.done, pdMS_TO_TICKS(180000)) != pdTRUE) {
-            ESP_LOGE(TAG, "Diagnostic exceeded three minutes; AT UART will stay closed");
+    const char *worker_name = operation ? "ota_session" : "lte_diagnostic";
+    unsigned stack_bytes = operation ? OTA_SESSION_STACK_BYTES : LTE_DIAGNOSTIC_STACK_BYTES;
+    if (xTaskCreate(run_diagnostic, worker_name, stack_bytes, &diagnostic, 4, NULL) == pdPASS) {
+        if (xSemaphoreTake(diagnostic.done, pdMS_TO_TICKS(operation ? 480000 : 180000)) != pdTRUE) {
+            ESP_LOGE(TAG, "LTE session deadline exceeded; AT UART will stay closed");
             return NULL;
         }
     }
@@ -76,8 +97,14 @@ modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *
         modem_close(modem);
         return NULL;
     }
+    *session_result = diagnostic.result;
     *uart_reopened = true;
     ESP_LOGI(TAG, "AT ready after diagnostic");
     return modem;
+}
+modem_t *lte_diagnostic_run(modem_t *modem, const modem_config_t *config, bool *uart_reopened)
+{
+    esp_err_t result;
+    return lte_session_run(modem, config, uart_reopened, NULL, NULL, &result);
 }
 #endif
