@@ -8,6 +8,7 @@
 #include "lte_diagnostic.h"
 #include "modem.h"
 #include "ota_boot_health.h"
+#include "ota_update.h"
 #include "portal.h"
 #include "provisioning.h"
 #include "sim_number.h"
@@ -102,6 +103,13 @@ void app_main(void)
         ota_boot_health_finish(false);
         return;
     }
+    if (modem_sync_startup(modem) != ESP_OK) {
+        portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
+        ESP_LOGE(TAG, "Modem command mode unavailable after startup recovery");
+        ota_boot_health_finish(false);
+        modem_close(modem);
+        return;
+    }
     modem_final_t at = probe(modem, "AT", NULL);
     status_led_set_connections(at != MODEM_FINAL_NONE, false, false);
     portal_set_status(read_lte_registration(modem), NULL, GPS_UNAVAILABLE);
@@ -120,7 +128,7 @@ void app_main(void)
         cache_sim_number(modem);
     }
 
-#ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
+#if defined(CONFIG_ROADHOG_LTE_DIAGNOSTIC) && !defined(CONFIG_ROADHOG_OTA_UPDATE_BENCH)
     bool diagnostic_pending = network_error == ESP_OK && provisioning_apn() != NULL;
     const int64_t diagnostic_at = esp_timer_get_time() + CONFIG_ROADHOG_LTE_DELAY * 1000000LL;
     if (diagnostic_pending) {
@@ -147,7 +155,7 @@ void app_main(void)
         modem_reachable |= csq_answered;
         status_led_set_connections(modem_reachable || lte != LTE_UNKNOWN || gps != GPS_UNAVAILABLE,
                                    lte == LTE_HOME || lte == LTE_ROAMING, gps == GPS_FIX);
-#ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
+#if defined(CONFIG_ROADHOG_LTE_DIAGNOSTIC) && !defined(CONFIG_ROADHOG_OTA_UPDATE_BENCH)
         if (diagnostic_pending && esp_timer_get_time() >= diagnostic_at) {
             diagnostic_pending = false;
             // A missing final can mean an older AT command still owns the stream.
@@ -169,6 +177,17 @@ void app_main(void)
                 }
             } else {
                 ESP_LOGW(TAG, "LTE diagnostic skipped at deadline: %s", lte_label(lte));
+            }
+        }
+#endif
+#ifdef CONFIG_ROADHOG_OTA_UPDATE_BENCH
+        // A missing final can mean an earlier command still owns the AT stream.
+        if (network_error == ESP_OK && csq_answered) {
+            modem = ota_update_poll(modem, &config, &sms);
+            if (!modem) {
+                status_led_set_connections(false, false, false);
+                portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
+                return;
             }
         }
 #endif

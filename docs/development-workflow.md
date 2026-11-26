@@ -16,7 +16,7 @@ This repository uses GitHub issues as the shared task queue, Codex CLI on the ow
 4. Review the diff, build/test evidence, and PR description. Publish the feature branch/PR only when ready.
 5. Ask the planning/review assistant to review the PR by number. Discuss fixes via the PR or a follow-up task.
 6. Owner runs the stated physical hardware checks, records actual output/observations on the PR, and approves merge.
-7. Only after approval: merge, update docs/roadmap, and plan the next issue.
+7. Only after approval: merge, update ROADMAP.md, and plan the next issue.
 
 ## Example Codex prompt
 

@@ -42,6 +42,7 @@ static uint8_t sectors[2 * FLASH_SECTOR_SIZE];
 static const esp_partition_t *running;
 static bool ota_has_initial_contents;
 static bool bootloader_write_fails;
+static bool metadata_erase_fails, metadata_write_fails;
 static unsigned restarts;
 
 void selector_finish(bool healthy);
@@ -103,6 +104,10 @@ static const esp_partition_t *read_otadata(esp_ota_select_entry_t entries[2])
 static esp_err_t esp_partition_erase_range(const esp_partition_t *partition, size_t offset, size_t size)
 {
     assert(partition == &metadata && offset + size <= sizeof(sectors));
+    if (metadata_erase_fails) {
+        assert(offset == FLASH_SECTOR_SIZE);
+        return ESP_FAIL;
+    }
     memset(sectors + offset, 0xff, size);
     return ESP_OK;
 }
@@ -111,6 +116,12 @@ static esp_err_t esp_partition_write(const esp_partition_t *partition, size_t of
                                      const void *entry, size_t size)
 {
     assert(partition == &metadata && offset + size <= sizeof(sectors));
+    if (metadata_write_fails) {
+        assert(offset == FLASH_SECTOR_SIZE && size == sizeof(esp_ota_select_entry_t));
+        // Simulate a torn write that leaves the candidate CRC erased.
+        memcpy(sectors + offset, entry, offsetof(esp_ota_select_entry_t, crc));
+        return ESP_FAIL;
+    }
     memcpy(sectors + offset, entry, size);
     return ESP_OK;
 }
@@ -187,6 +198,23 @@ int main(void)
     selector_finish(false);
     assert(restarts == 0);
 
+    uint8_t before[sizeof(sectors)];
+    memcpy(before, sectors, sizeof(before));
+    metadata_erase_fails = true;
+    assert(esp_ota_set_boot_partition(&apps[slot_b]) == ESP_FAIL);
+    assert(!memcmp(before, sectors, sizeof(sectors)));
+    assert(esp_ota_get_boot_partition() == running);
+    metadata_erase_fails = false;
+
+    metadata_write_fails = true;
+    assert(esp_ota_set_boot_partition(&apps[slot_b]) == ESP_FAIL);
+    assert(!memcmp(before, sectors, FLASH_SECTOR_SIZE));
+    assert(memcmp(before + FLASH_SECTOR_SIZE, sectors + FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE));
+    assert(esp_ota_get_boot_partition() == running);
+    assert(bootloader_utility_get_selected_boot_partition(&layout) == slot_a);
+    expect_state(slot_a, ESP_OTA_IMG_VALID);
+    metadata_write_fails = false;
+
     selector_finish(true);
     assert(restarts == 1);
     expect_state(slot_a, ESP_OTA_IMG_VALID);
@@ -203,5 +231,5 @@ int main(void)
     expect_state(slot_a, ESP_OTA_IMG_VALID);
     selector_finish(true);
     assert(restarts == 2);
-    puts("ESP-IDF 6.1.1 host lifecycle: erased metadata, VALID A, rejected B, return to A");
+    puts("ESP-IDF 6.1.1 host lifecycle: metadata failures, VALID A, rejected B, return to A");
 }
