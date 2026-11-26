@@ -32,6 +32,10 @@
     details { margin-top: 1.25rem }
     summary { cursor: pointer; color: #cfed87 }
     details form { margin-top: .75rem }
+    #sms-users { list-style: none; margin: .75rem 0; padding: 0 }
+    #sms-users li { display: flex; justify-content: space-between; align-items: center;
+                    gap: .75rem; padding: .55rem 0; border-bottom: 1px solid #3c473c }
+    #sms-users button { background: transparent; color: inherit }
     #logout { margin-top: 1rem; background: transparent; color: inherit }
     .notice { margin: .75rem 0 0; color: #ffd297 }
   </style>
@@ -96,6 +100,14 @@
           <button type="submit">Save password</button>
         </form>
       </details>
+      <h2>SMS users</h2>
+      <p>Authorized numbers can request status, GPS, a map link, the user list, and turn the setup AP on. The owner number is permanent and can also add or remove users and turn the AP off.</p>
+      <ul id="sms-users"></ul>
+      <form id="add-user" method="post" action="/api/users">
+        <label>Phone number <input name="number" type="tel" autocomplete="off"
+          placeholder="+ followed by country code and number" required maxlength="16"></label>
+        <button type="submit">Add user</button>
+      </form>
       <button id="logout" type="button">Sign out</button>
     </section>
     <p id="notice" class="notice" role="status" hidden></p>
@@ -131,6 +143,7 @@
 
     function showSignin() {
       document.getElementById("wifi_password").textContent = "—";
+      document.getElementById('sms-users').replaceChildren();
       if (signin.hidden) {
         password.reset();
         dashboard.querySelector('details').open = false;
@@ -169,6 +182,7 @@
         if (dashboard.hidden) message('');
         signin.hidden = true;
         dashboard.hidden = false;
+        await refreshUsers();
       } catch {
         if (started !== generation) return;
         fields.forEach(field => {
@@ -176,6 +190,58 @@
         });
         if (dashboard.hidden) showSignin();
         message('Can’t read device status. Check your Wi-Fi connection.');
+      }
+    }
+
+    async function refreshUsers() {
+      const started = generation;
+      const list = document.getElementById('sms-users');
+      try {
+        const response = await request('/api/users');
+        if (started !== generation) return;
+        if (response.status === 401) {
+          showSignin();
+          return;
+        }
+        if (!response.ok) {
+          list.replaceChildren();
+          return;
+        }
+        const body = await response.json();
+        if (started !== generation) return;
+        list.replaceChildren();
+        const owner = document.createElement('li');
+        owner.textContent = body.owner + ' — owner, permanent';
+        list.append(owner);
+        const users = Array.isArray(body.users) ? body.users : [];
+        if (!users.length) {
+          const empty = document.createElement('li');
+          empty.textContent = 'No additional users.';
+          list.append(empty);
+          return;
+        }
+        users.forEach(user => {
+          const item = document.createElement('li');
+          const name = document.createElement('span');
+          name.textContent = user.number + ' — authorized';
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = 'Remove';
+          button.addEventListener('click', () => removeUser(user.number, button));
+          item.append(name, button);
+          list.append(item);
+        });
+      } catch {
+        if (started !== generation) return;
+        list.replaceChildren();
+      }
+    }
+
+    async function removeUser(number, button) {
+      if (!confirm('Remove ' + number + ' from SMS access?')) return;
+      if (await submit('/api/users', 'remove\n' + number, button)) {
+        message('User removed.');
+        await refreshUsers();
       }
     }
 
@@ -228,6 +294,17 @@
 
     logout.addEventListener('click', async () => {
       if (await submit('/api/logout', '', logout)) showSignin();
+    });
+
+    const addUser = document.getElementById('add-user');
+    addUser.addEventListener('submit', async event => {
+      event.preventDefault();
+      const number = addUser.elements.number.value.trim();
+      if (await submit('/api/users', 'add\n' + number, event.submitter)) {
+        addUser.reset();
+        message('User added.');
+        await refreshUsers();
+      }
     });
 
     const sendCode = document.getElementById('send-code');

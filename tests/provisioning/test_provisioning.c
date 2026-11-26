@@ -12,6 +12,9 @@ typedef unsigned nvs_handle_t;
 enum { NVS_READONLY, NVS_READWRITE };
 static uint8_t stored[512];
 static size_t stored_length;
+static uint8_t users_stored[102];
+static size_t users_length;
+static bool users_set_error, users_commit_error;
 static bool config_exists, legacy_sms, legacy_admin;
 static bool init_error, read_error, set_error, commit_error;
 static unsigned writes;
@@ -36,6 +39,10 @@ static esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
         *handle = 1;
         return config_exists ? ESP_OK : ESP_ERR_NVS_NOT_FOUND;
     }
+    if (!strcmp(name, "sms") && mode == NVS_READWRITE) {
+        *handle = 3;
+        return ESP_OK;
+    }
     assert(mode == NVS_READONLY);
     if ((!strcmp(name, "sms") && legacy_sms) || (!strcmp(name, "portal_auth") && legacy_admin)) {
         *handle = 2;
@@ -44,10 +51,21 @@ static esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
     return ESP_ERR_NVS_NOT_FOUND;
 }
 
-static void nvs_close(nvs_handle_t handle) { assert(handle == 1 || handle == 2); }
+static void nvs_close(nvs_handle_t handle) { assert(handle == 1 || handle == 2 || handle == 3); }
 
 static esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *dst, size_t *length)
 {
+    if (handle == 3) {
+        assert(!strcmp(key, "users_v1"));
+        if (!users_length) {
+            return ESP_ERR_NVS_NOT_FOUND;
+        }
+        if (*length >= users_length) {
+            memcpy(dst, users_stored, users_length);
+        }
+        *length = users_length;
+        return ESP_OK;
+    }
     assert(handle == 1 && !strcmp(key, "settings_v1"));
     if (read_error) {
         return ESP_FAIL;
@@ -64,6 +82,16 @@ static esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key, void *dst, s
 
 static esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *input, size_t length)
 {
+    if (handle == 3) {
+        assert(!strcmp(key, "users_v1") && length == sizeof(users_stored));
+        ++writes;
+        if (users_set_error) {
+            return ESP_FAIL;
+        }
+        memcpy(users_stored, input, length);
+        users_length = length;
+        return ESP_OK;
+    }
     assert(handle == 1 && !strcmp(key, "settings_v1") && length <= sizeof(stored));
     ++writes;
     if (set_error) {
@@ -76,6 +104,9 @@ static esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *
 
 static esp_err_t nvs_commit(nvs_handle_t handle)
 {
+    if (handle == 3) {
+        return users_commit_error ? ESP_FAIL : ESP_OK;
+    }
     assert(handle == 1);
     return commit_error ? ESP_FAIL : ESP_OK;
 }
@@ -212,6 +243,10 @@ typedef struct {
     nvs_handle_t users_store;
 } sms_control_t;
 
+static bool users_lock_ok = true;
+static bool users_lock(void) { return users_lock_ok; }
+static void users_unlock(void) {}
+
 #include "sms_authorization_under_test.inc"
 
 enum { SMS_TEXT_CAPACITY = 161, PORTAL_SSID_CAPACITY = sizeof("ROADHOG-FFFF") };
@@ -310,8 +345,92 @@ static void fresh_flash(void)
     config_exists = legacy_sms = legacy_admin = false;
     init_error = read_error = set_error = commit_error = false;
     stored_length = 0;
+    users_length = 0;
+    users_set_error = users_commit_error = false;
+    memset(users_stored, 0, sizeof(users_stored));
     writes = 0;
     reboot();
+}
+
+static void test_portal_sms_users(void)
+{
+    assert(SMS_USER_LIMIT * SMS_NUMBER_CAPACITY == sizeof(users_stored));
+    users_length = 0;
+    users_set_error = users_commit_error = false;
+    sms_control_t sms = {.owner = "+1234"};
+    assert(sms_users_load(&sms) && sms.users_store);
+    unsigned before = writes;
+    assert(!strcmp(sms_users_request(&sms, false, "add", "+1999"), "Sign in again."));
+    assert(writes == before && !sms_sender_allowed(&sms, "+1999"));
+    assert(!strcmp(sms_users_request(&sms, true, "promote", "+1999"),
+                   "Enter add or remove and a phone number."));
+    assert(!strcmp(sms_users_request(&sms, true, "add", "1999"),
+                   "Use a number with + and country code."));
+    assert(!strcmp(sms_users_request(&sms, true, "add", "+1234"), "Owner is permanent"));
+    assert(!strcmp(sms_users_request(&sms, true, "remove", "+1234"), "Owner is permanent"));
+    assert(writes == before && sms_sender_allowed(&sms, "+1234"));
+
+    assert(!strcmp(sms_users_request(&sms, true, "add", "+1999"), "User added"));
+    assert(sms_sender_allowed(&sms, "+1999"));
+    assert(!strcmp(sms_users_request(&sms, true, "add", "+1999"), "User already authorized"));
+    char json[512];
+    assert(sms_users_json(&sms, json, sizeof(json)));
+    assert(strstr(json, "\"owner\":\"+1234\"") && strstr(json, "\"number\":\"+1999\""));
+    assert(strstr(json, "\"role\":\"authorized\"") && !strstr(json, "+1234\",\"role\""));
+
+    sms_control_t loaded = {.owner = "+1234"};
+    assert(sms_users_load(&loaded));
+    assert(sms_sender_allowed(&loaded, "+1999"));
+    assert(!strcmp(sms_users_request(&loaded, true, "remove", "+1888"), "User not found"));
+    assert(!strcmp(sms_users_request(&loaded, true, "remove", "+1999"), "User removed"));
+    assert(!sms_sender_allowed(&loaded, "+1999"));
+    sms_control_t after_reboot = {.owner = "+1234"};
+    assert(sms_users_load(&after_reboot));
+    assert(!after_reboot.users[0][0] && !sms_sender_allowed(&after_reboot, "+1999"));
+
+    users_set_error = true;
+    before = writes;
+    assert(!strcmp(sms_users_request(&after_reboot, true, "add", "+1777"), "Could not save user list"));
+    assert(!sms_sender_allowed(&after_reboot, "+1777") && writes == before + 1);
+    users_set_error = false;
+    users_commit_error = true;
+    assert(!strcmp(sms_users_request(&after_reboot, true, "add", "+1777"), "Could not save user list"));
+    assert(!sms_sender_allowed(&after_reboot, "+1777"));
+    users_commit_error = false;
+    assert(!strcmp(sms_users_request(&after_reboot, true, "add", "+1777"), "User added"));
+
+    for (int i = 0; i < SMS_USER_LIMIT - 1; i++) {
+        char number[8];
+        snprintf(number, sizeof(number), "+100%d", i);
+        assert(!strcmp(sms_users_request(&after_reboot, true, "add", number), "User added"));
+    }
+    assert(!strcmp(sms_users_request(&after_reboot, true, "add", "+1009"), "User list full"));
+    assert(!sms_sender_allowed(&after_reboot, "+1009"));
+    users_lock_ok = false;
+    before = writes;
+    assert(!strcmp(sms_users_request(&after_reboot, true, "add", "+1666"),
+                   "SMS users are unavailable."));
+    assert(writes == before);
+    assert(sms_sender_allowed(&after_reboot, "+1234"));
+    assert(!sms_sender_allowed(&after_reboot, "+1777"));
+    assert(!sms_users_json(&after_reboot, json, sizeof(json)));
+    users_lock_ok = true;
+    assert(sms_sender_allowed(&after_reboot, "+1777"));
+    assert(sms_users_json(&after_reboot, json, sizeof(json)));
+    assert(!sms_users_json(&after_reboot, json, 32));
+
+    after_reboot.users[2][0] = '\0';
+    strcpy(after_reboot.users[4], "+1777");
+    assert(!strcmp(sms_users_request(&after_reboot, true, "remove", "+1777"), "User removed"));
+    assert(!sms_sender_allowed(&after_reboot, "+1777"));
+    for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
+        assert(strcmp(after_reboot.users[i], "+1777"));
+    }
+
+    users_length = 4;
+    users_stored[0] = 'x';
+    sms_control_t corrupt = {.owner = "+1234"};
+    assert(!sms_users_load(&corrupt) && !corrupt.users_store && !corrupt.users[0][0]);
 }
 
 int main(void)
@@ -525,5 +644,6 @@ int main(void)
     sms_owner_verification_service(&modem);
     assert(owner_verification_status() == OWNER_VERIFY_SENT && modem.attempts == 2);
     assert(!provisioning_owner() && !writes);
+    test_portal_sms_users();
     puts("Provisioning, GPIO4 debounce and session binding, SMS challenge and reboot tests passed");
 }

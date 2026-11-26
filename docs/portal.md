@@ -43,6 +43,16 @@ The authenticated dashboard shows the registered owner SMS control number
 and a separate SIM phone number when the modem reports one. Missing SIM
 number information is shown as “Not available from SIM/carrier.”
 
+**SMS users** on that dashboard use the same `sms/users_v1` list as
+`ADDUSER` and `DELUSER`. The owner row is permanent. Each additional number
+is shown as authorized: it can request status, GPS, a map link, the user
+list, and turn the setup AP on. Add a number with `+` and the country code.
+Remove asks for confirmation, then deletes every stored copy of that number.
+Changes are saved before the response and apply to the next SMS command.
+The portal does not log the phone number. Only a signed-in administrator
+can open `GET /api/users` or `POST /api/users`. A post from another origin
+is rejected.
+
 To check the portal from a connected computer:
 
 - Confirm the client received an address in `192.168.4.0/24` and gateway
@@ -56,6 +66,10 @@ To check the portal from a connected computer:
 - Change the password and confirm the portal signs you out. Try the old
   password, then sign in with the new one. Reboot, enable the AP again,
   and confirm the new password still works.
+- Sign in and add a handset you control. Confirm `USERS` from the owner
+  phone lists it, and `STATUS` from the new handset works. Remove it in
+  the portal, confirm the prompt, and verify the removed handset gets no
+  reply. Reboot, open the dashboard, and confirm the list still matches.
 - Confirm an SMS `STATUS` still works while a client is connected.
 
 To verify the AP policy, start with a registered modem and confirm the SSID

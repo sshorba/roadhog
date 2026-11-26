@@ -14,7 +14,7 @@ typedef struct {
     char text[SMS_TEXT_CAPACITY];
 } sms_request_t;
 
-typedef struct {
+typedef struct sms_control {
     const char *owner;
     char users[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY];
     nvs_handle_t users_store;

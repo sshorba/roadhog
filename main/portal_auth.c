@@ -3,6 +3,7 @@
 #include "owner_verification.h"
 #include "setup_button.h"
 #include "portal.h"
+#include "sms_commands.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -155,6 +156,58 @@ static esp_err_t change_password(httpd_req_t *request, const char *current, cons
     return end_session(request);
 }
 
+static bool receive_body(httpd_req_t *request, char *body, size_t length);
+
+static const char *users_http_status(const char *message)
+{
+    if (!strcmp(message, "Sign in again.")) {
+        return "401 Unauthorized";
+    }
+    if (!strcmp(message, "SMS users are unavailable.")) {
+        return "503 Service Unavailable";
+    }
+    if (!strcmp(message, "Enter add or remove and a phone number.") ||
+        !strcmp(message, "Use a number with + and country code.")) {
+        return "400 Bad Request";
+    }
+    if (!strcmp(message, "Could not save user list")) {
+        return "500 Internal Server Error";
+    }
+    if (!strcmp(message, "User added") || !strcmp(message, "User removed")) {
+        return "200 OK";
+    }
+    return "409 Conflict";
+}
+
+static esp_err_t users_post(httpd_req_t *request)
+{
+    // The administrator session is the only portal role. Do not log the number.
+    if (!portal_authenticated(request)) {
+        return auth_response(request, "401 Unauthorized", "Sign in again.");
+    }
+    sms_control_t *sms = portal_bound_sms();
+    if (!sms || !sms->owner || !sms->users_store) {
+        return auth_response(request, "503 Service Unavailable", "SMS users are unavailable.");
+    }
+    char body[64];
+    size_t length = request->content_len;
+    if (!length || length >= sizeof(body) || !receive_body(request, body, length)) {
+        mbedtls_platform_zeroize(body, sizeof(body));
+        return auth_response(request, "400 Bad Request", "Enter add or remove and a phone number.");
+    }
+    char *number = strchr(body, '\n');
+    esp_err_t result;
+    if (!number || strchr(number + 1, '\n')) {
+        result = auth_response(request, "400 Bad Request", "Enter add or remove and a phone number.");
+    } else {
+        *number++ = '\0';
+        const char *message = sms_users_request(sms, true, body, number);
+        result = auth_response(request, users_http_status(message), message);
+    }
+    mbedtls_platform_zeroize(body, sizeof(body));
+    return result;
+}
+
 static bool receive_body(httpd_req_t *request, char *body, size_t length)
 {
     for (size_t offset = 0; offset < length;) {
@@ -298,6 +351,9 @@ esp_err_t portal_auth_post(httpd_req_t *request)
     }
     if (strcmp(request->uri, "/api/logout") == 0) {
         return end_session(request);
+    }
+    if (strcmp(request->uri, "/api/users") == 0) {
+        return users_post(request);
     }
 
     // Two UTF-8 fields separated by a newline. Password inputs are single-line.
