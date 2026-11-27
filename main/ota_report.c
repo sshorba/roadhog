@@ -124,6 +124,12 @@ esp_err_t ota_notification_save(const ota_manifest_t *release, uint32_t address,
 
 #endif
 
+static esp_err_t claim_notification(void *context)
+{
+    const nvs_handle_t *store = context;
+    return ota_notification_clear(*store);
+}
+
 void ota_sms_report_boot(const sms_control_t *sms, modem_t *modem)
 {
     if (!sms->configured || !sms->owner) {
@@ -156,7 +162,7 @@ void ota_sms_report_boot(const sms_control_t *sms, modem_t *modem)
         }
         success = verified == ESP_OK;
     }
-    if (!modem_maintenance_ready(modem) || sms->pending_acks || sms->expected_tpdu ||
+    if (!modem_maintenance_ready(modem) || sms->pending_acks || sms->pending_nacks || sms->delivery_fault || sms->expected_tpdu ||
         nvs_open("sms_ota", NVS_READWRITE, &store) != ESP_OK) {
         return;
     }
@@ -170,15 +176,15 @@ void ota_sms_report_boot(const sms_control_t *sms, modem_t *modem)
                  " did not validate. Rollback or interruption possible.", current, record.release.sequence);
         boot_status = "Requested update did not validate.";
     }
-    // Claim durably before submitting SMS. A reset or ambiguous submission can
-    // lose this report, but cannot send it twice.
-    esp_err_t error = ota_notification_clear(store);
+    esp_err_t error;
+    if (strcmp(record.owner, sms->owner) != 0) {
+        error = ota_notification_clear(store);
+    } else {
+        error = sms_control_send_claimed(modem, sms->owner, reply, claim_notification, &store);
+    }
     nvs_close(store);
     if (error != ESP_OK) {
-        ESP_LOGW(REPORT_TAG, "Could not consume pending boot report");
-    } else if (strcmp(record.owner, sms->owner) == 0 &&
-        sms_control_send(modem, sms->owner, reply) != ESP_OK) {
-        ESP_LOGW(REPORT_TAG, "Boot report submission failed or its outcome is unknown");
+        ESP_LOGW(REPORT_TAG, "Boot report send or journal claim did not complete");
     }
 }
 

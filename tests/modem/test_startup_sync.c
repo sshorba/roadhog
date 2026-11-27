@@ -50,6 +50,8 @@ static int64_t elapsed, last_write, response_at;
 static const char *incoming;
 static unsigned queries, escapes, hangups, notifications;
 static bool fault;
+enum { SMS_IDLE, SMS_DENY_PROMPT, SMS_DENY_CLAIM, SMS_LOSE_FINAL, SMS_SUCCESS };
+static unsigned sms_phase, sms_claims, sms_payloads, sms_escapes;
 static const esp_partition_t boot_slot = {.subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0, .label = "ota_0"};
 static esp_ota_img_states_t boot_state;
 static unsigned marks, rollbacks;
@@ -117,6 +119,21 @@ esp_err_t uart_flush_input(uart_port_t port)
 static int uart_write_bytes(uart_port_t port, const char *data, size_t size)
 {
     assert(port == 1 && !*incoming);
+    if (sms_phase != SMS_IDLE) {
+        if (size == sizeof("AT+CMGS=1\r") - 1 && !memcmp(data, "AT+CMGS=1\r", size)) {
+            incoming = sms_phase == SMS_DENY_PROMPT ? "\r\n+CMS ERROR: 500\r\n" : "\r\n> ";
+        } else if (size == 1 && data[0] == 0x1b) {
+            assert(sms_phase == SMS_DENY_CLAIM && sms_claims == 1 && !sms_payloads);
+            ++sms_escapes;
+            incoming = "\r\nOK\r\n";
+        } else {
+            assert(sms_claims == 1 && size == 5 && !memcmp(data, "0000\x1a", size));
+            ++sms_payloads;
+            incoming = sms_phase == SMS_LOSE_FINAL ? "" : "\r\n+CMGS: 1\r\nOK\r\n";
+        }
+        response_at = elapsed;
+        return size;
+    }
     if (size == 3 && !memcmp(data, "+++", 3)) {
         assert(++escapes == 1 && elapsed - last_write >= 1200000);
         if (scenario == STALE_ESCAPE) {
@@ -226,6 +243,28 @@ static void boot_case(esp_ota_img_states_t initial, case_t test, bool other_chec
     assert(boot_state == (expected_marks ? ESP_OTA_IMG_VALID : initial));
 }
 
+static esp_err_t test_sms_claim(void *context)
+{
+    assert(context == &sms_phase && !sms_payloads);
+    ++sms_claims;
+    return sms_phase == SMS_DENY_CLAIM ? ESP_FAIL : ESP_OK;
+}
+
+static void test_sms_submission(unsigned phase, esp_err_t expected)
+{
+    modem_t modem = {.config = {.port = 1}};
+    modem_result_t result;
+    incoming = "";
+    sms_phase = phase;
+    sms_claims = sms_payloads = sms_escapes = 0;
+    assert(modem_submit_sms_claimed(&modem, 1, "0000", &result, test_sms_claim, &sms_phase) == expected);
+    assert(sms_claims == (unsigned)(phase != SMS_DENY_PROMPT));
+    assert(sms_payloads == (unsigned)(phase == SMS_LOSE_FINAL || phase == SMS_SUCCESS));
+    assert(sms_escapes == (unsigned)(phase == SMS_DENY_CLAIM));
+    assert(modem_maintenance_ready(&modem) == (phase != SMS_LOSE_FINAL));
+    sms_phase = SMS_IDLE;
+}
+
 int main(void)
 {
     run_case(HEALTHY, ESP_OK, 1, 0, 0);
@@ -262,5 +301,9 @@ int main(void)
     modem.waiting_for_final = false;
     assert(modem_command(&modem, "AT+CGSN", "+CGSN:", 1000, identity, sizeof(identity), &result) == ESP_OK);
     assert(!strcmp(identity, "123456789012345\n") && result.final == MODEM_FINAL_OK && !notifications);
-    puts("Modem startup and stale-final regressions, VALID/PENDING health, and private identity capture passed");
+    test_sms_submission(SMS_DENY_PROMPT, ESP_ERR_INVALID_RESPONSE);
+    test_sms_submission(SMS_DENY_CLAIM, ESP_FAIL);
+    test_sms_submission(SMS_LOSE_FINAL, ESP_ERR_TIMEOUT);
+    test_sms_submission(SMS_SUCCESS, ESP_OK);
+    puts("Modem startup, stale finals, boot health, private identity and SMS submission phases passed");
 }

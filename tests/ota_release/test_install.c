@@ -392,6 +392,11 @@ typedef struct {
     const char *owner;
     unsigned pending_acks, expected_tpdu, request_count, request_head;
     int64_t tpdu_deadline, resume_at;
+    unsigned pending_nacks, inbox_index;
+    size_t inbox_length;
+    bool delivery_fault, storage_pending, storage_startup;
+    bool scanning_inbox, inbox_error, inbox_found, inbox_valid;
+    sms_request_t inbox_request;
     sms_request_t requests[SMS_QUEUE_CAPACITY];
 } sms_control_t;
 typedef esp_err_t (*cellular_operation_t)(esp_netif_t *, void *);
@@ -465,6 +470,11 @@ static esp_err_t modem_open(const modem_config_t *config, modem_t **modem)
 }
 
 static void pdu_command(sms_control_t *sms, const char *sender, const char *text, uint8_t flags);
+static void stored_pdu(sms_control_t *sms, const char *text, unsigned index);
+static sms_control_t *fixture_sms;
+static bool storage_mode, stored_cancel, stored_status, fail_delete;
+static unsigned storage_modes, stored_deletes;
+bool sms_control_notification(sms_control_t *, const char *);
 static sms_control_t *boundary_delivery;
 static sms_control_t *resume_delivery;
 static bool modem_busy, gps_timeout, late_final;
@@ -494,6 +504,31 @@ static esp_err_t modem_command(modem_t *modem, const char *command, const char *
                                modem_result_t *result)
 {
     assert(modem == &fixture_modem && uart_open && !ppp_active);
+    if (!strcmp(command, "AT+CNMI?")) {
+        assert(response && size >= 32 && !strcmp(prefix, "+CNMI:"));
+        snprintf(response, size, "+CNMI: %s\n", storage_mode && !is_case("sms-cnmi-readback") ?
+                 "0,1,0,0,0" : "2,2,0,0,0");
+        result->final = MODEM_FINAL_OK;
+        return ESP_OK;
+    }
+    if (!strcmp(command, "AT+CPMS?")) {
+        assert(response && size >= 42 && !strcmp(prefix, "+CPMS:"));
+        unsigned used = is_case("sms-me-full") ? 30U : (unsigned)stored_cancel + stored_status;
+        snprintf(response, size, "+CPMS: \"ME\",%u,30,\"ME\",%u,30,\"ME\",%u,30\n", used, used, used);
+        result->final = MODEM_FINAL_OK;
+        return ESP_OK;
+    }
+    if (!strcmp(command, "AT+CMGL=4")) {
+        assert(!response && !prefix && storage_mode && fixture_sms->scanning_inbox);
+        if (stored_status) {
+            stored_pdu(fixture_sms, "OTA STATUS", 3);
+        }
+        if (stored_cancel) {
+            stored_pdu(fixture_sms, "OTA CANCEL", 4);
+        }
+        result->final = MODEM_FINAL_OK;
+        return ESP_OK;
+    }
     assert(!strcmp(command, "AT") && !prefix && timeout_ms == 2000 && !response && !size);
     if (is_case("at-failure")) {
         return ESP_ERR_TIMEOUT;
@@ -547,6 +582,7 @@ static void vTaskDelete(void *task) { assert(!task); }
 static void sms_control_resume(sms_control_t *sms, modem_t *modem)
 {
     assert(at_ready && !ppp_active && modem);
+    storage_mode = false;
     sms->configured = sms_ready = !is_case("sms-failure") &&
         !(is_case("sms-resume-failed") && touched_sectors);
     if (resume_delivery && touched_sectors) {
@@ -756,6 +792,7 @@ int main(int argc, char **argv)
     uart_open = true;
     modem_config_t config = {0};
     sms_control_t sms = {.configured = !is_case("factory")};
+    fixture_sms = &sms;
     if (!strncmp(scenario, "sms-", 4) && !is_case("sms-failure")) {
         test_sms(&config, &sms);
         assert(!memcmp(flash, baseline, inactive->address));

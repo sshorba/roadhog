@@ -36,6 +36,8 @@ CASES = (
     "sms-report-busy", "sms-nvs-set-failed", "sms-nvs-erase-failed", "sms-reset-before-selection",
     "sms-reset-before-send", "sms-latest-redirect", "sms-latest-wrong-cert", "sms-wrong-sequence",
     "sms-wrong-target", "sms-legacy", "sms-incompatible",
+    "sms-supported-cnmi", "sms-cnmi-readback", "sms-me-full", "sms-stored-cancel", "sms-stored-fifo", "sms-late-cancel",
+    "sms-incomplete-staged", "sms-overflow", "sms-confirm-overflow", "sms-pre-prompt-retry", "sms-no-final",
 )
 
 
@@ -77,7 +79,7 @@ def compile_fixture(tmp, sdk):
         (tmp / destination).write_text(module)
     sms = (ROOT / "main/sms_control.c").read_text()
     parser = sms.split("static int nibble(", 1)[1].split("\n#endif", 1)[0]
-    delivery = sms[sms.index("void sms_control_expire_pdu("):]
+    delivery = sms[sms.index("static void sms_control_delivery_fault("):]
     (tmp / "sms_delivery.inc").write_text("static int nibble(" + parser + "\n" + delivery)
     (tmp / "key.S").write_text(
         '.section .rodata\n.global _binary_ota_public_pem_start, _binary_ota_public_pem_end\n'

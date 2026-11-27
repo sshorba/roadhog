@@ -341,20 +341,38 @@ untouched. The response includes the current and candidate sequences and a
 on the device's monotonic clock and is discarded on reboot. A fresh check
 replaces the previous offer. Confirming consumes the code before installation
 is queued. A failed acknowledgement or reply prevents the queued network
-operation. Cancellation clears the pending offer or a request still queued.
-Before PPP, the modem must accept CNMI mode 0 to buffer SMS indications.
-The UART owner drains the AT stream and defers the handoff if it sees an
-incomplete delivery, pending acknowledgement, or queued SMS. Incomplete
-headers expire after one second. After PPP, mode 2 flushes buffered
-indications. The installer gives the SMS loop another service turn and
-repeats the quiesce check before selecting the candidate and rebooting. An
-owner cancellation processed in that interval leaves the current slot
-selected. SMS and GNSS AT queries pause during PPP. The modem buffer is
-finite, so this protocol does not guarantee carrier delivery during a long
-transfer, high traffic, or a modem reset. Verify mode 0 buffering and mode 2
-flush on the SIM7600 during attended bench trials. See the
-[SIMCom AT command manual](https://simcom.ee/documents/SIM7600E/SIM7500_SIM7600%20Series_AT%20Command%20Manual%20_V1.10.pdf). The versioned signed manifest must match
-the confirmed sequence, target, size and SHA-256 before any image is staged.
+operation. An owner cancellation clears a live offer, queued request, or
+staged selection and only reports success when it cancels one of those.
+
+Before PPP and again before automatic selection, the UART owner selects
+ME for read, write, and incoming storage using CPMS and verifies its
+reported capacity. It sets and reads back CNMI mode 0 with stored delivery
+(`mt=1`). Buffered `+CMTI` indications are hints. A bounded `CMGL` scan
+checks ME even if an indication is delayed or lost. Handoff requires a
+non-full store, no received records, an idle AT stream, and no direct
+delivery or host backlog. A missing or truncated direct PDU or host queue
+overflow aborts pending remote work and is negatively acknowledged using
+CNMA. The serial console remains available after an abort.
+
+Mode 2 direct delivery is restored after PPP or an aborted handoff.
+Service reconciles one received ME record per turn in modem listing order
+and preserves the FIFO of admitted commands. ME is the Road Hög receive
+store. Sent and unsent records are left alone. Received records are
+deleted by index before dispatch to prevent executing the same stored
+record twice. A reset after deletion and before dispatch can lose that
+command. Stored records use no CNMA. Startup also scans ME before
+accepting a new OTA check.
+
+The last cancellable point is the final empty inbox and idle UART check
+before boot selection starts. A message received after that cutoff may be
+stored and processed after reboot. With SMS OTA enabled, a delayed
+cancellation with no live work returns `No pending OTA request to cancel.`
+SMS service and GNSS queries pause during PPP. Finite ME capacity,
+modem or carrier failures, and delays can still prevent delivery. Verify
+CPMS, CNMI, and end-to-end receive timing on the SIM7600 during attended
+bench trials. The versioned signed manifest must match the confirmed
+sequence, target, size and SHA-256 before any image is staged.
+[SIMCom AT command manual](https://simcom.ee/documents/SIM7600E/SIM7500_SIM7600%20Series_AT%20Command%20Manual%20_V1.10.pdf).
 
 The installer commits a pending report in its own NVS namespace before boot
 selection. On reconnect, the boot reporter requires the selected, running
@@ -364,10 +382,12 @@ GNSS service on a fresh iteration after any PPP handoff, plus an idle AT
 stream before consuming the journal. The message reports LTE registration and SMS readiness. It does
 not perform a second PPP or HTTPS test. If the previous firmware is running
 again, the outcome may be rollback or an interruption before selection.
-Without communication the outcome stays unknown. The record is consumed
-before SMS submission to prevent duplicate submissions across reboots.
-Power loss in that interval, ambiguous modem submission, or carrier delivery
-failure can therefore lose the report. The local console is still available
+Without communication the outcome stays unknown. The journal stays
+pending if the modem rejects CMGS before the prompt. After the prompt, the
+installer consumes it durably immediately before writing the TPDU. If the
+claim fails, it cancels the editor with ESC. Power loss after a successful
+claim, ambiguous submission, or carrier delivery failure can lose the report
+without causing a duplicate submission. The local console is still available
 for attended diagnostics.
 
 ### Attended SMS bench procedure

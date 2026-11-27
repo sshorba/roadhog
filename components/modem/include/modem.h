@@ -62,3 +62,10 @@ esp_err_t modem_command(modem_t *modem, const char *command, const char *respons
 // Success requires both a +CMGS acknowledgement and an OK final.
 esp_err_t modem_submit_sms(modem_t *modem, unsigned tpdu_length,
                            const char *pdu, modem_result_t *result);
+
+// Optional durable claim after the prompt and immediately before writing any
+// TPDU bytes. On failure the editor is cancelled and no payload is sent.
+typedef esp_err_t (*modem_sms_claim_fn)(void *context);
+esp_err_t modem_submit_sms_claimed(modem_t *modem, unsigned tpdu_length,
+                                  const char *pdu, modem_result_t *result,
+                                  modem_sms_claim_fn claim, void *context);

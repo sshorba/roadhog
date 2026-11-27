@@ -224,6 +224,15 @@ static esp_err_t modem_submit_sms(modem_t *modem, unsigned length, const char *t
     return modem->reject_sms ? ESP_FAIL : ESP_OK;
 }
 
+typedef esp_err_t (*modem_sms_claim_fn)(void *);
+static esp_err_t modem_submit_sms_claimed(modem_t *modem, unsigned length, const char *text,
+                                          modem_result_t *result, modem_sms_claim_fn claim,
+                                          void *context)
+{
+    assert(claim == NULL && context == NULL);
+    return modem_submit_sms(modem, length, text, result);
+}
+
 enum { SMS_TEXT_CAPACITY = 161 };
 bool sms_number_valid(const char *number);
 #include "sms_delivery_under_test.inc"

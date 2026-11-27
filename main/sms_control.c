@@ -107,7 +107,8 @@ static bool decode_request(const uint8_t *pdu, size_t length, size_t tpdu_length
 
 #endif
 
-esp_err_t sms_control_send(modem_t *modem, const char *number, const char *message)
+esp_err_t sms_control_send_claimed(modem_t *modem, const char *number, const char *message,
+                                  modem_sms_claim_fn claim, void *context)
 {
     if (!sms_number_valid(number) || strlen(message) >= SMS_TEXT_CAPACITY) {
         return ESP_ERR_INVALID_ARG;
@@ -140,10 +141,16 @@ esp_err_t sms_control_send(modem_t *modem, const char *number, const char *messa
     }
     text[2 * used] = '\0';
     modem_result_t result;
-    esp_err_t error = modem_submit_sms(modem, used - 1, text, &result);
+    esp_err_t error = claim ? modem_submit_sms_claimed(modem, used - 1, text, &result, claim, context)
+                            : modem_submit_sms(modem, used - 1, text, &result);
     mbedtls_platform_zeroize(text, sizeof(text));
     mbedtls_platform_zeroize(pdu, sizeof(pdu));
     return error;
+}
+
+esp_err_t sms_control_send(modem_t *modem, const char *number, const char *message)
+{
+    return sms_control_send_claimed(modem, number, message, NULL, NULL);
 }
 
 void sms_owner_verification_service(modem_t *modem)
@@ -183,6 +190,11 @@ void sms_control_start(sms_control_t *sms, modem_t *modem)
         return;
     }
     configure_sms(sms, modem);
+#if defined(ROADHOG_SMS_OTA_DESCRIPTOR) || defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+    // A prior SMS OTA boot may have left deliveries in the modem's ME store.
+    sms->storage_pending = true;
+    sms->storage_startup = true;
+#endif
     if (sms->configured) {
         unsigned users = 0;
         for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
@@ -217,21 +229,161 @@ void sms_control_resume(sms_control_t *sms, modem_t *modem)
 #endif
 }
 
+static void sms_control_delivery_fault(sms_control_t *sms)
+{
+    sms->delivery_fault = true;
+    if (sms->pending_nacks < UINT_MAX) {
+        ++sms->pending_nacks;
+    }
+}
+
 void sms_control_expire_pdu(sms_control_t *sms)
 {
     if (sms->expected_tpdu && esp_timer_get_time() >= sms->tpdu_deadline) {
         sms->expected_tpdu = 0;
+        if (sms->configured) {
+            sms_control_delivery_fault(sms);
+        }
     }
 }
+
+#if defined(CONFIG_ROADHOG_SMS_CONTROL)
+static bool read_me_capacity(modem_t *modem, unsigned *used, unsigned *capacity)
+{
+    char reply[96];
+    modem_result_t result;
+    unsigned write_used, write_total, incoming_used, incoming_total;
+    int end = 0;
+    return modem_command(modem, "AT+CPMS?", "+CPMS:", 5000, reply, sizeof(reply), &result) == ESP_OK &&
+           result.final == MODEM_FINAL_OK &&
+           sscanf(reply, "+CPMS: \"ME\",%u,%u,\"ME\",%u,%u,\"ME\",%u,%u%n",
+                  used, capacity, &write_used, &write_total, &incoming_used, &incoming_total, &end) == 6 &&
+           !strcmp(reply + end, "\n") && *capacity && *used <= *capacity &&
+           write_total == *capacity && incoming_total == *capacity &&
+           write_used <= *capacity && incoming_used <= *capacity;
+}
+
+static bool read_inbox(sms_control_t *sms, modem_t *modem)
+{
+    modem_result_t result;
+    sms->inbox_found = false;
+    sms->inbox_length = 0;
+    sms->inbox_valid = false;
+    sms->inbox_error = false;
+    sms->scanning_inbox = true;
+    esp_err_t error = modem_command(modem, "AT+CMGL=4", NULL, 5000, NULL, 0, &result);
+    sms->scanning_inbox = false;
+    return error == ESP_OK && result.final == MODEM_FINAL_OK &&
+           !sms->inbox_error && !sms->inbox_length;
+}
+
+static void queue_request(sms_control_t *sms, const sms_request_t *request)
+{
+    size_t tail = (sms->request_head + sms->request_count) % SMS_QUEUE_CAPACITY;
+    sms->requests[tail] = *request;
+    ++sms->request_count;
+}
+
+static bool inbox_line(sms_control_t *sms, const char *line)
+{
+    if (!sms->scanning_inbox) {
+        return false;
+    }
+    if (!strncmp(line, "+CMGL:", 6)) {
+        unsigned index, status;
+        const char *last = strrchr(line, ',');
+        char *end;
+        unsigned long length = last ? strtoul(last + 1, &end, 10) : 0;
+        if (sms->inbox_length ||
+            sscanf(line, "+CMGL: %u,%u,", &index, &status) != 2 ||
+            status > 3 || !length || length > 176 || *end) {
+            sms->inbox_error = true;
+        } else if (!sms->inbox_found && status <= 1) {
+            sms->inbox_found = true;
+            sms->inbox_index = index;
+            sms->inbox_length = length;
+        }
+        return true;
+    }
+    size_t length = strlen(line);
+    if (sms->inbox_length && length >= 2 && length % 2 == 0 &&
+        strspn(line, "0123456789ABCDEFabcdef") == length) {
+        uint8_t pdu[MAX_PDU_BYTES];
+        if (length / 2 > sizeof(pdu) || !decode_hex(line, pdu, length / 2) ||
+            pdu[0] + 1u + sms->inbox_length != length / 2) {
+            sms->inbox_error = true;
+        } else {
+            sms->inbox_valid = decode_request(pdu, length / 2, sms->inbox_length,
+                                             &sms->inbox_request);
+        }
+        sms->inbox_length = 0;
+        return true;
+    }
+    return false;
+}
+
+static bool storage_mode_verified(modem_t *modem)
+{
+    char reply[48];
+    modem_result_t result;
+    unsigned mode, mt, bm, ds, bfr;
+    int end = 0;
+    return modem_command(modem, "AT+CNMI?", "+CNMI:", 5000, reply, sizeof(reply), &result) == ESP_OK &&
+           result.final == MODEM_FINAL_OK &&
+           sscanf(reply, "+CNMI: %u,%u,%u,%u,%u%n", &mode, &mt, &bm, &ds, &bfr, &end) == 5 &&
+           !strcmp(reply + end, "\n") && mode == 0 && mt == 1 && !bm && !ds && !bfr;
+}
+
+static bool direct_delivery_idle(sms_control_t *sms, modem_t *modem)
+{
+    return modem_maintenance_ready(modem) && !sms->expected_tpdu &&
+           !sms->pending_acks && !sms->pending_nacks && !sms->delivery_fault;
+}
+
+static bool pause_direct(sms_control_t *sms, modem_t *modem)
+{
+    return command_ok(modem, "AT+CPMS=\"ME\",\"ME\",\"ME\"") &&
+           command_ok(modem, "AT+CNMI=0,1,0,0,0") && storage_mode_verified(modem) &&
+           modem_poll(modem, 250) == ESP_OK && direct_delivery_idle(sms, modem);
+}
+
+static void service_inbox(sms_control_t *sms, modem_t *modem)
+{
+    unsigned used, capacity;
+    if (pause_direct(sms, modem) && read_me_capacity(modem, &used, &capacity) &&
+        read_inbox(sms, modem) && direct_delivery_idle(sms, modem)) {
+        if (!sms->inbox_found) {
+            sms->storage_pending = false;
+            sms->storage_startup = false;
+        } else {
+            char command[24];
+            snprintf(command, sizeof(command), "AT+CMGD=%u", sms->inbox_index);
+            // Consume by index before dispatch. A reset after deletion can lose
+            // the delivery, while a failed deletion never executes a command.
+            if (command_ok(modem, command) && sms->inbox_valid &&
+                sms_sender_allowed(sms, sms->inbox_request.sender)) {
+                if (sms->request_count < SMS_QUEUE_CAPACITY) {
+                    queue_request(sms, &sms->inbox_request);
+                } else {
+                    sms->delivery_fault = true;
+                }
+            }
+        }
+    }
+    sms_control_resume(sms, modem);
+}
+#endif
 
 #if defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
 bool sms_control_quiesce(sms_control_t *sms, modem_t *modem)
 {
-    // Mode 0 buffers unsolicited SMS indications at the modem. Mode 2 with
-    // bfr=0 in configure_sms flushes them when normal service resumes.
-    if (!command_ok(modem, "AT+CNMI=0,2,0,0,0") ||
-        modem_poll(modem, 250) != ESP_OK || !modem_maintenance_ready(modem) ||
-        sms->expected_tpdu || sms->pending_acks || sms->request_count) {
+    // SIM7600 mode 0 is compatible with stored delivery (mt=1). The inbox
+    // survives UART closure and remains authoritative if an indication drops.
+    unsigned used, capacity;
+    sms->storage_pending = true;
+    if (!pause_direct(sms, modem) || !read_me_capacity(modem, &used, &capacity) ||
+        used == capacity || !read_inbox(sms, modem) || sms->inbox_found ||
+        !direct_delivery_idle(sms, modem) || sms->request_count) {
         sms_control_resume(sms, modem);
         return false;
     }
@@ -242,8 +394,24 @@ bool sms_control_quiesce(sms_control_t *sms, modem_t *modem)
 bool sms_control_notification(sms_control_t *sms, const char *line)
 {
     sms_control_expire_pdu(sms);
+#ifdef CONFIG_ROADHOG_SMS_CONTROL
+    if (!strncmp(line, "+CMTI:", 6)) {
+        const char *store = line + 6;
+        store += strspn(store, " ");
+        if (!strncmp(store, "\"ME\",", 5)) {
+            sms->storage_pending = true;
+        }
+        return true;
+    }
+    if ((!sms->expected_tpdu || !strncmp(line, "+CMGL:", 6)) && inbox_line(sms, line)) {
+        return true;
+    }
+#endif
     // Suppress headers and their payload even when SMS control is disabled.
     if (strncmp(line, "+CMT:", 5) == 0) {
+        if (sms->expected_tpdu && sms->configured) {
+            sms_control_delivery_fault(sms);
+        }
         sms->expected_tpdu = 0;
         const char *separator = strrchr(line, ',');
         if (separator) {
@@ -257,36 +425,34 @@ bool sms_control_notification(sms_control_t *sms, const char *line)
         return true;
     }
 
-    if (!sms->expected_tpdu) {
-        // A late orphan PDU cannot become a command or be logged as plaintext.
-        size_t length = strlen(line);
-        return length >= 2 && length % 2 == 0 && strspn(line, "0123456789ABCDEFabcdef") == length;
-    }
     size_t length = strlen(line);
+    bool hex_line = length >= 2 && strspn(line, "0123456789ABCDEFabcdef") == length;
+    if (!sms->expected_tpdu || !hex_line) {
+        // Suppress orphan PDU bytes without accepting them as a command.
+        return hex_line;
+    }
     size_t tpdu_length = sms->expected_tpdu;
     sms->expected_tpdu = 0;
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
     if (sms->configured) {
-        if (sms->pending_acks < UINT_MAX) {
-            sms->pending_acks++;
-        }
         uint8_t pdu[MAX_PDU_BYTES];
         sms_request_t request;
-        if (length >= 2 && length % 2 == 0 && length / 2 <= sizeof(pdu) &&
-            decode_hex(line, pdu, length / 2) &&
-            decode_request(pdu, length / 2, tpdu_length, &request) &&
-            sms_sender_allowed(sms, request.sender)) {
-            if (sms->request_count == SMS_QUEUE_CAPACITY) {
-                ESP_LOGW(TAG, "SMS command queue full");
-            } else {
-                size_t tail = (sms->request_head + sms->request_count) % SMS_QUEUE_CAPACITY;
-                sms->requests[tail] = request;
-                sms->request_count++;
+        bool framed = length % 2 == 0 && length / 2 <= sizeof(pdu) &&
+                      decode_hex(line, pdu, length / 2) && pdu[0] + 1u + tpdu_length == length / 2;
+        bool authorized = framed && decode_request(pdu, length / 2, tpdu_length, &request) &&
+                          sms_sender_allowed(sms, request.sender);
+        if (!framed || sms->pending_nacks || (authorized && sms->request_count == SMS_QUEUE_CAPACITY)) {
+            sms_control_delivery_fault(sms);
+        } else {
+            if (sms->pending_acks < UINT_MAX) {
+                ++sms->pending_acks;
+            }
+            if (authorized) {
+                queue_request(sms, &request);
             }
         }
     }
 #else
-    (void)length;
     (void)tpdu_length;
 #endif
     return true;
@@ -303,9 +469,21 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
     if (!sms->configured) {
         return;
     }
-    for (unsigned i = 0; i < SMS_QUEUE_CAPACITY && sms->pending_acks; ++i) {
-        sms->pending_acks--;
-        if (!command_ok(modem, "AT+CNMA")) {
+    if (sms->delivery_fault) {
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+        ota_sms_ack_failed();
+#endif
+        sms->delivery_fault = false;
+    }
+    for (unsigned i = 0; i < SMS_QUEUE_CAPACITY &&
+                         (sms->pending_acks || sms->pending_nacks); ++i) {
+        bool positive = sms->pending_acks != 0;
+        if (positive) {
+            --sms->pending_acks;
+        } else {
+            --sms->pending_nacks;
+        }
+        if (!command_ok(modem, positive ? "AT+CNMA" : "AT+CNMA=2")) {
             ESP_LOGW(TAG, "SMS acknowledgement failed");
             sms->request_count = 0;
 #ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
@@ -314,7 +492,14 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
             return;
         }
     }
-    if (!sms->pending_acks && sms->request_count) {
+    if (sms->pending_acks || sms->pending_nacks || sms->delivery_fault) {
+        return;
+    }
+    if (sms->storage_pending && !sms->request_count && !sms->expected_tpdu) {
+        service_inbox(sms, modem);
+    }
+    if (sms->configured && !sms->pending_acks && !sms->pending_nacks &&
+        !sms->delivery_fault && sms->request_count) {
         sms_request_t request = sms->requests[sms->request_head];
         sms->request_head = (sms->request_head + 1) % SMS_QUEUE_CAPACITY;
         sms->request_count--;

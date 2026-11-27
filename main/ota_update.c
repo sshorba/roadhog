@@ -558,11 +558,12 @@ static bool create_challenge(const ota_manifest_t *release)
 
 void ota_sms_ack_failed(void)
 {
-    if (queued != OTA_SMS_NONE || staged.install) {
+    if (challenge.expires || queued != OTA_SMS_NONE || staged.install) {
+        challenge = (ota_sms_challenge_t){0};
         staged.install = false;
         queued = OTA_SMS_NONE;
         confirmed = (ota_manifest_t){0};
-        remote_status = "Queued OTA request stopped after an SMS acknowledgement failure.";
+        remote_status = "Pending OTA work stopped after an SMS delivery or acknowledgement failure.";
     }
 }
 
@@ -599,12 +600,15 @@ bool ota_sms_service_command(const sms_control_t *sms, modem_t *modem, const sms
     }
     expire_remote_work(now);
     if (command == OTA_SMS_CANCEL) {
+        bool cancelled = pending || queued != OTA_SMS_NONE || staged.install;
         staged.install = false;
         challenge = (ota_sms_challenge_t){0};
         queued = OTA_SMS_NONE;
         confirmed = (ota_manifest_t){0};
-        remote_status = "OTA request cancelled.";
-        reply = remote_status;
+        if (cancelled) {
+            remote_status = "OTA request cancelled.";
+        }
+        reply = cancelled ? remote_status : "No pending OTA request to cancel.";
     } else if (command == OTA_SMS_STATUS) {
         uint32_t current;
         if (!ota_sequence_parse(esp_app_get_description()->version, &current)) {
@@ -619,6 +623,8 @@ bool ota_sms_service_command(const sms_control_t *sms, modem_t *modem, const sms
         }
     } else if (queued != OTA_SMS_NONE || staged.install) {
         reply = "An OTA request is queued.";
+    } else if (command == OTA_SMS_CHECK && sms->storage_startup) {
+        reply = "Reconciling stored SMS. Retry OTA CHECK after startup.";
     } else if (command == OTA_SMS_CHECK) {
         challenge = (ota_sms_challenge_t){0};
         update_t check = {0};
@@ -833,7 +839,8 @@ modem_t *ota_update_poll(modem_t *modem, const modem_config_t *config, sms_contr
     sms_control_expire_pdu(sms);
     expire_remote_work(esp_timer_get_time());
     if (queued != OTA_SMS_NONE || staged.install) {
-        if (!sms->configured || sms->pending_acks || sms->expected_tpdu || sms->request_count ||
+        if (!sms->configured || sms->pending_acks || sms->pending_nacks ||
+            sms->delivery_fault || sms->expected_tpdu || sms->request_count ||
             !sms_control_quiesce(sms, modem)) {
             return modem;
         }

@@ -68,22 +68,47 @@ static void nvs_close(nvs_handle_t store)
     assert(store == NVS_READONLY || store == NVS_READWRITE);
 }
 
-static esp_err_t sms_control_send(modem_t *modem, const char *number, const char *message)
+typedef esp_err_t (*modem_sms_claim_fn)(void *);
+static bool reject_prompt, missing_sms_final;
+static unsigned pre_prompts, editor_aborts;
+static esp_err_t sms_control_send_claimed(modem_t *modem, const char *number, const char *message,
+                                         modem_sms_claim_fn claim, void *context)
 {
     assert(modem == &fixture_modem && !ppp_active && uart_open && strlen(message) < sizeof(last_reply));
     assert(!strcmp(number, OWNER) && acks >= reply_requires_ack);
-    if (cut_before_submit) {
+    if (claim) {
+        ++pre_prompts;
+        if (reject_prompt) {
+            assert(durable_size);
+            return ESP_FAIL;
+        }
+        esp_err_t error = claim(context);
+        if (error != ESP_OK) {
+            ++editor_aborts;
+            return error;
+        }
         assert(!durable_size);
+    }
+    if (cut_before_submit) {
         return ESP_FAIL;
     }
     strcpy(last_reply, message);
     ++sent;
-    return fail_send ? ESP_FAIL : ESP_OK;
+    return fail_send || missing_sms_final ? ESP_FAIL : ESP_OK;
+}
+
+static esp_err_t sms_control_send(modem_t *modem, const char *number, const char *message)
+{
+    return sms_control_send_claimed(modem, number, message, NULL, NULL);
 }
 
 static void esp_restart(void)
 {
     assert(selected != running && durable_size && !ppp_active && at_ready && sms_ready && gps_ready);
+    assert(storage_mode);
+    if (is_case("sms-late-cancel")) {
+        stored_cancel = true;
+    }
     ++restarted;
 }
 
@@ -145,12 +170,44 @@ enum { MAX_PDU_BYTES = 190 };
 static const char hex[] = "0123456789ABCDEF";
 static const char *SMS_TAG = "sms";
 static bool fail_ack;
+static unsigned nacks, forbidden_cnmi;
 
 static bool command_ok(modem_t *modem, const char *command)
 {
     assert(modem == &fixture_modem && !ppp_active);
     if (!strcmp(command, "AT+CNMI=0,2,0,0,0")) {
-        return !fail_quiesce;
+        ++forbidden_cnmi;
+        return false;
+    }
+    if (!strcmp(command, "AT+CNMI=0,1,0,0,0")) {
+        if (fail_quiesce) {
+            return false;
+        }
+        ++storage_modes;
+        storage_mode = true;
+        return true;
+    }
+    if (!strcmp(command, "AT+CPMS=\"ME\",\"ME\",\"ME\"")) {
+        return true;
+    }
+    if (!strcmp(command, "AT+CMGD=3")) {
+        assert(stored_status && storage_mode);
+        if (fail_delete) {
+            return false;
+        }
+        stored_status = false;
+        ++stored_deletes;
+        return true;
+    }
+    if (!strcmp(command, "AT+CMGD=4")) {
+        assert(stored_cancel && storage_mode);
+        stored_cancel = false;
+        ++stored_deletes;
+        return true;
+    }
+    if (!strcmp(command, "AT+CNMA=2")) {
+        ++nacks;
+        return true;
     }
     assert(!strcmp(command, "AT+CNMA"));
     ++acks;

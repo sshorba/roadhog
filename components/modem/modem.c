@@ -245,7 +245,8 @@ bool modem_maintenance_ready(modem_t *modem)
 
 static esp_err_t run_command(modem_t *modem, const char *command, const char *response_prefix,
                              uint32_t timeout_ms, char *response, size_t response_size,
-                             modem_result_t *result, const char *pdu, bool ignore_final_before_payload)
+                             modem_result_t *result, const char *pdu, bool ignore_final_before_payload,
+                             modem_sms_claim_fn claim, void *claim_context)
 {
     if (!modem || !command || !result || timeout_ms == 0 ||
         (response_prefix && (!*response_prefix ||
@@ -302,6 +303,20 @@ static esp_err_t run_command(modem_t *modem, const char *command, const char *re
         return error == ESP_OK ? ESP_ERR_INVALID_RESPONSE : error;
     }
 
+    if (claim) {
+        esp_err_t claimed = claim(claim_context);
+        if (claimed != ESP_OK) {
+            const char escape = 0x1b;
+            transaction.waiting_for_prompt = false;
+            transaction.prompt_seen = false;
+            if (uart_write_bytes(modem->config.port, &escape, 1) != 1 ||
+                receive(modem, &transaction, 5000) != ESP_OK) {
+                modem->uart_fault = true;
+            }
+            return claimed;
+        }
+    }
+
     char payload[MODEM_LINE_CAPACITY];
     size_t payload_length = strlen(pdu);
     memcpy(payload, pdu, payload_length);
@@ -326,7 +341,7 @@ esp_err_t modem_command(modem_t *modem, const char *command, const char *respons
                         modem_result_t *result)
 {
     return run_command(modem, command, response_prefix, timeout_ms, response,
-                       response_size, result, NULL, false);
+                       response_size, result, NULL, false, NULL, NULL);
 }
 
 // Only startup may abandon a read-only probe. Normal AT commands keep the
@@ -346,7 +361,7 @@ static bool startup_probe(modem_t *modem, const char *command, const char *prefi
     char response[24];
     modem_result_t result;
     if (run_command(modem, command, prefix, 2000, response, sizeof(response),
-                    &result, NULL, retry) != ESP_OK || result.final != MODEM_FINAL_OK ||
+                    &result, NULL, retry, NULL, NULL) != ESP_OK || result.final != MODEM_FINAL_OK ||
         !response[0]) {
         return false;
     }
@@ -457,8 +472,8 @@ esp_err_t modem_sync_startup(modem_t *modem)
     return error;
 }
 
-esp_err_t modem_submit_sms(modem_t *modem, unsigned tpdu_length, const char *pdu,
-                           modem_result_t *result)
+esp_err_t modem_submit_sms_claimed(modem_t *modem, unsigned tpdu_length, const char *pdu,
+                                  modem_result_t *result, modem_sms_claim_fn claim, void *context)
 {
     if (!pdu || !tpdu_length || tpdu_length > 176) {
         return ESP_ERR_INVALID_ARG;
@@ -472,5 +487,12 @@ esp_err_t modem_submit_sms(modem_t *modem, unsigned tpdu_length, const char *pdu
     char command[24];
     char response[MODEM_LINE_CAPACITY];
     snprintf(command, sizeof(command), "AT+CMGS=%u", tpdu_length);
-    return run_command(modem, command, "+CMGS:", 60000, response, sizeof(response), result, pdu, false);
+    return run_command(modem, command, "+CMGS:", 60000, response, sizeof(response), result, pdu, false, claim, context);
+}
+
+
+esp_err_t modem_submit_sms(modem_t *modem, unsigned tpdu_length, const char *pdu,
+                           modem_result_t *result)
+{
+    return modem_submit_sms_claimed(modem, tpdu_length, pdu, result, NULL, NULL);
 }
