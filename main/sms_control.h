@@ -24,6 +24,7 @@ typedef struct sms_control {
     unsigned pending_acks;
     unsigned pending_nacks;
     bool delivery_fault;
+    bool routing_recovery;
     bool storage_pending;
     bool storage_startup;
     bool scanning_inbox;

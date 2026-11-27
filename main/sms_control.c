@@ -169,11 +169,24 @@ void sms_owner_verification_service(modem_t *modem)
 }
 
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
+static bool cnmi_verified(modem_t *modem, unsigned expected_mode, unsigned expected_mt)
+{
+    char reply[48];
+    modem_result_t result;
+    unsigned mode, mt, bm, ds, bfr;
+    int end = 0;
+    return modem_command(modem, "AT+CNMI?", "+CNMI:", 5000, reply, sizeof(reply), &result) == ESP_OK &&
+           result.final == MODEM_FINAL_OK &&
+           sscanf(reply, "+CNMI: %u,%u,%u,%u,%u%n", &mode, &mt, &bm, &ds, &bfr, &end) == 5 &&
+           !strcmp(reply + end, "\n") && mode == expected_mode && mt == expected_mt && !bm && !ds && !bfr;
+}
+
 static void configure_sms(sms_control_t *sms, modem_t *modem)
 {
     // Accept deliveries queued during the CNMI command itself.
     sms->configured = command_ok(modem, "ATE0") && command_ok(modem, "AT+CMGF=0") && command_ok(modem, "AT+CSMS=1");
-    sms->configured = sms->configured && command_ok(modem, "AT+CNMI=2,2,0,0,0");
+    sms->configured = sms->configured && command_ok(modem, "AT+CNMI=2,2,0,0,0") &&
+                      (!sms->routing_recovery || cnmi_verified(modem, 2, 2));
 }
 #endif
 
@@ -322,18 +335,6 @@ static bool inbox_line(sms_control_t *sms, const char *line)
     return false;
 }
 
-static bool storage_mode_verified(modem_t *modem)
-{
-    char reply[48];
-    modem_result_t result;
-    unsigned mode, mt, bm, ds, bfr;
-    int end = 0;
-    return modem_command(modem, "AT+CNMI?", "+CNMI:", 5000, reply, sizeof(reply), &result) == ESP_OK &&
-           result.final == MODEM_FINAL_OK &&
-           sscanf(reply, "+CNMI: %u,%u,%u,%u,%u%n", &mode, &mt, &bm, &ds, &bfr, &end) == 5 &&
-           !strcmp(reply + end, "\n") && mode == 0 && mt == 1 && !bm && !ds && !bfr;
-}
-
 static bool direct_delivery_idle(sms_control_t *sms, modem_t *modem)
 {
     return modem_maintenance_ready(modem) && !sms->expected_tpdu &&
@@ -343,7 +344,7 @@ static bool direct_delivery_idle(sms_control_t *sms, modem_t *modem)
 static bool pause_direct(sms_control_t *sms, modem_t *modem)
 {
     return command_ok(modem, "AT+CPMS=\"ME\",\"ME\",\"ME\"") &&
-           command_ok(modem, "AT+CNMI=0,1,0,0,0") && storage_mode_verified(modem) &&
+           command_ok(modem, "AT+CNMI=0,1,0,0,0") && cnmi_verified(modem, 0, 1) &&
            modem_poll(modem, 250) == ESP_OK && direct_delivery_idle(sms, modem);
 }
 
@@ -354,14 +355,19 @@ static void service_inbox(sms_control_t *sms, modem_t *modem)
         read_inbox(sms, modem) && direct_delivery_idle(sms, modem)) {
         if (!sms->inbox_found) {
             sms->storage_pending = false;
-            sms->storage_startup = false;
         } else {
             char command[24];
             snprintf(command, sizeof(command), "AT+CMGD=%u", sms->inbox_index);
             // Consume by index before dispatch. A reset after deletion can lose
             // the delivery, while a failed deletion never executes a command.
-            if (command_ok(modem, command) && sms->inbox_valid &&
-                sms_sender_allowed(sms, sms->inbox_request.sender)) {
+            if (!command_ok(modem, command)) {
+                // The modem may have deleted a cancellation before losing
+                // its final. An empty rescan cannot reauthorize this update.
+                sms->delivery_fault = true;
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+                ota_sms_ack_failed();
+#endif
+            } else if (sms->inbox_valid && sms_sender_allowed(sms, sms->inbox_request.sender)) {
                 if (sms->request_count < SMS_QUEUE_CAPACITY) {
                     queue_request(sms, &sms->inbox_request);
                 } else {
@@ -371,6 +377,14 @@ static void service_inbox(sms_control_t *sms, modem_t *modem)
         }
     }
     sms_control_resume(sms, modem);
+    if (!sms->storage_pending) {
+        if (sms->configured && (!sms->routing_recovery || direct_delivery_idle(sms, modem))) {
+            sms->storage_startup = false;
+            sms->routing_recovery = false;
+        } else {
+            sms->storage_pending = true;
+        }
+    }
 }
 #endif
 
@@ -421,6 +435,9 @@ bool sms_control_notification(sms_control_t *sms, const char *line)
                 sms->expected_tpdu = length;
                 sms->tpdu_deadline = esp_timer_get_time() + INT64_C(1000000);
             }
+        }
+        if (!sms->expected_tpdu && sms->configured) {
+            sms_control_delivery_fault(sms);
         }
         return true;
     }
@@ -485,7 +502,16 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
         }
         if (!command_ok(modem, positive ? "AT+CNMA" : "AT+CNMA=2")) {
             ESP_LOGW(TAG, "SMS acknowledgement failed");
+            // The modem may have timed out the delivery and reset CNMI.
+            // Outstanding direct acknowledgements cannot be retried blindly.
             sms->request_count = 0;
+            sms->pending_acks = 0;
+            sms->pending_nacks = 0;
+            sms->expected_tpdu = 0;
+            sms->configured = false;
+            sms->routing_recovery = true;
+            sms->storage_pending = true;
+            sms->resume_at = esp_timer_get_time() + INT64_C(5000000);
 #ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
             ota_sms_ack_failed();
 #endif

@@ -352,14 +352,19 @@ checks ME even if an indication is delayed or lost. Handoff requires a
 non-full store, no received records, an idle AT stream, and no direct
 delivery or host backlog. A missing or truncated direct PDU or host queue
 overflow aborts pending remote work and is negatively acknowledged using
-CNMA. The serial console remains available after an abort.
+CNMA. A failed positive or negative CNMA makes routing state unknown.
+After the AT stream becomes idle, SMS service restores direct CNMI and
+reads it back. Remote OTA remains blocked until ME reconciliation and
+direct routing verification both succeed. The serial console remains
+available after abort.
 
 Mode 2 direct delivery is restored after PPP or an aborted handoff.
 Service reconciles one received ME record per turn in modem listing order
 and preserves the FIFO of admitted commands. ME is the Road Hög receive
 store. Sent and unsent records are left alone. Received records are
 deleted by index before dispatch to prevent executing the same stored
-record twice. A reset after deletion and before dispatch can lose that
+record twice. An unconfirmed delete aborts pending remote work even if
+the modem removed the record and a later inbox scan is empty. A reset after deletion and before dispatch can lose that
 command. Stored records use no CNMA. Startup also scans ME before
 accepting a new OTA check.
 

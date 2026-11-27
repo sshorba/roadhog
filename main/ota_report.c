@@ -132,7 +132,7 @@ static esp_err_t claim_notification(void *context)
 
 void ota_sms_report_boot(const sms_control_t *sms, modem_t *modem)
 {
-    if (!sms->configured || !sms->owner) {
+    if (!sms->configured || sms->routing_recovery || !sms->owner) {
         return;
     }
     nvs_handle_t store;

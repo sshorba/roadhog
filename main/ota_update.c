@@ -623,6 +623,9 @@ bool ota_sms_service_command(const sms_control_t *sms, modem_t *modem, const sms
         }
     } else if (queued != OTA_SMS_NONE || staged.install) {
         reply = "An OTA request is queued.";
+    } else if (sms->routing_recovery &&
+               (command == OTA_SMS_CHECK || command == OTA_SMS_CONFIRM)) {
+        reply = "SMS routing is recovering. Retry OTA CHECK after recovery.";
     } else if (command == OTA_SMS_CHECK && sms->storage_startup) {
         reply = "Reconciling stored SMS. Retry OTA CHECK after startup.";
     } else if (command == OTA_SMS_CHECK) {
@@ -839,7 +842,7 @@ modem_t *ota_update_poll(modem_t *modem, const modem_config_t *config, sms_contr
     sms_control_expire_pdu(sms);
     expire_remote_work(esp_timer_get_time());
     if (queued != OTA_SMS_NONE || staged.install) {
-        if (!sms->configured || sms->pending_acks || sms->pending_nacks ||
+        if (!sms->configured || sms->routing_recovery || sms->pending_acks || sms->pending_nacks ||
             sms->delivery_fault || sms->expected_tpdu || sms->request_count ||
             !sms_control_quiesce(sms, modem)) {
             return modem;

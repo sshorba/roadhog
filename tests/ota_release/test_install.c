@@ -394,7 +394,7 @@ typedef struct {
     int64_t tpdu_deadline, resume_at;
     unsigned pending_nacks, inbox_index;
     size_t inbox_length;
-    bool delivery_fault, storage_pending, storage_startup;
+    bool delivery_fault, routing_recovery, storage_pending, storage_startup;
     bool scanning_inbox, inbox_error, inbox_found, inbox_valid;
     sms_request_t inbox_request;
     sms_request_t requests[SMS_QUEUE_CAPACITY];
@@ -473,6 +473,8 @@ static void pdu_command(sms_control_t *sms, const char *sender, const char *text
 static void stored_pdu(sms_control_t *sms, const char *text, unsigned index);
 static sms_control_t *fixture_sms;
 static bool storage_mode, stored_cancel, stored_status, fail_delete;
+static bool routing_reset, wrong_direct_readback;
+static unsigned direct_readbacks, inbox_scans;
 static unsigned storage_modes, stored_deletes;
 bool sms_control_notification(sms_control_t *, const char *);
 static sms_control_t *boundary_delivery;
@@ -506,8 +508,11 @@ static esp_err_t modem_command(modem_t *modem, const char *command, const char *
     assert(modem == &fixture_modem && uart_open && !ppp_active);
     if (!strcmp(command, "AT+CNMI?")) {
         assert(response && size >= 32 && !strcmp(prefix, "+CNMI:"));
+        if (!storage_mode) {
+            ++direct_readbacks;
+        }
         snprintf(response, size, "+CNMI: %s\n", storage_mode && !is_case("sms-cnmi-readback") ?
-                 "0,1,0,0,0" : "2,2,0,0,0");
+                 "0,1,0,0,0" : (routing_reset || wrong_direct_readback) ? "2,0,0,0,0" : "2,2,0,0,0");
         result->final = MODEM_FINAL_OK;
         return ESP_OK;
     }
@@ -520,6 +525,7 @@ static esp_err_t modem_command(modem_t *modem, const char *command, const char *
     }
     if (!strcmp(command, "AT+CMGL=4")) {
         assert(!response && !prefix && storage_mode && fixture_sms->scanning_inbox);
+        ++inbox_scans;
         if (stored_status) {
             stored_pdu(fixture_sms, "OTA STATUS", 3);
         }
@@ -579,17 +585,6 @@ static void vTaskDelete(void *task) { assert(!task); }
 #include "lte_wrapper.inc"
 #undef TAG
 
-static void sms_control_resume(sms_control_t *sms, modem_t *modem)
-{
-    assert(at_ready && !ppp_active && modem);
-    storage_mode = false;
-    sms->configured = sms_ready = !is_case("sms-failure") &&
-        !(is_case("sms-resume-failed") && touched_sectors);
-    if (resume_delivery && touched_sectors) {
-        pdu_command(resume_delivery, "+15550101001", "OTA CANCEL", 0);
-        resume_delivery = NULL;
-    }
-}
 static bool start_gps(modem_t *modem)
 {
     assert(at_ready && !ppp_active && modem);

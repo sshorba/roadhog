@@ -38,6 +38,7 @@ CASES = (
     "sms-wrong-target", "sms-legacy", "sms-incompatible",
     "sms-supported-cnmi", "sms-cnmi-readback", "sms-me-full", "sms-stored-cancel", "sms-stored-fifo", "sms-late-cancel",
     "sms-incomplete-staged", "sms-overflow", "sms-confirm-overflow", "sms-pre-prompt-retry", "sms-no-final",
+    "sms-cancel-delete-late", "sms-status-delete-failed", "sms-cnma-nack-recovery", "sms-cnma-ack-recovery", "sms-truncated-header",
 )
 
 
@@ -79,8 +80,14 @@ def compile_fixture(tmp, sdk):
         (tmp / destination).write_text(module)
     sms = (ROOT / "main/sms_control.c").read_text()
     parser = sms.split("static int nibble(", 1)[1].split("\n#endif", 1)[0]
+    configure = sms[sms.index("static bool cnmi_verified("):sms.index("void sms_control_start(")]
+    configure = configure.rsplit("#endif", 1)[0]
+    resume = sms[sms.index("void sms_control_resume("):sms.index("static void sms_control_delivery_fault(")]
     delivery = sms[sms.index("static void sms_control_delivery_fault("):]
-    (tmp / "sms_delivery.inc").write_text("static int nibble(" + parser + "\n" + delivery)
+    (tmp / "sms_delivery.inc").write_text(
+        "static int nibble(" + parser + "\nvoid sms_control_expire_pdu(sms_control_t *);\n"
+        + configure + resume + delivery
+    )
     (tmp / "key.S").write_text(
         '.section .rodata\n.global _binary_ota_public_pem_start, _binary_ota_public_pem_end\n'
         '_binary_ota_public_pem_start:\n.incbin "release-public.pem"\n.byte 0\n'

@@ -64,12 +64,72 @@ static void test_pdu(const modem_config_t *config, sms_control_t *sms)
     fail_ack = true;
     sms_control_service(sms, &fixture_modem);
     assert(acks == 3 && sent == 0 && queued == OTA_SMS_NONE);
-    pdu_command(sms, OWNER, "ota check", 0);
     fail_ack = false;
+    clock_adjustment += INT64_C(5100000);
+    sms_control_service(sms, &fixture_modem);
+    assert(sms->configured && !sms->routing_recovery);
+    pdu_command(sms, OWNER, "ota check", 0);
     sms_control_service(sms, &fixture_modem);
     assert(acks == 4 && sent == 1 && queued == OTA_SMS_CHECK && !requests);
     assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
     assert(requests == 1 && challenge.expires && !touched_sectors && !selections);
+}
+
+static void test_cnma_recovery(const modem_config_t *config, sms_control_t *sms)
+{
+    if (is_case("sms-truncated-header")) {
+        assert(sms_control_notification(sms, "+CMT: ,"));
+        assert(!sms->expected_tpdu && sms->pending_nacks == 1 && sms->delivery_fault);
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem && !requests);
+        sms_control_service(sms, &fixture_modem);
+        assert(nacks == 1 && queued == OTA_SMS_NONE && !requests);
+        return;
+    }
+
+    fail_ack = is_case("sms-cnma-ack-recovery");
+    fail_nack = !fail_ack;
+    if (fail_ack) {
+        pdu_command(sms, OWNER, "OTA STATUS", 0);
+    } else {
+        assert(sms_control_notification(sms, "+CMT: ,40"));
+        clock_adjustment += INT64_C(1100000);
+    }
+    sms_control_service(sms, &fixture_modem);
+    assert(routing_reset && modem_busy && sms->routing_recovery && !sms->configured &&
+           queued == OTA_SMS_NONE && !requests && !sms->request_count);
+    unsigned before = direct_readbacks;
+    clock_adjustment += INT64_C(5100000);
+    sms_control_service(sms, &fixture_modem);
+    assert(direct_readbacks == before && sms->routing_recovery && !requests);
+
+    late_final = true;
+    assert(modem_poll(&fixture_modem, 250) == ESP_OK);
+    fail_ack = fail_nack = false;
+    wrong_direct_readback = true;
+    sms_control_service(sms, &fixture_modem);
+    assert(direct_readbacks == before + 1 && !sms->configured && sms->routing_recovery);
+    int input[2];
+    assert(pipe(input) == 0 && dup2(input[0], STDIN_FILENO) == STDIN_FILENO);
+    assert(close(input[0]) == 0 && write(input[1], "modem inspect\n", 14) == 14);
+    assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem &&
+           !requests && maintenance_calls == 1);
+    assert(close(input[1]) == 0);
+
+    wrong_direct_readback = false;
+    stored_status = true;
+    clock_adjustment += INT64_C(5100000);
+    sms_control_service(sms, &fixture_modem);
+    assert(sms->configured && sms->routing_recovery && inbox_scans == 1 && stored_deletes == 1);
+    owner_command(sms, OWNER, "OTA CHECK");
+    assert(strstr(last_reply, "SMS routing is recovering") && queued == OTA_SMS_NONE && !requests);
+    sms_control_service(sms, &fixture_modem);
+    assert(sms->configured && !sms->routing_recovery && inbox_scans == 2 && direct_readbacks >= before + 4);
+
+    pdu_command(sms, OWNER, "OTA CHECK", 0);
+    sms_control_service(sms, &fixture_modem);
+    assert(queued == OTA_SMS_CHECK);
+    assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+    assert(requests == 1 && challenge.expires && !touched_sectors && !selection_attempts);
 }
 
 static void test_sms(const modem_config_t *config, sms_control_t *sms)
@@ -100,6 +160,11 @@ static void test_sms(const modem_config_t *config, sms_control_t *sms)
     assert(strstr(last_reply, "Checking") && !requests && !touched_sectors && !selections);
     if (fail_send) {
         assert(queued == OTA_SMS_NONE);
+        return;
+    }
+    if (is_case("sms-cnma-nack-recovery") || is_case("sms-cnma-ack-recovery") ||
+        is_case("sms-truncated-header")) {
+        test_cnma_recovery(config, sms);
         return;
     }
     if (is_case("sms-incomplete-expiry")) {
@@ -278,29 +343,49 @@ static void test_sms(const modem_config_t *config, sms_control_t *sms)
         assert(nacks == 1 && !staged.install && !selection_attempts && !restarted);
         return;
     }
-    if (is_case("sms-stored-cancel") || is_case("sms-stored-fifo")) {
+    if (is_case("sms-cancel-delete-late")) {
         stored_cancel = true;
-        stored_status = is_case("sms-stored-fifo");
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+        assert(staged.install && stored_cancel && !selection_attempts);
+        sms_control_service(sms, &fixture_modem);
+        assert(!staged.install && !stored_cancel && stored_deletes == 1 && modem_busy);
+        late_final = true;
+        assert(modem_poll(&fixture_modem, 250) == ESP_OK);
+        clock_adjustment += INT64_C(5100000);
+        sms_control_service(sms, &fixture_modem);
+        assert(sms->configured && !sms->storage_pending && !modem_busy);
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+        assert(!selection_attempts && !restarted && selected == running);
+        return;
+    }
+    if (is_case("sms-stored-cancel") || is_case("sms-stored-fifo") || is_case("sms-status-delete-failed")) {
+        stored_cancel = true;
+        stored_status = is_case("sms-stored-fifo") || is_case("sms-status-delete-failed");
         assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
         assert(staged.install && stored_cancel && !storage_mode && !selection_attempts);
         unsigned before = acks;
         unsigned expected_deletes = 1;
-        if (stored_status) {
+        if (is_case("sms-status-delete-failed")) {
             unsigned before_reply = sent;
             fail_delete = true;
             sms_control_service(sms, &fixture_modem);
-            assert(sent == before_reply && stored_status && stored_cancel && !stored_deletes);
+            assert(sent == before_reply && stored_status && stored_cancel && !stored_deletes && !staged.install);
             fail_delete = false;
+        }
+        if (stored_status) {
             sms_control_service(sms, &fixture_modem);
-            assert(strstr(last_reply, "Image verified") && !stored_status && stored_cancel);
-            assert(staged.install && stored_deletes == 1);
+            bool status_failure = is_case("sms-status-delete-failed");
+            assert(strstr(last_reply, status_failure ? "acknowledgement failure" : "Image verified") &&
+                   !stored_status && stored_cancel);
+            assert(staged.install == !status_failure && stored_deletes == 1);
             assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
-            assert(staged.install && !selection_attempts);
+            assert(staged.install == !status_failure && !selection_attempts);
             expected_deletes = 2;
         }
         sms_control_service(sms, &fixture_modem);
         assert(!staged.install && stored_deletes == expected_deletes && !stored_cancel && acks == before);
-        assert(strstr(last_reply, "cancelled") && !selection_attempts && !restarted);
+        assert(strstr(last_reply, is_case("sms-status-delete-failed") ?
+                      "No pending OTA request" : "cancelled") && !selection_attempts && !restarted);
         return;
     }
     if (is_case("sms-recovery-cancel") || is_case("sms-recovery-ack-failed")) {

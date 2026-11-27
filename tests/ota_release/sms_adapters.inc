@@ -169,12 +169,29 @@ static int psa_mac_compute(mbedtls_svc_key_id_t id, int algorithm, const uint8_t
 enum { MAX_PDU_BYTES = 190 };
 static const char hex[] = "0123456789ABCDEF";
 static const char *SMS_TAG = "sms";
-static bool fail_ack;
+static bool fail_ack, fail_nack;
 static unsigned nacks, forbidden_cnmi;
 
 static bool command_ok(modem_t *modem, const char *command)
 {
     assert(modem == &fixture_modem && !ppp_active);
+    if (modem_busy) {
+        return false;
+    }
+    if (!strcmp(command, "ATE0") || !strcmp(command, "AT+CMGF=0") || !strcmp(command, "AT+CSMS=1")) {
+        return true;
+    }
+    if (!strcmp(command, "AT+CNMI=2,2,0,0,0")) {
+        assert(at_ready);
+        storage_mode = false;
+        routing_reset = false;
+        sms_ready = !is_case("sms-failure") && !(is_case("sms-resume-failed") && touched_sectors);
+        if (resume_delivery && touched_sectors) {
+            pdu_command(resume_delivery, OWNER, "OTA CANCEL", 0);
+            resume_delivery = NULL;
+        }
+        return sms_ready;
+    }
     if (!strcmp(command, "AT+CNMI=0,2,0,0,0")) {
         ++forbidden_cnmi;
         return false;
@@ -203,14 +220,24 @@ static bool command_ok(modem_t *modem, const char *command)
         assert(stored_cancel && storage_mode);
         stored_cancel = false;
         ++stored_deletes;
+        if (is_case("sms-cancel-delete-late")) {
+            modem_busy = true;
+            return false;
+        }
         return true;
     }
     if (!strcmp(command, "AT+CNMA=2")) {
         ++nacks;
-        return true;
+        if (fail_nack) {
+            routing_reset = modem_busy = true;
+        }
+        return !fail_nack;
     }
     assert(!strcmp(command, "AT+CNMA"));
     ++acks;
+    if (fail_ack && is_case("sms-cnma-ack-recovery")) {
+        routing_reset = modem_busy = true;
+    }
     return !fail_ack;
 }
 
