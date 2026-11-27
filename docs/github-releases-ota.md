@@ -295,8 +295,15 @@ independent. The SMS command path defaults off. A release built with rollback
 and SMS support from this source can report a pending result even with the
 SMS OTA command option off.
 
-Publish the same three signed assets under `<base>/vN/`. Use immutable,
-increasing sequence numbers. Once all three objects are readable at their
+Publish the three signed assets under `<base>/vN/`. Generate the SMS
+manifest with `python3 tools/ota_release_manifest.py --sms roadhog-vN.bin N <notes-url>`.
+It uses the signed `roadhog-sms-release-v1` header and the same ordered fields.
+The publisher checks the capability marker at byte offset 288. The build emits
+that marker for the 16 MiB Road Hög A/B layout with rollback and owner SMS
+support enabled. Before staging, the installer checks the marker in the
+downloaded image prefix, then verifies the full signed digest and readback
+before selection. Use the original manifest command for legacy serial
+installers. Use immutable, increasing sequence numbers. Once all three objects are readable at their
 final URLs and the detached signature has been verified, build a single
 `latest` object from the exact versioned manifest and signature. The object
 contains one unsigned byte with the DER signature length (1–72), the DER
@@ -335,15 +342,26 @@ on the device's monotonic clock and is discarded on reboot. A fresh check
 replaces the previous offer. Confirming consumes the code before installation
 is queued. A failed acknowledgement or reply prevents the queued network
 operation. Cancellation clears the pending offer or a request still queued.
-During PPP, SMS reception and GNSS AT queries pause. Cancellation cannot
-interrupt an active PPP transfer. The versioned signed manifest must match
+Before PPP, the modem must accept CNMI mode 0 to buffer SMS indications.
+The UART owner drains the AT stream and defers the handoff if it sees an
+incomplete delivery, pending acknowledgement, or queued SMS. Incomplete
+headers expire after one second. After PPP, mode 2 flushes buffered
+indications. The installer gives the SMS loop another service turn and
+repeats the quiesce check before selecting the candidate and rebooting. An
+owner cancellation processed in that interval leaves the current slot
+selected. SMS and GNSS AT queries pause during PPP. The modem buffer is
+finite, so this protocol does not guarantee carrier delivery during a long
+transfer, high traffic, or a modem reset. Verify mode 0 buffering and mode 2
+flush on the SIM7600 during attended bench trials. See the
+[SIMCom AT command manual](https://simcom.ee/documents/SIM7600E/SIM7500_SIM7600%20Series_AT%20Command%20Manual%20_V1.10.pdf). The versioned signed manifest must match
 the confirmed sequence, target, size and SHA-256 before any image is staged.
 
 The installer commits a pending report in its own NVS namespace before boot
 selection. On reconnect, the boot reporter requires the selected, running
 partition to be VALID and matches the version, slot and exact image digest
 before claiming success. It waits for LTE registration, SMS configuration and
-GNSS service. The message reports LTE registration and SMS readiness. It does
+GNSS service on a fresh iteration after any PPP handoff, plus an idle AT
+stream before consuming the journal. The message reports LTE registration and SMS readiness. It does
 not perform a second PPP or HTTPS test. If the previous firmware is running
 again, the outcome may be rollback or an interruption before selection.
 Without communication the outcome stays unknown. The record is consumed

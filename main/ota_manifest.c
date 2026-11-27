@@ -80,20 +80,27 @@ static const char *field(const char **cursor, const char *prefix, size_t *length
     return value;
 }
 
-bool ota_manifest_parse(const uint8_t *data, size_t size, ota_manifest_t *manifest)
+static bool parse_manifest(const uint8_t *data, size_t size, ota_manifest_t *manifest, bool sms_only)
 {
-    static const char header[] = "roadhog-release-v1\n"
-                                 "target=esp32s3-n16r8-ota-ab-v1\n";
+    static const char serial[] = "roadhog-release-v1\ntarget=esp32s3-n16r8-ota-ab-v1\n";
+    static const char sms[] = "roadhog-sms-release-v1\ntarget=esp32s3-n16r8-ota-ab-v1\n";
+    size_t header_size;
+    if (size >= sizeof(sms) && !memcmp(data, sms, sizeof(sms) - 1)) {
+        header_size = sizeof(sms) - 1;
+    } else if (!sms_only && size >= sizeof(serial) && !memcmp(data, serial, sizeof(serial) - 1)) {
+        header_size = sizeof(serial) - 1;
+    } else {
+        return false;
+    }
     const char hex[] = "0123456789abcdef";
-    if (size < sizeof(header) || size > OTA_MANIFEST_MAX ||
-        memchr(data, 0, size) || memcmp(data, header, sizeof(header) - 1)) {
+    if (size > OTA_MANIFEST_MAX || memchr(data, 0, size)) {
         return false;
     }
 
     char text[OTA_MANIFEST_MAX + 1];
     memcpy(text, data, size);
     text[size] = '\0';
-    const char *cursor = text + sizeof(header) - 1;
+    const char *cursor = text + header_size;
     size_t length;
     const char *value = field(&cursor, "sequence=", &length);
     if (!value || !decimal(value, length, &manifest->sequence)) {
@@ -124,4 +131,14 @@ bool ota_manifest_parse(const uint8_t *data, size_t size, ota_manifest_t *manife
     char host[254];
     const char *path;
     return ota_https_url(value, host, &path);
+}
+
+bool ota_manifest_parse(const uint8_t *data, size_t size, ota_manifest_t *manifest)
+{
+    return parse_manifest(data, size, manifest, false);
+}
+
+bool ota_manifest_parse_sms(const uint8_t *data, size_t size, ota_manifest_t *manifest)
+{
+    return parse_manifest(data, size, manifest, true);
 }

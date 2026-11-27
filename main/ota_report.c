@@ -16,6 +16,12 @@
 
 #define IMAGE_PREFIX (sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t))
 
+#ifdef ROADHOG_SMS_OTA_DESCRIPTOR
+// ESP-IDF puts this immediately after esp_app_desc_t in the application image.
+__attribute__((section(".rodata_custom_desc"), used, aligned(1)))
+const char roadhog_sms_ota_descriptor[] = OTA_SMS_IMAGE_MARKER;
+#endif
+
 static const char *REPORT_TAG = "ota_report";
 static const char *boot_status = "No OTA request this boot.";
 
@@ -150,7 +156,8 @@ void ota_sms_report_boot(const sms_control_t *sms, modem_t *modem)
         }
         success = verified == ESP_OK;
     }
-    if (nvs_open("sms_ota", NVS_READWRITE, &store) != ESP_OK) {
+    if (!modem_maintenance_ready(modem) || sms->pending_acks || sms->expected_tpdu ||
+        nvs_open("sms_ota", NVS_READWRITE, &store) != ESP_OK) {
         return;
     }
     char reply[SMS_TEXT_CAPACITY];

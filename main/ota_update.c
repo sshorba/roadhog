@@ -280,7 +280,7 @@ typedef struct {
     const update_t *update;
     esp_ota_handle_t handle;
     bool open;
-    uint8_t prefix[IMAGE_PREFIX];
+    uint8_t prefix[IMAGE_PREFIX + sizeof(OTA_SMS_IMAGE_MARKER)];
     size_t prefix_used;
     size_t written;
     psa_hash_operation_t hash;
@@ -323,14 +323,22 @@ static esp_err_t write_body(void *context, const uint8_t *bytes, size_t length)
 {
     writer_t *writer = context;
     if (!writer->open) {
-        size_t missing = sizeof(writer->prefix) - writer->prefix_used;
+        size_t prefix_size = IMAGE_PREFIX;
+#if defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+        if (writer->update->remote) {
+            prefix_size += sizeof(OTA_SMS_IMAGE_MARKER);
+        }
+#endif
+        size_t missing = prefix_size - writer->prefix_used;
         size_t keep = length < missing ? length : missing;
         memcpy(writer->prefix + writer->prefix_used, bytes, keep);
         writer->prefix_used += keep;
-        if (writer->prefix_used != sizeof(writer->prefix)) {
+        if (writer->prefix_used != prefix_size) {
             return ESP_OK;
         }
-        if (!candidate_header(writer)) {
+        if (!candidate_header(writer) ||
+            (prefix_size > IMAGE_PREFIX &&
+             memcmp(writer->prefix + IMAGE_PREFIX, OTA_SMS_IMAGE_MARKER, sizeof(OTA_SMS_IMAGE_MARKER)))) {
             return ESP_ERR_INVALID_VERSION;
         }
         // In IDF v6.1.1 begin can erase the inactive otadata sector.
@@ -341,7 +349,7 @@ static esp_err_t write_body(void *context, const uint8_t *bytes, size_t length)
             return error;
         }
         writer->open = true;
-        error = write_chunk(writer, writer->prefix, sizeof(writer->prefix));
+        error = write_chunk(writer, writer->prefix, prefix_size);
         if (error != ESP_OK || length == keep) {
             return error;
         }
@@ -409,7 +417,13 @@ static esp_err_t update_over_ppp(esp_netif_t *netif, void *context)
     const uint8_t *manifest_bytes = workspace->manifest_bytes;
     const uint8_t *signature = workspace->signature;
     bool discovery = false;
+    size_t minimum_image_size = IMAGE_PREFIX;
+    bool (*parse)(const uint8_t *, size_t, ota_manifest_t *) = ota_manifest_parse;
 #if defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+    if (update->remote) {
+        parse = ota_manifest_parse_sms;
+        minimum_image_size += sizeof(OTA_SMS_IMAGE_MARKER);
+    }
     discovery = update->remote && !update->install;
     if (discovery) {
         manifest_body.maximum = sizeof(workspace->manifest_bytes);
@@ -436,8 +450,8 @@ static esp_err_t update_over_ppp(esp_netif_t *netif, void *context)
     if (error == ESP_OK &&
         (manifest_body.used > OTA_MANIFEST_MAX ||
          !verify_signature(manifest_bytes, manifest_body.used, signature, signature_body.used) ||
-         !ota_manifest_parse(manifest_bytes, manifest_body.used, manifest) ||
-         (!discovery && manifest->sequence != update->sequence) || manifest->size < IMAGE_PREFIX)) {
+         !parse(manifest_bytes, manifest_body.used, manifest) ||
+         (!discovery && manifest->sequence != update->sequence) || manifest->size < minimum_image_size)) {
         error = ESP_ERR_INVALID_RESPONSE;
     }
 #if defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
@@ -501,6 +515,8 @@ static ota_sms_command_t queued;
 static ota_manifest_t confirmed;
 static const char *remote_status;
 static int64_t queued_until;
+static update_t staged;
+static int64_t staged_until;
 static mbedtls_svc_key_id_t challenge_key;
 
 void ota_sms_init(void)
@@ -542,10 +558,22 @@ static bool create_challenge(const ota_manifest_t *release)
 
 void ota_sms_ack_failed(void)
 {
-    if (queued != OTA_SMS_NONE) {
+    if (queued != OTA_SMS_NONE || staged.install) {
+        staged.install = false;
         queued = OTA_SMS_NONE;
         confirmed = (ota_manifest_t){0};
         remote_status = "Queued OTA request stopped after an SMS acknowledgement failure.";
+    }
+}
+
+static void expire_remote_work(int64_t now)
+{
+    if ((queued != OTA_SMS_NONE && now >= queued_until) ||
+        (staged.install && now >= staged_until)) {
+        staged.install = false;
+        queued = OTA_SMS_NONE;
+        confirmed = (ota_manifest_t){0};
+        remote_status = "Queued OTA request expired.";
     }
 }
 
@@ -569,12 +597,9 @@ bool ota_sms_service_command(const sms_control_t *sms, modem_t *modem, const sms
     if (had_code && !pending) {
         remote_status = "OTA confirmation expired.";
     }
-    if (queued != OTA_SMS_NONE && now >= queued_until) {
-        queued = OTA_SMS_NONE;
-        confirmed = (ota_manifest_t){0};
-        remote_status = "Queued OTA request expired.";
-    }
+    expire_remote_work(now);
     if (command == OTA_SMS_CANCEL) {
+        staged.install = false;
         challenge = (ota_sms_challenge_t){0};
         queued = OTA_SMS_NONE;
         confirmed = (ota_manifest_t){0};
@@ -592,7 +617,7 @@ bool ota_sms_service_command(const sms_control_t *sms, modem_t *modem, const sms
             snprintf(detail, sizeof(detail), "Current v%" PRIu32 ". %s", current, status);
             reply = detail;
         }
-    } else if (queued != OTA_SMS_NONE) {
+    } else if (queued != OTA_SMS_NONE || staged.install) {
         reply = "An OTA request is queued.";
     } else if (command == OTA_SMS_CHECK) {
         challenge = (ota_sms_challenge_t){0};
@@ -638,6 +663,29 @@ bool ota_sms_service_command(const sms_control_t *sms, modem_t *modem, const sms
     return true;
 }
 
+static void select_remote(sms_control_t *sms, modem_t *modem)
+{
+    staged.install = false;
+    nvs_handle_t store;
+    if (update_ready(&staged) &&
+        ota_notification_save(&staged.release, staged.target->address, sms->owner, &store) == ESP_OK) {
+        esp_err_t result = esp_ota_set_boot_partition(staged.target);
+        if (result != ESP_OK && ota_notification_clear(store) != ESP_OK) {
+            ESP_LOGW(TAG, "Could not clear the boot report after failed selection");
+        }
+        nvs_close(store);
+        if (result == ESP_OK) {
+            esp_restart();
+            return;
+        }
+    }
+    sms_control_resume(sms, modem);
+    remote_status = "OTA selection failed. Installation is unconfirmed.";
+    if (sms->configured) {
+        sms_control_send(modem, sms->owner, remote_status);
+    }
+}
+
 static void finish_remote(sms_control_t *sms, modem_t *modem, update_t *update,
                           bool ready, esp_err_t result)
 {
@@ -658,23 +706,10 @@ static void finish_remote(sms_control_t *sms, modem_t *modem, update_t *update,
             snprintf(reply, sizeof(reply), "%s", remote_status);
         }
     } else if (update->install && ready && update_ready(update)) {
-        nvs_handle_t store;
-        result = ota_notification_save(&update->release, update->target->address, sms->owner, &store);
-        if (result == ESP_OK) {
-            result = esp_ota_set_boot_partition(update->target);
-            if (result != ESP_OK) {
-                if (ota_notification_clear(store) != ESP_OK) {
-                    ESP_LOGW(TAG, "Could not clear the boot report after failed selection");
-                }
-            }
-            nvs_close(store);
-            if (result == ESP_OK) {
-                esp_restart();
-                return;
-            }
-        }
-        remote_status = "OTA selection failed. Installation is unconfirmed.";
-        snprintf(reply, sizeof(reply), "%s", remote_status);
+        staged = *update;
+        staged_until = esp_timer_get_time() + OTA_SMS_LIFETIME_US;
+        remote_status = "Image verified. Waiting for SMS service before reboot.";
+        return;
     } else {
         remote_status = update->install ? "OTA install failed before boot selection."
                         : result == ESP_ERR_NOT_FOUND ? "No latest release published."
@@ -706,7 +741,11 @@ static modem_t *execute_update(modem_t *modem, const modem_config_t *config,
         return NULL;
     }
     bool gps_ready = false;
-    if (reopened) {
+    if (reopened
+#if defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+        || update->remote
+#endif
+    ) {
         sms_control_resume(sms, modem);
         gps_ready = start_gps(modem);
     }
@@ -748,6 +787,7 @@ static modem_t *run_remote(modem_t *modem, const modem_config_t *config, sms_con
     confirmed = (ota_manifest_t){0};
     if (!sms->configured || !sms->owner || !update_ready(&update) ||
         esp_timer_get_time() >= queued_until) {
+        sms_control_resume(sms, modem);
         remote_status = "OTA request failed preflight.";
         if (sms->configured && sms->owner) {
             sms_control_send(modem, sms->owner, remote_status);
@@ -790,10 +830,24 @@ static modem_t *run_update(modem_t *modem, const modem_config_t *config, sms_con
 modem_t *ota_update_poll(modem_t *modem, const modem_config_t *config, sms_control_t *sms)
 {
 #if defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
-    if (queued != OTA_SMS_NONE) {
-        // Finish acknowledging direct-delivery messages before taking UART for PPP.
-        return sms->pending_acks || sms->expected_tpdu || sms->request_count
-               ? modem : run_remote(modem, config, sms);
+    sms_control_expire_pdu(sms);
+    expire_remote_work(esp_timer_get_time());
+    if (queued != OTA_SMS_NONE || staged.install) {
+        if (!sms->configured || sms->pending_acks || sms->expected_tpdu || sms->request_count ||
+            !sms_control_quiesce(sms, modem)) {
+            return modem;
+        }
+        if (staged.install) {
+            if (esp_timer_get_time() < staged_until) {
+                select_remote(sms, modem);
+            } else {
+                staged.install = false;
+                remote_status = "Queued OTA request expired.";
+                sms_control_resume(sms, modem);
+            }
+            return modem;
+        }
+        return run_remote(modem, config, sms);
     }
 #endif
     static char line[64];

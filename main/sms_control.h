@@ -23,10 +23,14 @@ typedef struct sms_control {
     unsigned request_count;
     unsigned pending_acks;
     size_t expected_tpdu;
+    int64_t tpdu_deadline;
+    int64_t resume_at;
     bool configured;
 } sms_control_t;
 
 void sms_control_start(sms_control_t *sms, modem_t *modem);
+bool sms_control_quiesce(sms_control_t *sms, modem_t *modem);
+void sms_control_expire_pdu(sms_control_t *sms);
 void sms_control_resume(sms_control_t *sms, modem_t *modem);
 bool sms_control_notification(sms_control_t *sms, const char *line);
 esp_err_t sms_control_send(modem_t *modem, const char *number, const char *message);

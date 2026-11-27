@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define OTA_SMS_IMAGE_MARKER "ROADHOG-SMS-OTA1"
 #define OTA_SLOT_SIZE 0x400000
 #define OTA_MANIFEST_MAX 1024
 #define OTA_URL_MAX 2048
@@ -15,6 +16,7 @@ typedef struct {
 } ota_manifest_t;
 
 bool ota_sequence_parse(const char *text, uint32_t *sequence);
+bool ota_manifest_parse_sms(const uint8_t *data, size_t size, ota_manifest_t *manifest);
 bool ota_manifest_parse(const uint8_t *data, size_t size, ota_manifest_t *manifest);
 bool ota_https_url(const char *url, char host[254], const char **path);
 bool ota_host_allowed(const char *host, const char *allowlist);

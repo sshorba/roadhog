@@ -60,6 +60,7 @@ static void test_pdu(const modem_config_t *config, sms_control_t *sms)
 static void test_sms(const modem_config_t *config, sms_control_t *sms)
 {
     ota_sms_init();
+    at_ready = true;
     sms->owner = OWNER;
     if (is_case("sms-pdu")) {
         test_pdu(config, sms);
@@ -81,6 +82,27 @@ static void test_sms(const modem_config_t *config, sms_control_t *sms)
         assert(queued == OTA_SMS_NONE);
         return;
     }
+    if (is_case("sms-incomplete-expiry")) {
+        int input[2];
+        assert(pipe(input) == 0 && dup2(input[0], STDIN_FILENO) == STDIN_FILENO);
+        assert(close(input[0]) == 0 && write(input[1], "modem inspect\n", 14) == 14);
+        assert(sms_control_notification(sms, "+CMT: ,40"));
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+        assert(!maintenance_calls && !requests && sms->expected_tpdu);
+        clock_adjustment += OTA_SMS_LIFETIME_US;
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+        assert(maintenance_calls == 1 && !requests && !sms->expected_tpdu && queued == OTA_SMS_NONE);
+        assert(sms_control_notification(sms, "00112233"));
+        assert(!sms->request_count && !sms->pending_acks);
+        assert(close(input[1]) == 0);
+        return;
+    }
+    if (is_case("sms-quiesce-failed")) {
+        fail_quiesce = true;
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+        assert(!requests && uart_open && sms->configured && queued == OTA_SMS_CHECK);
+        fail_quiesce = false;
+    }
     sms->pending_acks = 1;
     assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem && requests == 0);
     sms->pending_acks = 0;
@@ -90,9 +112,15 @@ static void test_sms(const modem_config_t *config, sms_control_t *sms)
         return;
     }
     assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
-    assert(requests == 1 && !touched_sectors && !selections && !restarted && !durable_size);
+    unsigned discovery_requests = is_case("sms-latest-redirect") || is_case("sms-latest-wrong-cert") ? 2 : 1;
+    assert(requests == discovery_requests && !touched_sectors && !selections && !restarted && !durable_size);
+    if (is_case("sms-latest-redirect") || is_case("sms-quiesce-failed")) {
+        assert(challenge.expires && strstr(last_reply, "Signed update v2 available"));
+        return;
+    }
     if (is_case("sms-missing") || is_case("sms-invalid") || is_case("sms-malformed-pointer") ||
-        is_case("sms-equal") || is_case("sms-older")) {
+        is_case("sms-equal") || is_case("sms-older") || is_case("sms-legacy") ||
+        is_case("sms-latest-wrong-cert")) {
         assert(!challenge.expires);
         assert(strstr(last_reply, is_case("sms-missing") ? "No latest release" :
                (is_case("sms-equal") || is_case("sms-older")) ? "No newer update" : "check failed"));
@@ -121,6 +149,15 @@ static void test_sms(const modem_config_t *config, sms_control_t *sms)
         return;
     }
 
+    if (is_case("sms-reboot-replay")) {
+        challenge = (ota_sms_challenge_t){0};
+        ota_sms_init();
+        pdu_command(sms, OWNER, confirm, 0);
+        sms_control_service(sms, &fixture_modem);
+        assert(strstr(last_reply, "Invalid or expired") && queued == OTA_SMS_NONE && requests == 1);
+        return;
+    }
+
     if (is_case("sms-replay")) {
         owner_command(sms, OWNER, "OTA CHECK");
         assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
@@ -131,19 +168,76 @@ static void test_sms(const modem_config_t *config, sms_control_t *sms)
     }
 
     fail_commit = is_case("sms-journal-failed");
-    owner_command(sms, OWNER, confirm);
-    assert(strstr(last_reply, "Confirmed v2") && requests == 1 && !touched_sectors);
-    assert(!challenge.expires && queued == OTA_SMS_CONFIRM);
+    fail_send = is_case("sms-confirm-reply-failed");
+    unsigned before_ack = acks;
+    reply_requires_ack = before_ack + 1;
+    pdu_command(sms, OWNER, confirm, 0);
+    sms_control_service(sms, &fixture_modem);
+    assert(acks == before_ack + 1 && strstr(last_reply, "Confirmed v2") &&
+           requests == 1 && !touched_sectors && !challenge.expires);
+    if (fail_send) {
+        assert(queued == OTA_SMS_NONE);
+        fail_send = false;
+        owner_command(sms, OWNER, confirm);
+        assert(strstr(last_reply, "Invalid or expired"));
+        return;
+    }
+    assert(queued == OTA_SMS_CONFIRM);
+    if (is_case("sms-queued-expiry")) {
+        clock_adjustment += OTA_SMS_LIFETIME_US;
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+        assert(queued == OTA_SMS_NONE && requests == 1 && !touched_sectors);
+        return;
+    }
+    if (is_case("sms-boundary-cancel")) {
+        boundary_delivery = sms;
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+        assert(queued == OTA_SMS_CONFIRM && requests == 1 && sms->pending_acks && uart_open);
+        sms_control_service(sms, &fixture_modem);
+        assert(strstr(last_reply, "cancelled") && queued == OTA_SMS_NONE && !sms->pending_acks);
+        return;
+    }
+    if (is_case("sms-recovery-cancel") || is_case("sms-recovery-ack-failed")) {
+        resume_delivery = sms;
+    }
     assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
-    owner_command(sms, OWNER, confirm);
-    assert(strstr(last_reply, "Invalid or expired") && queued == OTA_SMS_NONE);
-
-    if (is_case("sms-changed")) {
-        assert(requests == 5 && !touched_sectors && !selection_attempts && !restarted);
+    assert(!selections && !restarted && !durable_size);
+    if (is_case("sms-changed") || is_case("sms-wrong-sequence") || is_case("sms-wrong-target") ||
+        is_case("sms-incompatible")) {
+        assert(requests == (is_case("sms-incompatible") ? 7 : 5));
+        assert(!touched_sectors && !selection_attempts && !staged.install);
         return;
     }
     assert(requests == 7 && touched_sectors == 3);
-    if (is_case("sms-journal-failed") || is_case("sms-selection-failed")) {
+    if (is_case("sms-resume-failed")) {
+        assert(!sms->configured && !staged.install && !selection_attempts && uart_open);
+        return;
+    }
+    assert(staged.install);
+    if (is_case("sms-recovery-cancel") || is_case("sms-recovery-ack-failed")) {
+        assert(sms->pending_acks && sms->request_count);
+        assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+        assert(!selection_attempts && !restarted);
+        fail_ack = is_case("sms-recovery-ack-failed");
+        sms_control_service(sms, &fixture_modem);
+        assert((fail_ack || strstr(last_reply, "cancelled")) && !staged.install && !sms->pending_acks);
+        assert(!selection_attempts && !restarted);
+        return;
+    }
+    if (is_case("sms-reset-before-selection")) {
+        nvs_handle_t store;
+        assert(ota_notification_save(&staged.release, staged.target->address, OWNER, &store) == ESP_OK);
+        nvs_close(store);
+        staged = (update_t){0};
+        assert(!selection_attempts && selected == running && durable_size);
+        ota_sms_report_boot(sms, &fixture_modem);
+        assert(strstr(last_reply, "did not validate") && !durable_size);
+        return;
+    }
+    assert(ota_update_poll(&fixture_modem, config, sms) == &fixture_modem);
+    owner_command(sms, OWNER, confirm);
+    assert(strstr(last_reply, "Invalid or expired") && queued == OTA_SMS_NONE);
+    if (is_case("sms-journal-failed") || is_case("sms-selection-failed") || is_case("sms-nvs-set-failed")) {
         assert(!selections && !restarted && !durable_size);
         return;
     }
@@ -173,6 +267,30 @@ static void test_sms(const modem_config_t *config, sms_control_t *sms)
         ota_sms_report_boot(sms, &fixture_modem);
         assert(sent == prior && durable_size);
         fail_commit = false;
+    }
+    if (is_case("sms-report-busy") || is_case("sms-nvs-erase-failed")) {
+        if (is_case("sms-report-busy")) {
+            gps_timeout = true;
+            assert(!start_gps(&fixture_modem));
+        }
+        fail_erase = is_case("sms-nvs-erase-failed");
+        ota_sms_report_boot(sms, &fixture_modem);
+        assert(sent == prior && durable_size);
+        if (is_case("sms-report-busy")) {
+            late_final = true;
+            assert(modem_poll(&fixture_modem, 250) == ESP_OK && !modem_busy);
+            assert(start_gps(&fixture_modem));
+        }
+        fail_erase = false;
+    }
+    if (is_case("sms-reset-before-send")) {
+        cut_before_submit = true;
+        ota_sms_report_boot(sms, &fixture_modem);
+        assert(sent == prior && !durable_size);
+        cut_before_submit = false;
+        ota_sms_report_boot(sms, &fixture_modem);
+        assert(sent == prior);
+        return;
     }
     if (is_case("sms-owner-changed")) {
         sms->owner = OTHER_USER;

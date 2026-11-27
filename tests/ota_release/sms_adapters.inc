@@ -2,8 +2,8 @@
 #define OWNER "+15550101001"
 #define OTHER_USER "+15550101002"
 static char last_reply[SMS_TEXT_CAPACITY];
-static unsigned sent, restarted;
-static bool fail_send, fail_commit;
+static unsigned sent, restarted, acks, reply_requires_ack;
+static bool fail_send, fail_commit, fail_erase, fail_quiesce, cut_before_submit;
 static uint8_t nvs_durable[128], nvs_uncommitted[128];
 static size_t durable_size, uncommitted_size;
 
@@ -34,6 +34,9 @@ static esp_err_t nvs_get_blob(nvs_handle_t store, const char *key, void *data, s
 static esp_err_t nvs_set_blob(nvs_handle_t store, const char *key, const void *data, size_t size)
 {
     assert(store == NVS_READWRITE && !strcmp(key, "pending_v1") && size <= sizeof(nvs_uncommitted));
+    if (is_case("sms-nvs-set-failed")) {
+        return ESP_ERR_FLASH_OP_FAIL;
+    }
     memcpy(nvs_uncommitted, data, size);
     uncommitted_size = size;
     return ESP_OK;
@@ -42,6 +45,9 @@ static esp_err_t nvs_set_blob(nvs_handle_t store, const char *key, const void *d
 static esp_err_t nvs_erase_key(nvs_handle_t store, const char *key)
 {
     assert(store == NVS_READWRITE && !strcmp(key, "pending_v1"));
+    if (fail_erase) {
+        return ESP_ERR_FLASH_OP_FAIL;
+    }
     uncommitted_size = 0;
     return ESP_OK;
 }
@@ -65,7 +71,11 @@ static void nvs_close(nvs_handle_t store)
 static esp_err_t sms_control_send(modem_t *modem, const char *number, const char *message)
 {
     assert(modem == &fixture_modem && !ppp_active && uart_open && strlen(message) < sizeof(last_reply));
-    assert(!strcmp(number, OWNER));
+    assert(!strcmp(number, OWNER) && acks >= reply_requires_ack);
+    if (cut_before_submit) {
+        assert(!durable_size);
+        return ESP_FAIL;
+    }
     strcpy(last_reply, message);
     ++sent;
     return fail_send ? ESP_FAIL : ESP_OK;
@@ -134,12 +144,15 @@ static int psa_mac_compute(mbedtls_svc_key_id_t id, int algorithm, const uint8_t
 enum { MAX_PDU_BYTES = 190 };
 static const char hex[] = "0123456789ABCDEF";
 static const char *SMS_TAG = "sms";
-static unsigned acks;
 static bool fail_ack;
 
 static bool command_ok(modem_t *modem, const char *command)
 {
-    assert(modem == &fixture_modem && !ppp_active && !strcmp(command, "AT+CNMA"));
+    assert(modem == &fixture_modem && !ppp_active);
+    if (!strcmp(command, "AT+CNMI=0,2,0,0,0")) {
+        return !fail_quiesce;
+    }
+    assert(!strcmp(command, "AT+CNMA"));
     ++acks;
     return !fail_ack;
 }

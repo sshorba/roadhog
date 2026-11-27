@@ -1,6 +1,7 @@
 """Run the production installer with loopback TLS and simulated ESP32 flash."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,11 @@ CASES = (
     "sms-malformed-pointer", "sms-equal", "sms-older", "sms-changed", "sms-reply-failed",
     "sms-ack-failed", "sms-journal-failed", "sms-selection-failed", "sms-rollback",
     "sms-report-failed", "sms-report-commit-failed", "sms-owner-changed", "sms-readback",
+    "sms-incomplete-expiry", "sms-confirm-reply-failed", "sms-queued-expiry", "sms-reboot-replay",
+    "sms-boundary-cancel", "sms-recovery-cancel", "sms-recovery-ack-failed", "sms-quiesce-failed", "sms-resume-failed",
+    "sms-report-busy", "sms-nvs-set-failed", "sms-nvs-erase-failed", "sms-reset-before-selection",
+    "sms-reset-before-send", "sms-latest-redirect", "sms-latest-wrong-cert", "sms-wrong-sequence",
+    "sms-wrong-target", "sms-legacy", "sms-incompatible",
 )
 
 
@@ -71,7 +77,7 @@ def compile_fixture(tmp, sdk):
         (tmp / destination).write_text(module)
     sms = (ROOT / "main/sms_control.c").read_text()
     parser = sms.split("static int nibble(", 1)[1].split("\n#endif", 1)[0]
-    delivery = sms[sms.index("bool sms_control_notification("):]
+    delivery = sms[sms.index("void sms_control_expire_pdu("):]
     (tmp / "sms_delivery.inc").write_text("static int nibble(" + parser + "\n" + delivery)
     (tmp / "key.S").write_text(
         '.section .rodata\n.global _binary_ota_public_pem_start, _binary_ota_public_pem_end\n'
@@ -98,28 +104,44 @@ def make_assets(tmp):
     image[48] = ord("2")
     image[80:87] = b"roadhog"
     binary = tmp / "roadhog-v2.bin"
+    marker = b"ROADHOG-SMS-OTA1\0"
+    notes = "https://github.com/sshorba/roadhog/releases/tag/v2"
     binary.write_bytes(image)
-    run(sys.executable, ROOT / "tools/ota_release_manifest.py", binary, "2",
-        "https://github.com/sshorba/roadhog/releases/tag/v2")
+    publisher = ROOT / "tools/ota_release_manifest.py"
+    legacy = subprocess.run([sys.executable, publisher, "--sms", binary, "2", notes],
+                            capture_output=True)
+    assert legacy.returncode and b"lacks the SMS OTA boot capability marker" in legacy.stderr
+    incompatible = bytes(image)
+    image[288:288 + len(marker)] = marker
+    binary.write_bytes(image)
+    run(sys.executable, publisher, "--sms", binary, "2", notes)
     openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out",
             tmp / "release-private.pem")
     openssl("pkey", "-in", tmp / "release-private.pem", "-pubout", "-out", tmp / "release-public.pem")
-    openssl("dgst", "-sha256", "-sign", tmp / "release-private.pem", "-out",
-            binary.with_suffix(".sig"), binary.with_suffix(".manifest"))
-    changed_manifest = tmp / "changed.manifest"
-    changed_manifest.write_bytes(re.sub(rb"sha256=[0-9a-f]{64}", b"sha256=" + b"a" * 64,
-                                        binary.with_suffix(".manifest").read_bytes()))
-    changed_signature = tmp / "changed.sig"
-    openssl("dgst", "-sha256", "-sign", tmp / "release-private.pem", "-out",
-            changed_signature, changed_manifest)
-    signature = binary.with_suffix(".sig").read_bytes()
-    changed_sig = changed_signature.read_bytes()
-    latest = {
-        "original": bytes([len(signature)]) + signature + binary.with_suffix(".manifest").read_bytes(),
-        "changed": bytes([len(changed_sig)]) + changed_sig + changed_manifest.read_bytes(),
+    def signed(name, manifest):
+        path = tmp / f"{name}.manifest"
+        path.write_bytes(manifest)
+        signature = tmp / f"{name}.sig"
+        openssl("dgst", "-sha256", "-sign", tmp / "release-private.pem", "-out", signature, path)
+        return {"manifest": manifest, "sig": signature.read_bytes()}
+
+    original = binary.with_suffix(".manifest").read_bytes()
+    assets = {
+        name: signed(name, manifest)
+        for name, manifest in {
+            "original": original,
+            "changed": re.sub(rb"sha256=[0-9a-f]{64}", b"sha256=" + b"a" * 64, original),
+            "sequence": original.replace(b"sequence=2", b"sequence=3"),
+            "target": original.replace(b"esp32s3", b"esp32c3"),
+            "legacy": original.replace(b"roadhog-sms-release-v1", b"roadhog-release-v1"),
+            "incompatible": re.sub(rb"sha256=[0-9a-f]{64}",
+                                   b"sha256=" + hashlib.sha256(incompatible).hexdigest().encode(),
+                                   original),
+        }.items()
     }
-    return binary, latest, {suffix: binary.with_suffix("." + suffix).read_bytes()
-                    for suffix in ("bin", "manifest", "sig")}
+    for name, release in assets.items():
+        release["bin"] = incompatible if name == "incompatible" else bytes(image)
+    return binary, assets
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -142,11 +164,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.connection.fixture_sni != host:
             self.send_error(421)
             return
-        if host == "github.com" and self.path == PROJECT.split("/v2/")[0] + "/latest":
+        if (host == "github.com" and self.path == PROJECT.split("/v2/")[0] + "/latest" or
+                host == S3 and self.path == "/latest"):
+            if host == "github.com" and case in ("sms-latest-redirect", "sms-latest-wrong-cert"):
+                redirect_host = S3 if case == "sms-latest-redirect" else "wrong.example"
+                self.redirect(f"https://{redirect_host}/latest")
+                return
             if case == "sms-missing":
                 self.send_error(404)
                 return
-            data = self.server.latest["changed" if case == "sms-changed" else "original"]
+            variant = {"sms-changed": "changed", "sms-incompatible": "incompatible",
+                       "sms-legacy": "legacy"}.get(case, "original")
+            release = self.server.assets[variant]
+            data = bytes([len(release["sig"])]) + release["sig"] + release["manifest"]
             if case == "sms-invalid":
                 data = data[:-2] + b"x\n"
             elif case == "sms-malformed-pointer":
@@ -159,7 +189,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if host == "github.com" and self.path.startswith(PROJECT):
             suffix = self.path.removeprefix(PROJECT)
-            if suffix not in self.server.assets:
+            if suffix not in self.server.assets["original"]:
                 self.send_error(404)
                 return
             location = f"https://{S3}{ASSET}{suffix}?sig=fixture%2Bvalue"
@@ -184,7 +214,11 @@ class Handler(BaseHTTPRequestHandler):
         if query != "sig=fixture%2Bvalue":
             self.send_error(400)
             return
-        data = self.server.assets[suffix]
+        variant = {"sms-wrong-sequence": "sequence", "sms-wrong-target": "target",
+                   "sms-incompatible": "incompatible"}.get(case, "original")
+        if not case.startswith("sms-") or case == "sms-failure":
+            variant = "legacy"
+        data = self.server.assets[variant][suffix]
         if case == "http-failure" and suffix == "bin":
             self.send_error(503)
             return
@@ -222,7 +256,7 @@ def main():
     sdk = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory() as directory:
         tmp = Path(directory)
-        image, latest, assets = make_assets(tmp)
+        image, assets = make_assets(tmp)
         runner = compile_fixture(tmp, sdk)
         ca, key = make_certificate(tmp, "loopback")
         unrelated_ca, _ = make_certificate(tmp, "unrelated")
@@ -236,7 +270,6 @@ def main():
         with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
             server.socket = context.wrap_socket(server.socket, server_side=True)
             server.assets = assets
-            server.latest = latest
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:

@@ -179,6 +179,7 @@ void app_main(void)
                     sms_control_resume(&sms, modem);
                     start_gps(modem);
                 }
+                continue; // Resample modem readiness on the restored UART.
             } else {
                 ESP_LOGW(TAG, "LTE diagnostic skipped at deadline: %s", lte_label(lte));
             }

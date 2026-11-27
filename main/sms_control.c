@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mbedtls/platform_util.h"
 #include "sdkconfig.h"
 
@@ -200,9 +201,10 @@ void sms_control_start(sms_control_t *sms, modem_t *modem)
 void sms_control_resume(sms_control_t *sms, modem_t *modem)
 {
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
-    if (sms->configured) {
-        sms->expected_tpdu = 0;
+    if (sms->configured || sms->resume_at) {
+        sms_control_expire_pdu(sms);
         configure_sms(sms, modem);
+        sms->resume_at = sms->configured ? 0 : esp_timer_get_time() + INT64_C(5000000);
         if (sms->configured) {
             ESP_LOGI(TAG, "SMS commands resumed after LTE diagnostic");
         } else {
@@ -215,8 +217,31 @@ void sms_control_resume(sms_control_t *sms, modem_t *modem)
 #endif
 }
 
+void sms_control_expire_pdu(sms_control_t *sms)
+{
+    if (sms->expected_tpdu && esp_timer_get_time() >= sms->tpdu_deadline) {
+        sms->expected_tpdu = 0;
+    }
+}
+
+#if defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+bool sms_control_quiesce(sms_control_t *sms, modem_t *modem)
+{
+    // Mode 0 buffers unsolicited SMS indications at the modem. Mode 2 with
+    // bfr=0 in configure_sms flushes them when normal service resumes.
+    if (!command_ok(modem, "AT+CNMI=0,2,0,0,0") ||
+        modem_poll(modem, 250) != ESP_OK || !modem_maintenance_ready(modem) ||
+        sms->expected_tpdu || sms->pending_acks || sms->request_count) {
+        sms_control_resume(sms, modem);
+        return false;
+    }
+    return true;
+}
+#endif
+
 bool sms_control_notification(sms_control_t *sms, const char *line)
 {
+    sms_control_expire_pdu(sms);
     // Suppress headers and their payload even when SMS control is disabled.
     if (strncmp(line, "+CMT:", 5) == 0) {
         sms->expected_tpdu = 0;
@@ -226,13 +251,16 @@ bool sms_control_notification(sms_control_t *sms, const char *line)
             unsigned long length = strtoul(separator + 1, &end, 10);
             if (!*end && length > 0 && length <= 176) {
                 sms->expected_tpdu = length;
+                sms->tpdu_deadline = esp_timer_get_time() + INT64_C(1000000);
             }
         }
         return true;
     }
 
     if (!sms->expected_tpdu) {
-        return false;
+        // A late orphan PDU cannot become a command or be logged as plaintext.
+        size_t length = strlen(line);
+        return length >= 2 && length % 2 == 0 && strspn(line, "0123456789ABCDEFabcdef") == length;
     }
     size_t length = strlen(line);
     size_t tpdu_length = sms->expected_tpdu;
@@ -266,11 +294,16 @@ bool sms_control_notification(sms_control_t *sms, const char *line)
 
 void sms_control_service(sms_control_t *sms, modem_t *modem)
 {
+    sms_control_expire_pdu(sms);
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
+    if (sms->resume_at && esp_timer_get_time() >= sms->resume_at &&
+        modem_maintenance_ready(modem)) {
+        sms_control_resume(sms, modem);
+    }
     if (!sms->configured) {
         return;
     }
-    while (sms->pending_acks) {
+    for (unsigned i = 0; i < SMS_QUEUE_CAPACITY && sms->pending_acks; ++i) {
         sms->pending_acks--;
         if (!command_ok(modem, "AT+CNMA")) {
             ESP_LOGW(TAG, "SMS acknowledgement failed");
@@ -281,7 +314,7 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
             return;
         }
     }
-    if (sms->request_count) {
+    if (!sms->pending_acks && sms->request_count) {
         sms_request_t request = sms->requests[sms->request_head];
         sms->request_head = (sms->request_head + 1) % SMS_QUEUE_CAPACITY;
         sms->request_count--;

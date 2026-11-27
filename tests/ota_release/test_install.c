@@ -391,6 +391,7 @@ typedef struct {
     bool configured;
     const char *owner;
     unsigned pending_acks, expected_tpdu, request_count, request_head;
+    int64_t tpdu_deadline, resume_at;
     sms_request_t requests[SMS_QUEUE_CAPACITY];
 } sms_control_t;
 typedef esp_err_t (*cellular_operation_t)(esp_netif_t *, void *);
@@ -463,9 +464,28 @@ static esp_err_t modem_open(const modem_config_t *config, modem_t **modem)
     return ESP_OK;
 }
 
+static void pdu_command(sms_control_t *sms, const char *sender, const char *text, uint8_t flags);
+static sms_control_t *boundary_delivery;
+static sms_control_t *resume_delivery;
+static bool modem_busy, gps_timeout, late_final;
+
+static bool modem_maintenance_ready(modem_t *modem)
+{
+    assert(modem == &fixture_modem && uart_open && !ppp_active);
+    return !modem_busy;
+}
+
 static esp_err_t modem_poll(modem_t *modem, unsigned timeout_ms)
 {
     assert(modem == &fixture_modem && uart_open && timeout_ms == 250);
+    if (late_final) {
+        modem_busy = false;
+        late_final = false;
+    }
+    if (boundary_delivery) {
+        pdu_command(boundary_delivery, "+15550101001", "OTA CANCEL", 0);
+        boundary_delivery = NULL;
+    }
     return ESP_OK;
 }
 
@@ -527,11 +547,21 @@ static void vTaskDelete(void *task) { assert(!task); }
 static void sms_control_resume(sms_control_t *sms, modem_t *modem)
 {
     assert(at_ready && !ppp_active && modem);
-    sms->configured = sms_ready = !is_case("sms-failure");
+    sms->configured = sms_ready = !is_case("sms-failure") &&
+        !(is_case("sms-resume-failed") && touched_sectors);
+    if (resume_delivery && touched_sectors) {
+        pdu_command(resume_delivery, "+15550101001", "OTA CANCEL", 0);
+        resume_delivery = NULL;
+    }
 }
 static bool start_gps(modem_t *modem)
 {
     assert(at_ready && !ppp_active && modem);
+    if (gps_timeout) {
+        gps_timeout = false;
+        modem_busy = true;
+        return gps_ready = false;
+    }
     return gps_ready = !is_case("gnss-failure");
 }
 
@@ -684,20 +714,27 @@ static esp_err_t esp_http_client_cleanup(host_http_t *client)
     return ESP_OK;
 }
 
+static unsigned maintenance_calls;
+
 static bool cellular_modem_maintenance(modem_t **modem, const char *line, const char *apn)
 {
     (void)modem;
-    (void)line;
     (void)apn;
+    if (!strcmp(line, "modem inspect")) {
+        ++maintenance_calls;
+        return true;
+    }
     return false;
 }
 
 #include "sms_adapters.inc"
 #include "report.inc"
-#include "installer.inc"
+void ota_sms_ack_failed(void);
+bool ota_sms_service_command(const sms_control_t *, modem_t *, const sms_request_t *);
 #define TAG SMS_TAG
 #include "sms_delivery.inc"
 #undef TAG
+#include "installer.inc"
 #include "sms_cases.inc"
 
 int main(int argc, char **argv)
