@@ -11,7 +11,7 @@ sed -n '/^bool sms_number_valid/,/^static void gps_reply/{ /^static void gps_rep
     "$root/main/sms_commands.c" > "$tmp/sms_authorization_under_test.inc"
 sed -n '/^static const char hex\[\]/p;
         /^static bool command_ok/,/^#ifdef CONFIG_ROADHOG_SMS_CONTROL/{ /^#ifdef/!p; }
-        /^static esp_err_t send_reply/,/^#ifdef CONFIG_ROADHOG_SMS_CONTROL/{ /^#ifdef/!p; }' \
+        /^esp_err_t sms_control_send/,/^#ifdef CONFIG_ROADHOG_SMS_CONTROL/{ /^#ifdef/!p; }' \
     "$root/main/sms_control.c" > "$tmp/sms_delivery_under_test.inc"
 sed -n '/^void sms_command_reply/,$p' "$root/main/sms_commands.c" > "$tmp/sms_commands_under_test.inc"
 cc -std=gnu11 -Wall -Wextra -Werror -I "$root/main" -I "$root/tests/provisioning" -I "$tmp" \

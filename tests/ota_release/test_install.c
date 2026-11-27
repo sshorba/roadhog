@@ -1,8 +1,11 @@
 /* Host adapters for the production installer and pinned SDK staging functions. */
 #include <assert.h>
+#include <limits.h>
 #include <curl/curl.h>
 #include <net/if.h>
 #include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/hmac.h>
 #include <openssl/pem.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -15,6 +18,7 @@
 #include <time.h>
 
 #include "ota_manifest.h"
+#include "ota_sms.h"
 
 static char update_report[160];
 
@@ -39,6 +43,8 @@ static void fixture_log(const char *tag, const char *format, ...)
 #define CONFIG_ROADHOG_OTA_RELEASE_BASE "https://github.com/sshorba/roadhog/releases/download"
 #define CONFIG_ROADHOG_OTA_RELEASE_HOSTS "github.com,release-assets.githubusercontent.com,wrong.example"
 #define CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 1
+#define CONFIG_ROADHOG_OTA_SMS_BENCH 1
+#define CONFIG_ROADHOG_OTA_SMS_RELEASE_BASE CONFIG_ROADHOG_OTA_RELEASE_BASE
 #define FIXTURE_APN "fixture.carrier"
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
@@ -48,7 +54,7 @@ enum {
     ESP_ERR_INVALID_RESPONSE, ESP_ERR_INVALID_VERSION, ESP_ERR_INVALID_CRC, ESP_ERR_TIMEOUT,
     ESP_ERR_NO_MEM, ESP_ERR_NOT_FOUND, ESP_ERR_OTA_PARTITION_CONFLICT,
     ESP_ERR_OTA_ROLLBACK_INVALID_STATE, ESP_ERR_OTA_ALREADY_IN_PROGRESS, ESP_ERR_OTA_VALIDATE_FAILED,
-    ESP_ERR_FLASH_OP_FAIL,
+    ESP_ERR_FLASH_OP_FAIL, ESP_ERR_NVS_NOT_FOUND,
 };
 
 static const char *esp_err_to_name(esp_err_t error)
@@ -97,6 +103,9 @@ static const esp_partition_t *running, *inactive, *selected;
 static unsigned touched_sectors, requests, selections, selection_attempts, ended, aborted;
 static bool ppp_active, uart_open, at_ready, sms_ready, gps_ready;
 static const char *scenario;
+static const char *running_version = "1";
+static esp_ota_img_states_t running_state = ESP_OTA_IMG_VALID;
+static int64_t clock_adjustment;
 
 static bool is_case(const char *name)
 {
@@ -116,7 +125,7 @@ static const esp_partition_t *esp_ota_get_next_update_partition(const esp_partit
 static esp_err_t esp_ota_get_state_partition(const esp_partition_t *part, esp_ota_img_states_t *state)
 {
     assert(part == running);
-    *state = ESP_OTA_IMG_VALID;
+    *state = running_state;
     return ESP_OK;
 }
 
@@ -156,7 +165,8 @@ _Static_assert(sizeof(esp_image_header_t) == 24 && sizeof(esp_app_desc_t) == 256
 
 static const esp_app_desc_t *esp_app_get_description(void)
 {
-    static const esp_app_desc_t description = {.version = "1"};
+    static esp_app_desc_t description;
+    strcpy(description.version, running_version);
     return &description;
 }
 
@@ -271,7 +281,7 @@ static esp_err_t esp_ota_set_boot_partition(const esp_partition_t *part)
     assert(!memcmp(flash + part->address, expected, sizeof(expected)));
     assert(!LIST_FIRST(&s_ota_ops_entries_head));
     ++selection_attempts;
-    if (is_case("selection-metadata")) {
+    if (is_case("selection-metadata") || is_case("sms-selection-failed")) {
         return ESP_ERR_FLASH_OP_FAIL;
     }
     ++selections;
@@ -338,12 +348,20 @@ static int mbedtls_pk_get_psa_attributes(mbedtls_pk_context *key, int usage, psa
 }
 static int psa_get_key_type(psa_key_attributes_t *attributes)
 {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
     char group[32];
     return EVP_PKEY_is_a(*attributes, "EC") &&
            EVP_PKEY_get_group_name(*attributes, group, sizeof(group), NULL) == 1 &&
            !strcmp(group, "prime256v1") ? PSA_ECC_FAMILY_SECP_R1 : 0;
+#else
+    if (EVP_PKEY_base_id(*attributes) != EVP_PKEY_EC) {
+        return 0;
+    }
+    const EC_GROUP *group = EC_KEY_get0_group(EVP_PKEY_get0_EC_KEY(*attributes));
+    return EC_GROUP_get_curve_name(group) == NID_X9_62_prime256v1 ? PSA_ECC_FAMILY_SECP_R1 : 0;
+#endif
 }
-static int psa_get_key_bits(psa_key_attributes_t *attributes) { return EVP_PKEY_get_bits(*attributes); }
+static int psa_get_key_bits(psa_key_attributes_t *attributes) { return EVP_PKEY_bits(*attributes); }
 static void psa_reset_key_attributes(psa_key_attributes_t *attributes) { *attributes = NULL; }
 static int mbedtls_pk_verify(mbedtls_pk_context *key, int algorithm, const uint8_t *digest,
                              size_t length, const uint8_t *signature, size_t signature_size)
@@ -364,14 +382,30 @@ typedef struct {
     int port, tx_pin, rx_pin, baud_rate;
     const char *apn;
 } cellular_net_config_t;
-typedef struct { bool configured; } sms_control_t;
+enum { SMS_NUMBER_CAPACITY = 17, SMS_TEXT_CAPACITY = 161, SMS_QUEUE_CAPACITY = 4 };
+typedef struct {
+    char sender[SMS_NUMBER_CAPACITY];
+    char text[SMS_TEXT_CAPACITY];
+} sms_request_t;
+typedef struct {
+    bool configured;
+    const char *owner;
+    unsigned pending_acks, expected_tpdu, request_count, request_head;
+    int64_t tpdu_deadline, resume_at;
+    unsigned pending_nacks, inbox_index;
+    size_t inbox_length;
+    bool delivery_fault, routing_recovery, storage_pending, storage_startup;
+    bool scanning_inbox, inbox_error, inbox_found, inbox_valid;
+    sms_request_t inbox_request;
+    sms_request_t requests[SMS_QUEUE_CAPACITY];
+} sms_control_t;
 typedef esp_err_t (*cellular_operation_t)(esp_netif_t *, void *);
 
 static int64_t esp_timer_get_time(void)
 {
     struct timespec time;
     assert(clock_gettime(CLOCK_MONOTONIC, &time) == 0);
-    return (int64_t)time.tv_sec * 1000000 + time.tv_nsec / 1000;
+    return (int64_t)time.tv_sec * 1000000 + time.tv_nsec / 1000 + clock_adjustment;
 }
 static bool cellular_ppp_is_uplink(esp_netif_t *netif)
 {
@@ -435,9 +469,35 @@ static esp_err_t modem_open(const modem_config_t *config, modem_t **modem)
     return ESP_OK;
 }
 
+static void pdu_command(sms_control_t *sms, const char *sender, const char *text, uint8_t flags);
+static void stored_pdu(sms_control_t *sms, const char *text, unsigned index);
+static sms_control_t *fixture_sms;
+static bool storage_mode, stored_cancel, stored_status, fail_delete;
+static bool routing_reset, wrong_direct_readback;
+static unsigned direct_readbacks, inbox_scans;
+static unsigned storage_modes, stored_deletes;
+bool sms_control_notification(sms_control_t *, const char *);
+static sms_control_t *boundary_delivery;
+static sms_control_t *resume_delivery;
+static bool modem_busy, gps_timeout, late_final;
+
+static bool modem_maintenance_ready(modem_t *modem)
+{
+    assert(modem == &fixture_modem && uart_open && !ppp_active);
+    return !modem_busy;
+}
+
 static esp_err_t modem_poll(modem_t *modem, unsigned timeout_ms)
 {
     assert(modem == &fixture_modem && uart_open && timeout_ms == 250);
+    if (late_final) {
+        modem_busy = false;
+        late_final = false;
+    }
+    if (boundary_delivery) {
+        pdu_command(boundary_delivery, "+15550101001", "OTA CANCEL", 0);
+        boundary_delivery = NULL;
+    }
     return ESP_OK;
 }
 
@@ -446,6 +506,35 @@ static esp_err_t modem_command(modem_t *modem, const char *command, const char *
                                modem_result_t *result)
 {
     assert(modem == &fixture_modem && uart_open && !ppp_active);
+    if (!strcmp(command, "AT+CNMI?")) {
+        assert(response && size >= 32 && !strcmp(prefix, "+CNMI:"));
+        if (!storage_mode) {
+            ++direct_readbacks;
+        }
+        snprintf(response, size, "+CNMI: %s\n", storage_mode && !is_case("sms-cnmi-readback") ?
+                 "0,1,0,0,0" : (routing_reset || wrong_direct_readback) ? "2,0,0,0,0" : "2,2,0,0,0");
+        result->final = MODEM_FINAL_OK;
+        return ESP_OK;
+    }
+    if (!strcmp(command, "AT+CPMS?")) {
+        assert(response && size >= 42 && !strcmp(prefix, "+CPMS:"));
+        unsigned used = is_case("sms-me-full") ? 30U : (unsigned)stored_cancel + stored_status;
+        snprintf(response, size, "+CPMS: \"ME\",%u,30,\"ME\",%u,30,\"ME\",%u,30\n", used, used, used);
+        result->final = MODEM_FINAL_OK;
+        return ESP_OK;
+    }
+    if (!strcmp(command, "AT+CMGL=4")) {
+        assert(!response && !prefix && storage_mode && fixture_sms->scanning_inbox);
+        ++inbox_scans;
+        if (stored_status) {
+            stored_pdu(fixture_sms, "OTA STATUS", 3);
+        }
+        if (stored_cancel) {
+            stored_pdu(fixture_sms, "OTA CANCEL", 4);
+        }
+        result->final = MODEM_FINAL_OK;
+        return ESP_OK;
+    }
     assert(!strcmp(command, "AT") && !prefix && timeout_ms == 2000 && !response && !size);
     if (is_case("at-failure")) {
         return ESP_ERR_TIMEOUT;
@@ -496,14 +585,14 @@ static void vTaskDelete(void *task) { assert(!task); }
 #include "lte_wrapper.inc"
 #undef TAG
 
-static void sms_control_resume(sms_control_t *sms, modem_t *modem)
-{
-    assert(at_ready && !ppp_active && modem);
-    sms->configured = sms_ready = !is_case("sms-failure");
-}
 static bool start_gps(modem_t *modem)
 {
     assert(at_ready && !ppp_active && modem);
+    if (gps_timeout) {
+        gps_timeout = false;
+        modem_busy = true;
+        return gps_ready = false;
+    }
     return gps_ready = !is_case("gnss-failure");
 }
 
@@ -656,15 +745,28 @@ static esp_err_t esp_http_client_cleanup(host_http_t *client)
     return ESP_OK;
 }
 
+static unsigned maintenance_calls;
+
 static bool cellular_modem_maintenance(modem_t **modem, const char *line, const char *apn)
 {
     (void)modem;
-    (void)line;
     (void)apn;
+    if (!strcmp(line, "modem inspect")) {
+        ++maintenance_calls;
+        return true;
+    }
     return false;
 }
 
+#include "sms_adapters.inc"
+#include "report.inc"
+void ota_sms_ack_failed(void);
+bool ota_sms_service_command(const sms_control_t *, modem_t *, const sms_request_t *);
+#define TAG SMS_TAG
+#include "sms_delivery.inc"
+#undef TAG
 #include "installer.inc"
+#include "sms_cases.inc"
 
 int main(int argc, char **argv)
 {
@@ -685,6 +787,16 @@ int main(int argc, char **argv)
     uart_open = true;
     modem_config_t config = {0};
     sms_control_t sms = {.configured = !is_case("factory")};
+    fixture_sms = &sms;
+    if (!strncmp(scenario, "sms-", 4) && !is_case("sms-failure")) {
+        test_sms(&config, &sms);
+        assert(!memcmp(flash, baseline, inactive->address));
+        size_t end = inactive->address + inactive->size;
+        assert(!memcmp(flash + end, baseline + end, sizeof(flash) - end));
+        printf("%s passed\n", scenario);
+        curl_global_cleanup();
+        return 0;
+    }
     bool repeated_check = is_case("dry-run-repeated");
     const char *command = is_case("dry-run") || repeated_check ? "ota check 2" : "ota install powered 2";
     modem_t *result = run_update(&fixture_modem, &config, &sms, command);

@@ -1,6 +1,7 @@
 """Run the production installer with loopback TLS and simulated ESP32 flash."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -26,6 +27,18 @@ CASES = (
     "untrusted-cert", "redirect-http", "redirect-host", "redirect-loop",
     "duplicate-location", "invalid-image", "readback-digest", "link-down", "missing-slot",
     "factory", "missing-apn", "flash-erase", "flash-partial-write", "selection-metadata",
+    "sms-pdu", "sms-success", "sms-cancel", "sms-expiry", "sms-replay", "sms-missing", "sms-invalid",
+    "sms-malformed-pointer", "sms-equal", "sms-older", "sms-changed", "sms-reply-failed",
+    "sms-ack-failed", "sms-journal-failed", "sms-selection-failed", "sms-rollback",
+    "sms-report-failed", "sms-report-commit-failed", "sms-owner-changed", "sms-readback",
+    "sms-incomplete-expiry", "sms-confirm-reply-failed", "sms-queued-expiry", "sms-reboot-replay",
+    "sms-boundary-cancel", "sms-recovery-cancel", "sms-recovery-ack-failed", "sms-quiesce-failed", "sms-resume-failed",
+    "sms-report-busy", "sms-nvs-set-failed", "sms-nvs-erase-failed", "sms-reset-before-selection",
+    "sms-reset-before-send", "sms-latest-redirect", "sms-latest-wrong-cert", "sms-wrong-sequence",
+    "sms-wrong-target", "sms-legacy", "sms-incompatible",
+    "sms-supported-cnmi", "sms-cnmi-readback", "sms-me-full", "sms-stored-cancel", "sms-stored-fifo", "sms-late-cancel",
+    "sms-incomplete-staged", "sms-overflow", "sms-confirm-overflow", "sms-pre-prompt-retry", "sms-no-final",
+    "sms-cancel-delete-late", "sms-status-delete-failed", "sms-cnma-nack-recovery", "sms-cnma-ack-recovery", "sms-truncated-header",
 )
 
 
@@ -53,12 +66,28 @@ def compile_fixture(tmp, sdk):
     # Compile the full modules with host adapters replacing ESP-IDF includes.
     for source, destination, guard in (
         ("ota_update.c", "installer.inc", "CONFIG_ROADHOG_OTA_UPDATE_BENCH"),
+        ("ota_report.c", "report.inc", r"UNUSED_GUARD"),
         ("lte_diagnostic.c", "lte_wrapper.inc", "CONFIG_ROADHOG_LTE_DIAGNOSTIC"),
     ):
         module = (ROOT / "main" / source).read_text()
-        module = re.sub(rf'^#include "[^"]+"\n|^#ifdef {guard}\n|^#endif\n',
-                        "", module, flags=re.M)
+        outer = ("#if defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE) && "
+                 "defined(CONFIG_ROADHOG_SMS_CONTROL)" if source == "ota_report.c"
+                 else f"#ifdef {guard}")
+        module = module.replace(outer + "\n", "", 1)
+        module, closing, tail = module.rpartition("#endif")
+        assert closing and not tail.strip()
+        module = re.sub(r'^#include "[^"]+"\n', "", module, flags=re.M)
         (tmp / destination).write_text(module)
+    sms = (ROOT / "main/sms_control.c").read_text()
+    parser = sms.split("static int nibble(", 1)[1].split("\n#endif", 1)[0]
+    configure = sms[sms.index("static bool cnmi_verified("):sms.index("void sms_control_start(")]
+    configure = configure.rsplit("#endif", 1)[0]
+    resume = sms[sms.index("void sms_control_resume("):sms.index("static void sms_control_delivery_fault(")]
+    delivery = sms[sms.index("static void sms_control_delivery_fault("):]
+    (tmp / "sms_delivery.inc").write_text(
+        "static int nibble(" + parser + "\nvoid sms_control_expire_pdu(sms_control_t *);\n"
+        + configure + resume + delivery
+    )
     (tmp / "key.S").write_text(
         '.section .rodata\n.global _binary_ota_public_pem_start, _binary_ota_public_pem_end\n'
         '_binary_ota_public_pem_start:\n.incbin "release-public.pem"\n.byte 0\n'
@@ -69,7 +98,7 @@ def compile_fixture(tmp, sdk):
     ))
     binary = tmp / "test_install"
     run(*shlex.split(os.environ.get("CC", "cc")), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
-        "-I", str(tmp), "-I", str(ROOT / "main"), ROOT / "main/ota_manifest.c",
+        "-I", str(tmp), "-I", str(ROOT / "main"), ROOT / "main/ota_manifest.c", ROOT / "main/ota_sms.c",
         TESTS / "test_install.c", "key.S", *flags, "-o", binary, cwd=tmp)
     return binary
 
@@ -84,16 +113,44 @@ def make_assets(tmp):
     image[48] = ord("2")
     image[80:87] = b"roadhog"
     binary = tmp / "roadhog-v2.bin"
+    marker = b"ROADHOG-SMS-OTA1\0"
+    notes = "https://github.com/sshorba/roadhog/releases/tag/v2"
     binary.write_bytes(image)
-    run(sys.executable, ROOT / "tools/ota_release_manifest.py", binary, "2",
-        "https://github.com/sshorba/roadhog/releases/tag/v2")
+    publisher = ROOT / "tools/ota_release_manifest.py"
+    legacy = subprocess.run([sys.executable, publisher, "--sms", binary, "2", notes],
+                            capture_output=True)
+    assert legacy.returncode and b"lacks the SMS OTA boot capability marker" in legacy.stderr
+    incompatible = bytes(image)
+    image[288:288 + len(marker)] = marker
+    binary.write_bytes(image)
+    run(sys.executable, publisher, "--sms", binary, "2", notes)
     openssl("genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out",
             tmp / "release-private.pem")
     openssl("pkey", "-in", tmp / "release-private.pem", "-pubout", "-out", tmp / "release-public.pem")
-    openssl("dgst", "-sha256", "-sign", tmp / "release-private.pem", "-out",
-            binary.with_suffix(".sig"), binary.with_suffix(".manifest"))
-    return binary, {suffix: binary.with_suffix("." + suffix).read_bytes()
-                    for suffix in ("bin", "manifest", "sig")}
+    def signed(name, manifest):
+        path = tmp / f"{name}.manifest"
+        path.write_bytes(manifest)
+        signature = tmp / f"{name}.sig"
+        openssl("dgst", "-sha256", "-sign", tmp / "release-private.pem", "-out", signature, path)
+        return {"manifest": manifest, "sig": signature.read_bytes()}
+
+    original = binary.with_suffix(".manifest").read_bytes()
+    assets = {
+        name: signed(name, manifest)
+        for name, manifest in {
+            "original": original,
+            "changed": re.sub(rb"sha256=[0-9a-f]{64}", b"sha256=" + b"a" * 64, original),
+            "sequence": original.replace(b"sequence=2", b"sequence=3"),
+            "target": original.replace(b"esp32s3", b"esp32c3"),
+            "legacy": original.replace(b"roadhog-sms-release-v1", b"roadhog-release-v1"),
+            "incompatible": re.sub(rb"sha256=[0-9a-f]{64}",
+                                   b"sha256=" + hashlib.sha256(incompatible).hexdigest().encode(),
+                                   original),
+        }.items()
+    }
+    for name, release in assets.items():
+        release["bin"] = incompatible if name == "incompatible" else bytes(image)
+    return binary, assets
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -116,9 +173,32 @@ class Handler(BaseHTTPRequestHandler):
         if self.connection.fixture_sni != host:
             self.send_error(421)
             return
+        if (host == "github.com" and self.path == PROJECT.split("/v2/")[0] + "/latest" or
+                host == S3 and self.path == "/latest"):
+            if host == "github.com" and case in ("sms-latest-redirect", "sms-latest-wrong-cert"):
+                redirect_host = S3 if case == "sms-latest-redirect" else "wrong.example"
+                self.redirect(f"https://{redirect_host}/latest")
+                return
+            if case == "sms-missing":
+                self.send_error(404)
+                return
+            variant = {"sms-changed": "changed", "sms-incompatible": "incompatible",
+                       "sms-legacy": "legacy"}.get(case, "original")
+            release = self.server.assets[variant]
+            data = bytes([len(release["sig"])]) + release["sig"] + release["manifest"]
+            if case == "sms-invalid":
+                data = data[:-2] + b"x\n"
+            elif case == "sms-malformed-pointer":
+                data = b"\xff" + data[1:]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if host == "github.com" and self.path.startswith(PROJECT):
             suffix = self.path.removeprefix(PROJECT)
-            if suffix not in self.server.assets:
+            if suffix not in self.server.assets["original"]:
                 self.send_error(404)
                 return
             location = f"https://{S3}{ASSET}{suffix}?sig=fixture%2Bvalue"
@@ -143,7 +223,11 @@ class Handler(BaseHTTPRequestHandler):
         if query != "sig=fixture%2Bvalue":
             self.send_error(400)
             return
-        data = self.server.assets[suffix]
+        variant = {"sms-wrong-sequence": "sequence", "sms-wrong-target": "target",
+                   "sms-incompatible": "incompatible"}.get(case, "original")
+        if not case.startswith("sms-") or case == "sms-failure":
+            variant = "legacy"
+        data = self.server.assets[variant][suffix]
         if case == "http-failure" and suffix == "bin":
             self.send_error(503)
             return

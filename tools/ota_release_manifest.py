@@ -10,6 +10,7 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sms", action="store_true", help="Require the SMS OTA boot capability marker")
     parser.add_argument("image", type=Path)
     parser.add_argument("sequence", type=int)
     parser.add_argument("notes_url")
@@ -36,8 +37,12 @@ def main():
         or descriptor[48:80].split(b"\0", 1)[0] != b"roadhog"
     ):
         parser.error("image header, project or embedded version does not match the release")
+    marker = b"ROADHOG-SMS-OTA1\0"
+    if args.sms and image[288:288 + len(marker)] != marker:
+        parser.error("image lacks the SMS OTA boot capability marker")
+    manifest_type = "roadhog-sms-release-v1" if args.sms else "roadhog-release-v1"
     manifest = (
-        "roadhog-release-v1\n"
+        f"{manifest_type}\n"
         "target=esp32s3-n16r8-ota-ab-v1\n"
         f"sequence={sequence}\n"
         f"size={len(image)}\n"

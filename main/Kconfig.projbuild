@@ -59,6 +59,19 @@ config ROADHOG_OTA_UPDATE_BENCH
     depends on !ROADHOG_OTA_BENCH_BOOT_PEER && !ROADHOG_OTA_BENCH_REJECT_PENDING && ESP_CONSOLE_UART
     default n
 
+config ROADHOG_OTA_SMS_BENCH
+    bool "Enable owner-confirmed OTA over SMS for attended bench testing"
+    depends on ROADHOG_OTA_UPDATE_BENCH
+    default n
+
+config ROADHOG_OTA_SMS_RELEASE_BASE
+    string "HogBarn HTTPS release base URL (without trailing slash)"
+    depends on ROADHOG_OTA_SMS_BENCH
+    default ""
+    help
+        Must be explicitly configured. Add the exact HogBarn hostname to
+        the OTA HTTPS allowlist. SMS uses latest/ and vN/ under this base.
+
 config ROADHOG_MODEM_MAINTENANCE_BENCH
     bool "Enable constrained local SIM7600 maintenance commands"
     depends on ROADHOG_OTA_UPDATE_BENCH && ESP_MAIN_TASK_STACK_SIZE >= 6144

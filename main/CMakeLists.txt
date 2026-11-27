@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "provisioning.c" "setup_button.c" "owner_verification.c" "sim_number.c" "ota_boot_health.c" "sms_control.c" "sms_commands.c" "portal.c" "portal_auth.c" "connection_status.c" "status_led.c" "lte_diagnostic.c" "ota_update.c" "ota_manifest.c" EMBED_TXTFILES "portal/index.html" PRIV_REQUIRES app_update bootloader_support esp_app_format esp_http_client spi_flash modem cellular_net esp_driver_gpio nvs_flash esp_wifi esp_event esp_netif esp_http_server esp_timer lwip mbedtls esp_hw_support esp_driver_rmt)
+idf_component_register(SRCS "main.c" "provisioning.c" "setup_button.c" "owner_verification.c" "sim_number.c" "ota_boot_health.c" "sms_control.c" "sms_commands.c" "portal.c" "portal_auth.c" "connection_status.c" "status_led.c" "lte_diagnostic.c" "ota_update.c" "ota_manifest.c" "ota_sms.c" "ota_report.c" EMBED_TXTFILES "portal/index.html" PRIV_REQUIRES app_update bootloader_support esp_app_format esp_http_client spi_flash modem cellular_net esp_driver_gpio nvs_flash esp_wifi esp_event esp_netif esp_http_server esp_timer lwip mbedtls esp_hw_support esp_driver_rmt)
 
 if(CONFIG_ROADHOG_OTA_UPDATE_BENCH)
     if(NOT IS_ABSOLUTE "${ROADHOG_OTA_PUBLIC_KEY}" OR NOT EXISTS "${ROADHOG_OTA_PUBLIC_KEY}")
@@ -11,4 +11,11 @@ if(CONFIG_ROADHOG_OTA_UPDATE_BENCH)
     endif()
     configure_file("${ROADHOG_OTA_PUBLIC_KEY}" "${CMAKE_CURRENT_BINARY_DIR}/ota_public.pem" COPYONLY)
     target_add_binary_data(${COMPONENT_LIB} "${CMAKE_CURRENT_BINARY_DIR}/ota_public.pem" TEXT)
+endif()
+
+if(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE AND CONFIG_ROADHOG_SMS_CONTROL
+   AND CONFIG_ESPTOOLPY_FLASHSIZE_16MB AND CONFIG_PARTITION_TABLE_CUSTOM
+   AND CONFIG_PARTITION_TABLE_CUSTOM_FILENAME STREQUAL "partitions.ota-16mb.csv")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE ROADHOG_SMS_OTA_DESCRIPTOR)
+    target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--undefined=roadhog_sms_ota_descriptor")
 endif()
