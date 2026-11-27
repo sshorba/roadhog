@@ -26,6 +26,10 @@ CASES = (
     "untrusted-cert", "redirect-http", "redirect-host", "redirect-loop",
     "duplicate-location", "invalid-image", "readback-digest", "link-down", "missing-slot",
     "factory", "missing-apn", "flash-erase", "flash-partial-write", "selection-metadata",
+    "sms-pdu", "sms-success", "sms-cancel", "sms-expiry", "sms-replay", "sms-missing", "sms-invalid",
+    "sms-malformed-pointer", "sms-equal", "sms-older", "sms-changed", "sms-reply-failed",
+    "sms-ack-failed", "sms-journal-failed", "sms-selection-failed", "sms-rollback",
+    "sms-report-failed", "sms-report-commit-failed", "sms-owner-changed", "sms-readback",
 )
 
 
@@ -53,12 +57,22 @@ def compile_fixture(tmp, sdk):
     # Compile the full modules with host adapters replacing ESP-IDF includes.
     for source, destination, guard in (
         ("ota_update.c", "installer.inc", "CONFIG_ROADHOG_OTA_UPDATE_BENCH"),
+        ("ota_report.c", "report.inc", r"UNUSED_GUARD"),
         ("lte_diagnostic.c", "lte_wrapper.inc", "CONFIG_ROADHOG_LTE_DIAGNOSTIC"),
     ):
         module = (ROOT / "main" / source).read_text()
-        module = re.sub(rf'^#include "[^"]+"\n|^#ifdef {guard}\n|^#endif\n',
-                        "", module, flags=re.M)
+        outer = ("#if defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE) && "
+                 "defined(CONFIG_ROADHOG_SMS_CONTROL)" if source == "ota_report.c"
+                 else f"#ifdef {guard}")
+        module = module.replace(outer + "\n", "", 1)
+        module, closing, tail = module.rpartition("#endif")
+        assert closing and not tail.strip()
+        module = re.sub(r'^#include "[^"]+"\n', "", module, flags=re.M)
         (tmp / destination).write_text(module)
+    sms = (ROOT / "main/sms_control.c").read_text()
+    parser = sms.split("static int nibble(", 1)[1].split("\n#endif", 1)[0]
+    delivery = sms[sms.index("bool sms_control_notification("):]
+    (tmp / "sms_delivery.inc").write_text("static int nibble(" + parser + "\n" + delivery)
     (tmp / "key.S").write_text(
         '.section .rodata\n.global _binary_ota_public_pem_start, _binary_ota_public_pem_end\n'
         '_binary_ota_public_pem_start:\n.incbin "release-public.pem"\n.byte 0\n'
@@ -69,7 +83,7 @@ def compile_fixture(tmp, sdk):
     ))
     binary = tmp / "test_install"
     run(*shlex.split(os.environ.get("CC", "cc")), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
-        "-I", str(tmp), "-I", str(ROOT / "main"), ROOT / "main/ota_manifest.c",
+        "-I", str(tmp), "-I", str(ROOT / "main"), ROOT / "main/ota_manifest.c", ROOT / "main/ota_sms.c",
         TESTS / "test_install.c", "key.S", *flags, "-o", binary, cwd=tmp)
     return binary
 
@@ -92,7 +106,19 @@ def make_assets(tmp):
     openssl("pkey", "-in", tmp / "release-private.pem", "-pubout", "-out", tmp / "release-public.pem")
     openssl("dgst", "-sha256", "-sign", tmp / "release-private.pem", "-out",
             binary.with_suffix(".sig"), binary.with_suffix(".manifest"))
-    return binary, {suffix: binary.with_suffix("." + suffix).read_bytes()
+    changed_manifest = tmp / "changed.manifest"
+    changed_manifest.write_bytes(re.sub(rb"sha256=[0-9a-f]{64}", b"sha256=" + b"a" * 64,
+                                        binary.with_suffix(".manifest").read_bytes()))
+    changed_signature = tmp / "changed.sig"
+    openssl("dgst", "-sha256", "-sign", tmp / "release-private.pem", "-out",
+            changed_signature, changed_manifest)
+    signature = binary.with_suffix(".sig").read_bytes()
+    changed_sig = changed_signature.read_bytes()
+    latest = {
+        "original": bytes([len(signature)]) + signature + binary.with_suffix(".manifest").read_bytes(),
+        "changed": bytes([len(changed_sig)]) + changed_sig + changed_manifest.read_bytes(),
+    }
+    return binary, latest, {suffix: binary.with_suffix("." + suffix).read_bytes()
                     for suffix in ("bin", "manifest", "sig")}
 
 
@@ -115,6 +141,21 @@ class Handler(BaseHTTPRequestHandler):
         host = self.headers["Host"]
         if self.connection.fixture_sni != host:
             self.send_error(421)
+            return
+        if host == "github.com" and self.path == PROJECT.split("/v2/")[0] + "/latest":
+            if case == "sms-missing":
+                self.send_error(404)
+                return
+            data = self.server.latest["changed" if case == "sms-changed" else "original"]
+            if case == "sms-invalid":
+                data = data[:-2] + b"x\n"
+            elif case == "sms-malformed-pointer":
+                data = b"\xff" + data[1:]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
             return
         if host == "github.com" and self.path.startswith(PROJECT):
             suffix = self.path.removeprefix(PROJECT)
@@ -181,7 +222,7 @@ def main():
     sdk = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory() as directory:
         tmp = Path(directory)
-        image, assets = make_assets(tmp)
+        image, latest, assets = make_assets(tmp)
         runner = compile_fixture(tmp, sdk)
         ca, key = make_certificate(tmp, "loopback")
         unrelated_ca, _ = make_certificate(tmp, "unrelated")
@@ -195,6 +236,7 @@ def main():
         with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
             server.socket = context.wrap_socket(server.socket, server_side=True)
             server.assets = assets
+            server.latest = latest
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:

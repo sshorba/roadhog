@@ -1,8 +1,11 @@
 /* Host adapters for the production installer and pinned SDK staging functions. */
 #include <assert.h>
+#include <limits.h>
 #include <curl/curl.h>
 #include <net/if.h>
 #include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/hmac.h>
 #include <openssl/pem.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -15,6 +18,7 @@
 #include <time.h>
 
 #include "ota_manifest.h"
+#include "ota_sms.h"
 
 static char update_report[160];
 
@@ -39,6 +43,8 @@ static void fixture_log(const char *tag, const char *format, ...)
 #define CONFIG_ROADHOG_OTA_RELEASE_BASE "https://github.com/sshorba/roadhog/releases/download"
 #define CONFIG_ROADHOG_OTA_RELEASE_HOSTS "github.com,release-assets.githubusercontent.com,wrong.example"
 #define CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 1
+#define CONFIG_ROADHOG_OTA_SMS_BENCH 1
+#define CONFIG_ROADHOG_OTA_SMS_RELEASE_BASE CONFIG_ROADHOG_OTA_RELEASE_BASE
 #define FIXTURE_APN "fixture.carrier"
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
@@ -48,7 +54,7 @@ enum {
     ESP_ERR_INVALID_RESPONSE, ESP_ERR_INVALID_VERSION, ESP_ERR_INVALID_CRC, ESP_ERR_TIMEOUT,
     ESP_ERR_NO_MEM, ESP_ERR_NOT_FOUND, ESP_ERR_OTA_PARTITION_CONFLICT,
     ESP_ERR_OTA_ROLLBACK_INVALID_STATE, ESP_ERR_OTA_ALREADY_IN_PROGRESS, ESP_ERR_OTA_VALIDATE_FAILED,
-    ESP_ERR_FLASH_OP_FAIL,
+    ESP_ERR_FLASH_OP_FAIL, ESP_ERR_NVS_NOT_FOUND,
 };
 
 static const char *esp_err_to_name(esp_err_t error)
@@ -97,6 +103,9 @@ static const esp_partition_t *running, *inactive, *selected;
 static unsigned touched_sectors, requests, selections, selection_attempts, ended, aborted;
 static bool ppp_active, uart_open, at_ready, sms_ready, gps_ready;
 static const char *scenario;
+static const char *running_version = "1";
+static esp_ota_img_states_t running_state = ESP_OTA_IMG_VALID;
+static int64_t clock_adjustment;
 
 static bool is_case(const char *name)
 {
@@ -116,7 +125,7 @@ static const esp_partition_t *esp_ota_get_next_update_partition(const esp_partit
 static esp_err_t esp_ota_get_state_partition(const esp_partition_t *part, esp_ota_img_states_t *state)
 {
     assert(part == running);
-    *state = ESP_OTA_IMG_VALID;
+    *state = running_state;
     return ESP_OK;
 }
 
@@ -156,7 +165,8 @@ _Static_assert(sizeof(esp_image_header_t) == 24 && sizeof(esp_app_desc_t) == 256
 
 static const esp_app_desc_t *esp_app_get_description(void)
 {
-    static const esp_app_desc_t description = {.version = "1"};
+    static esp_app_desc_t description;
+    strcpy(description.version, running_version);
     return &description;
 }
 
@@ -271,7 +281,7 @@ static esp_err_t esp_ota_set_boot_partition(const esp_partition_t *part)
     assert(!memcmp(flash + part->address, expected, sizeof(expected)));
     assert(!LIST_FIRST(&s_ota_ops_entries_head));
     ++selection_attempts;
-    if (is_case("selection-metadata")) {
+    if (is_case("selection-metadata") || is_case("sms-selection-failed")) {
         return ESP_ERR_FLASH_OP_FAIL;
     }
     ++selections;
@@ -338,12 +348,20 @@ static int mbedtls_pk_get_psa_attributes(mbedtls_pk_context *key, int usage, psa
 }
 static int psa_get_key_type(psa_key_attributes_t *attributes)
 {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
     char group[32];
     return EVP_PKEY_is_a(*attributes, "EC") &&
            EVP_PKEY_get_group_name(*attributes, group, sizeof(group), NULL) == 1 &&
            !strcmp(group, "prime256v1") ? PSA_ECC_FAMILY_SECP_R1 : 0;
+#else
+    if (EVP_PKEY_base_id(*attributes) != EVP_PKEY_EC) {
+        return 0;
+    }
+    const EC_GROUP *group = EC_KEY_get0_group(EVP_PKEY_get0_EC_KEY(*attributes));
+    return EC_GROUP_get_curve_name(group) == NID_X9_62_prime256v1 ? PSA_ECC_FAMILY_SECP_R1 : 0;
+#endif
 }
-static int psa_get_key_bits(psa_key_attributes_t *attributes) { return EVP_PKEY_get_bits(*attributes); }
+static int psa_get_key_bits(psa_key_attributes_t *attributes) { return EVP_PKEY_bits(*attributes); }
 static void psa_reset_key_attributes(psa_key_attributes_t *attributes) { *attributes = NULL; }
 static int mbedtls_pk_verify(mbedtls_pk_context *key, int algorithm, const uint8_t *digest,
                              size_t length, const uint8_t *signature, size_t signature_size)
@@ -364,14 +382,24 @@ typedef struct {
     int port, tx_pin, rx_pin, baud_rate;
     const char *apn;
 } cellular_net_config_t;
-typedef struct { bool configured; } sms_control_t;
+enum { SMS_NUMBER_CAPACITY = 17, SMS_TEXT_CAPACITY = 161, SMS_QUEUE_CAPACITY = 4 };
+typedef struct {
+    char sender[SMS_NUMBER_CAPACITY];
+    char text[SMS_TEXT_CAPACITY];
+} sms_request_t;
+typedef struct {
+    bool configured;
+    const char *owner;
+    unsigned pending_acks, expected_tpdu, request_count, request_head;
+    sms_request_t requests[SMS_QUEUE_CAPACITY];
+} sms_control_t;
 typedef esp_err_t (*cellular_operation_t)(esp_netif_t *, void *);
 
 static int64_t esp_timer_get_time(void)
 {
     struct timespec time;
     assert(clock_gettime(CLOCK_MONOTONIC, &time) == 0);
-    return (int64_t)time.tv_sec * 1000000 + time.tv_nsec / 1000;
+    return (int64_t)time.tv_sec * 1000000 + time.tv_nsec / 1000 + clock_adjustment;
 }
 static bool cellular_ppp_is_uplink(esp_netif_t *netif)
 {
@@ -664,7 +692,13 @@ static bool cellular_modem_maintenance(modem_t **modem, const char *line, const 
     return false;
 }
 
+#include "sms_adapters.inc"
+#include "report.inc"
 #include "installer.inc"
+#define TAG SMS_TAG
+#include "sms_delivery.inc"
+#undef TAG
+#include "sms_cases.inc"
 
 int main(int argc, char **argv)
 {
@@ -685,6 +719,15 @@ int main(int argc, char **argv)
     uart_open = true;
     modem_config_t config = {0};
     sms_control_t sms = {.configured = !is_case("factory")};
+    if (!strncmp(scenario, "sms-", 4) && !is_case("sms-failure")) {
+        test_sms(&config, &sms);
+        assert(!memcmp(flash, baseline, inactive->address));
+        size_t end = inactive->address + inactive->size;
+        assert(!memcmp(flash + end, baseline + end, sizeof(flash) - end));
+        printf("%s passed\n", scenario);
+        curl_global_cleanup();
+        return 0;
+    }
     bool repeated_check = is_case("dry-run-repeated");
     const char *command = is_case("dry-run") || repeated_check ? "ota check 2" : "ota install powered 2";
     modem_t *result = run_update(&fixture_modem, &config, &sms, command);

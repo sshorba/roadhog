@@ -28,6 +28,10 @@ authorized sender can request location and the sender list.
 STATUS checks the modem when requested. An active data context indicates a
 modem bearer is up. It does not verify internet reachability or activate data.
 
+Owner-confirmed OTA SMS commands are available in the default-off
+[HogBarn bench configuration](github-releases-ota.md#owner-confirmed-sms-ota-on-hogbarn).
+They use the same provisioned owner number.
+
 ## Bench checks
 
 - From the owner handset, send mixed-case `sTaTuS` with a trailing space,

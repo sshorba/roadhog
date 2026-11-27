@@ -69,8 +69,8 @@ exact case-sensitive hostname allowlist. Bench fixtures can use a restricted
 network endpoint with a certificate in the firmware's trust bundle. Fetches
 follow at most three absolute HTTPS redirects per asset, recheck the allowlist,
 and verify the certificate and hostname/SNI on every hop. HTTPS uses port 443.
-There is no automatic discovery. A future latest-release pointer can identify a
-candidate sequence, which still needs signed-manifest verification.
+The serial flow uses an operator-supplied sequence. The optional owner SMS
+flow discovers a signed HogBarn pointer on request.
 
 ## Trust and rollback
 
@@ -283,3 +283,103 @@ validate those improvements in v2.
   recovery as release gates. The bench console and disposable bench key are
   development tools. A passing private trial alone does not qualify a public
   firmware release.
+
+## Owner-confirmed SMS OTA on HogBarn
+
+Set `CONFIG_ROADHOG_OTA_SMS_BENCH=y` in the attended installer build in addition
+to the serial OTA bench settings above. Set `CONFIG_ROADHOG_OTA_SMS_RELEASE_BASE`
+to the HogBarn HTTPS release directory, including a path and with no trailing
+slash or query string. Add the exact HogBarn hostname and any approved redirect
+hosts to `CONFIG_ROADHOG_OTA_RELEASE_HOSTS`. This leaves the serial release base
+independent. The SMS command path defaults off. A release built with rollback
+and SMS support from this source can report a pending result even with the
+SMS OTA command option off.
+
+Publish the same three signed assets under `<base>/vN/`. Use immutable,
+increasing sequence numbers. Once all three objects are readable at their
+final URLs and the detached signature has been verified, build a single
+`latest` object from the exact versioned manifest and signature. The object
+contains one unsigned byte with the DER signature length (1–72), the DER
+signature, and the canonical signed manifest (1–1024 bytes). For example,
+given the verified release assets in the current directory:
+
+```sh
+python3 - roadhog-v2.manifest roadhog-v2.sig <<'PY'
+from pathlib import Path
+import sys
+
+manifest, signature = (Path(name).read_bytes() for name in sys.argv[1:])
+assert 0 < len(manifest) <= 1024 and 0 < len(signature) <= 72
+Path("latest.new").write_bytes(bytes([len(signature)]) + signature + manifest)
+PY
+```
+
+Atomically replace `<base>/latest` using a single object PUT or a rename on the
+same filesystem. Configure the server and CDN to revalidate the mutable object
+on each request. Readers can see a complete previous or new pointer during
+publication. A stale authentic pointer can still offer a release newer than the
+device. TLS and the signature authenticate content, while freshness depends
+on publication and caching. Future HogForge publishers can use the same assets
+and publish the final `latest` object after promoting a reviewed release.
+Withdrawing the pointer stops new offers. To withdraw a specific offered release,
+also make its versioned manifest or image unavailable, since an existing
+challenge binds the versioned release for up to five minutes.
+
+Only the provisioned owner can use `OTA CHECK`, `OTA CONFIRM <code>`,
+`OTA CANCEL`, and `OTA STATUS`. The modem supplies the originating
+phone number. Spoofing and SIM or handset compromise remain risks.
+`OTA CHECK` fetches signed metadata over LTE and leaves both app slots
+untouched. The response includes the current and candidate sequences and a
+12-character hexadecimal code. The code expires five minutes after issuance
+on the device's monotonic clock and is discarded on reboot. A fresh check
+replaces the previous offer. Confirming consumes the code before installation
+is queued. A failed acknowledgement or reply prevents the queued network
+operation. Cancellation clears the pending offer or a request still queued.
+During PPP, SMS reception and GNSS AT queries pause. Cancellation cannot
+interrupt an active PPP transfer. The versioned signed manifest must match
+the confirmed sequence, target, size and SHA-256 before any image is staged.
+
+The installer commits a pending report in its own NVS namespace before boot
+selection. On reconnect, the boot reporter requires the selected, running
+partition to be VALID and matches the version, slot and exact image digest
+before claiming success. It waits for LTE registration, SMS configuration and
+GNSS service. The message reports LTE registration and SMS readiness. It does
+not perform a second PPP or HTTPS test. If the previous firmware is running
+again, the outcome may be rollback or an interruption before selection.
+Without communication the outcome stays unknown. The record is consumed
+before SMS submission to prevent duplicate submissions across reboots.
+Power loss in that interval, ambiguous modem submission, or carrier delivery
+failure can therefore lose the report. The local console is still available
+for attended diagnostics.
+
+### Attended SMS bench procedure
+
+Follow the [preflight](lte-ota-preflight.md) and obtain separate hardware
+approval before each trial. Keep the approved local recovery path available.
+
+1. Start on the selected, VALID installer with the expected layout, stable
+   ESP32 and modem power, the verified recovery backup, and an owner handset.
+   Check SMS, LTE registration, GNSS, and portal access. Keep any challenge
+   and handset details out of shared logs.
+2. Publish a newer signed fixture on the approved HogBarn bench endpoint.
+   From an additional authorized SMS number, try all four OTA commands and
+   verify they cause no response or update. From the owner handset send
+   `OTA STATUS`, then `OTA CHECK`. Verify the response sequences and that
+   the endpoint served only the pointer. Check that the inactive slot and
+   boot selection are unchanged using the separately approved readback path.
+3. Send `OTA CANCEL`, then confirm with the captured code. Check rejection
+   and no versioned asset requests. Repeat with a new code held for more
+   than five minutes. Exercise missing, invalid, equal, and older pointers.
+4. Send `OTA CHECK` again and confirm the fresh code during the maintenance
+   window. Check that the confirmation reply precedes versioned requests.
+   Confirm the automatic reboot follows staged image validation and modem
+   recovery. Verify the candidate reaches VALID, the success SMS arrives
+   once, and provisioning, SMS, GNSS, the portal, and local diagnostics work.
+   Replay the old confirmation and check that no update begins.
+5. On separate trials, replace the versioned signed manifest after discovery
+   and interrupt the network during download. Verify that the prior VALID
+   slot remains selected and SMS recovers when command mode returns. For a
+   forced rollback trial, use a separately signed candidate with the
+   existing forced-reject bench option. Check the original slot returns
+   as VALID and the owner receives an unsuccessful update report once
+   communication returns. Record what happened on the modem and device.

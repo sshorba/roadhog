@@ -8,6 +8,7 @@
 #include "lte_diagnostic.h"
 #include "modem.h"
 #include "ota_boot_health.h"
+#include "ota_report.h"
 #include "ota_update.h"
 #include "portal.h"
 #include "provisioning.h"
@@ -64,6 +65,9 @@ static void cache_sim_number(modem_t *modem)
 void app_main(void)
 {
     static sms_control_t sms;
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+    ota_sms_init();
+#endif
     esp_err_t led_error = status_led_start();
     if (led_error != ESP_OK) {
         ESP_LOGW(TAG, "Status LED unavailable: %s", esp_err_to_name(led_error));
@@ -178,6 +182,11 @@ void app_main(void)
             } else {
                 ESP_LOGW(TAG, "LTE diagnostic skipped at deadline: %s", lte_label(lte));
             }
+        }
+#endif
+#if defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE) && defined(CONFIG_ROADHOG_SMS_CONTROL)
+        if (csq_answered && gps != GPS_UNAVAILABLE && (lte == LTE_HOME || lte == LTE_ROAMING)) {
+            ota_sms_report_boot(&sms, modem);
         }
 #endif
 #ifdef CONFIG_ROADHOG_OTA_UPDATE_BENCH

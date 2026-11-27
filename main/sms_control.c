@@ -1,4 +1,5 @@
 #include "sms_control.h"
+#include "ota_update.h"
 #include "sms_commands.h"
 #include "provisioning.h"
 #include "owner_verification.h"
@@ -105,8 +106,11 @@ static bool decode_request(const uint8_t *pdu, size_t length, size_t tpdu_length
 
 #endif
 
-static esp_err_t send_reply(modem_t *modem, const char *number, const char *message)
+esp_err_t sms_control_send(modem_t *modem, const char *number, const char *message)
 {
+    if (!sms_number_valid(number) || strlen(message) >= SMS_TEXT_CAPACITY) {
+        return ESP_ERR_INVALID_ARG;
+    }
     const char *digits = number + 1;
     size_t digit_count = strlen(digits);
     size_t length = strlen(message);
@@ -150,7 +154,7 @@ void sms_owner_verification_service(modem_t *modem)
     char message[48];
     snprintf(message, sizeof(message), "Road Hog owner verification code: %s", request.code);
     bool accepted = command_ok(modem, "ATE0") && command_ok(modem, "AT+CMGF=0") &&
-                    send_reply(modem, request.owner, message) == ESP_OK;
+                    sms_control_send(modem, request.owner, message) == ESP_OK;
     owner_verification_finish(accepted);
     mbedtls_platform_zeroize(&request, sizeof(request));
     mbedtls_platform_zeroize(message, sizeof(message));
@@ -271,6 +275,9 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
         if (!command_ok(modem, "AT+CNMA")) {
             ESP_LOGW(TAG, "SMS acknowledgement failed");
             sms->request_count = 0;
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+            ota_sms_ack_failed();
+#endif
             return;
         }
     }
@@ -279,9 +286,14 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
         sms->request_head = (sms->request_head + 1) % SMS_QUEUE_CAPACITY;
         sms->request_count--;
         if (sms_sender_allowed(sms, request.sender)) {
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+            if (ota_sms_service_command(sms, modem, &request)) {
+                return;
+            }
+#endif
             char reply[SMS_TEXT_CAPACITY];
             sms_command_reply(sms, modem, &request, reply);
-            if (send_reply(modem, request.sender, reply) == ESP_OK) {
+            if (sms_control_send(modem, request.sender, reply) == ESP_OK) {
                 ESP_LOGI(TAG, "SMS reply accepted by modem");
             } else {
                 ESP_LOGW(TAG, "SMS reply failed");

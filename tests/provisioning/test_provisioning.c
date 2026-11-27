@@ -224,6 +224,8 @@ static esp_err_t modem_submit_sms(modem_t *modem, unsigned length, const char *t
     return modem->reject_sms ? ESP_FAIL : ESP_OK;
 }
 
+enum { SMS_TEXT_CAPACITY = 161 };
+bool sms_number_valid(const char *number);
 #include "sms_delivery_under_test.inc"
 
 static owner_verify_message_t deliver(const char *owner, bool accepted)
@@ -249,7 +251,7 @@ static void users_unlock(void) {}
 
 #include "sms_authorization_under_test.inc"
 
-enum { SMS_TEXT_CAPACITY = 161, PORTAL_SSID_CAPACITY = sizeof("ROADHOG-FFFF") };
+enum { PORTAL_SSID_CAPACITY = sizeof("ROADHOG-FFFF") };
 typedef struct { char sender[SMS_NUMBER_CAPACITY], text[SMS_TEXT_CAPACITY]; } sms_request_t;
 static const char *const unknown = "Unknown command";
 static bool ap_running;
