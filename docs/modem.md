@@ -101,32 +101,64 @@ The modem firmware revision and carrier were unrecorded.
 
 ## Automatic SIM7600 recovery
 
-Local startup does not wait for the modem. UART0 diagnostics, status LEDs
-and the setup portal start first. The application task is the only AT UART
-owner. It waits, initializes, goes online, or recovers with a five-second
-pause between failed attempts. The online check uses command responses and
-GNSS engine state. LTE searching, denied registration, or lack of a GNSS fix
-does not by itself restart the AT session. The portal shows unknown LTE and
-unavailable GNSS while recovering. UART1 is released on a fault and reopened
-only after any PPP worker has finished its cleanup.
+UART0 diagnostics, status LEDs and the setup portal start before modem
+initialization. The application task is the only AT UART owner. It attempts
+one prompt reopen after losing an online modem and pauses five seconds between
+failed attempts. A failed LTE registration or a missing GNSS fix does not
+restart an otherwise responsive AT session. A GNSS query error is reported as
+unavailable and retried on the next sample. A confirmed stopped engine is
+restarted in place. The owner gives a late AT final a bounded chance to
+arrive before reconnecting, while the AT transaction guard stays active.
 
-Recovery discards RAM-only direct SMS deliveries and acknowledgements from
-the old UART session. It keeps provisioned authorization and reconfigures
-PDU mode, SMS routing and GNSS on the new session. Carrier registration and
-the reported data context are sampled again. The existing LTE session
-code still owns temporary PPP contexts. If SMS OTA support is present,
-recovery cancels pending challenges and preselection work, rechecks direct
-routing, and resumes the existing ME inbox handling. The durable boot report
-remains governed by its existing submission rules.
+Reopening UART1 retains the outstanding transaction boundary. The application
+waits for its final or a SIM7600 reboot indication before sending startup
+probes. A delayed SMS prompt is canceled with ESC and the cancellation final
+must arrive before normal commands resume. If the final, prompt or reboot
+indication is lost, the application keeps the UART open when possible and
+waits for positive evidence on later attempts. A timer alone cannot clear the
+boundary. In that case SMS and GNSS remain unavailable while local services
+continue. A PPP worker that outlives its waiter retains ownership until it
+signals completion after cleanup.
 
-A pending OTA image has 90 seconds from application startup to complete
-the existing portal, AT, SMS and GNSS health checks. The deadline is checked
-between bounded initialization attempts and before accepting success. If an
-attempt is in flight at the deadline, the decision follows that attempt and
-late success cannot mark the image valid. Missing the deadline uses the
-existing rollback path. If the SDK cannot roll back, the image remains pending
-and modem retries continue. Factory or already validated firmware retries
-without a deadline.
+A genuine disconnect clears RAM-only SMS deliveries and acknowledgements.
+Recovery reuses the authorization store and configures PDU mode, SMS routing
+and GNSS on the recovered session. Portal bindings remain stable across retries.
+Carrier registration and the data context are sampled again. The LTE session
+code owns temporary PPP contexts.
+
+A pending OTA image has 90 seconds from application startup to complete the
+portal, AT, SMS and GNSS checks. An initialization attempt already in progress
+can finish after the deadline, but its success cannot validate the image.
+Boot-state errors are retried even if the modem is unavailable. Metadata
+errors get up to three attempts, at least a second apart, with a fresh
+rejection budget at the deadline. A successful write is read back before
+completing validation or rebooting for rollback. If metadata remains
+unreadable or no rollback target can be verified, local recovery continues
+with PPP and OTA blocked. No automatic reboot is scheduled in that state.
+
+### Integrating the separate SMS OTA branch
+
+When integrating PR #20, reconcile the overlapping application loop, SMS
+control, component registration and modem/OTA fixture changes together.
+
+1. Keep `sms_control_service` running when direct routing is temporarily
+   disabled and `resume_at` is set. Allow its in-place CNMA recovery to run
+   after the AT boundary clears. Gate PPP, the boot reporter and OTA polling
+   on restored routing and ME reconciliation. Escalate to a full disconnect
+   only if the AT transport cannot re-establish its boundary.
+2. On an actual reconnect, clear transient delivery and scan state, cancel
+   the pending SMS OTA challenge or staged selection, and re-establish and
+   verify direct CNMI routing. Reconcile the ME inbox with the existing
+   consume-before-dispatch rule. Keep the authorization store and durable
+   boot-report journal.
+3. After PPP returns, restart at the top of the service loop so registration,
+   GNSS, SMS routing and boot health are sampled on the returned UART before
+   attempting the boot reporter.
+
+Combined regression cases should inject a late CNMA final during in-place
+routing recovery, a stored cancellation across a genuine reconnect, and a
+PPP handoff followed by a fresh boot-reporter iteration. Assert no stale OTA
+selection, duplicate dispatch or journal consumption before the fresh checks.
 
 ### Attended verification
 

@@ -46,6 +46,9 @@ esp_err_t modem_sync_startup(modem_t *modem);
 void modem_watch_restart(modem_t *modem);
 
 esp_err_t modem_poll(modem_t *modem, uint32_t duration_ms);
+// True while a reopened UART awaits the old operation's boundary.
+bool modem_reconnect_pending(const modem_t *modem);
+
 // Only the current UART owner may call this. Flushes no outstanding work.
 bool modem_maintenance_ready(modem_t *modem);
 

@@ -17,7 +17,8 @@ static size_t users_length;
 static bool users_set_error, users_commit_error;
 static bool config_exists, legacy_sms, legacy_admin;
 static bool init_error, read_error, set_error, commit_error;
-static unsigned writes;
+static unsigned writes, user_store_opens;
+static void (*during_users_commit)(void);
 static uint8_t entropy;
 
 static esp_err_t nvs_flash_init(void) { return init_error ? ESP_FAIL : ESP_OK; }
@@ -40,6 +41,7 @@ static esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle)
         return config_exists ? ESP_OK : ESP_ERR_NVS_NOT_FOUND;
     }
     if (!strcmp(name, "sms") && mode == NVS_READWRITE) {
+        ++user_store_opens;
         *handle = 3;
         return ESP_OK;
     }
@@ -105,6 +107,9 @@ static esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *
 static esp_err_t nvs_commit(nvs_handle_t handle)
 {
     if (handle == 3) {
+        if (during_users_commit) {
+            during_users_commit();
+        }
         return users_commit_error ? ESP_FAIL : ESP_OK;
     }
     assert(handle == 1);
@@ -241,13 +246,51 @@ typedef struct {
     const char *owner;
     char users[SMS_USER_LIMIT][SMS_NUMBER_CAPACITY];
     nvs_handle_t users_store;
+    bool configured;
 } sms_control_t;
 
 static bool users_lock_ok = true;
-static bool users_lock(void) { return users_lock_ok; }
-static void users_unlock(void) {}
+static bool users_locked;
+static bool users_lock(void)
+{
+    assert(!users_locked);
+    return users_locked = users_lock_ok;
+}
+static void users_unlock(void)
+{
+    assert(users_locked);
+    users_locked = false;
+}
+
+static void sms_users_lock_init(void) {}
+static void configure_sms(sms_control_t *sms, modem_t *modem)
+{
+    sms->configured = modem && !modem->reject_command;
+}
 
 #include "sms_authorization_under_test.inc"
+
+#define CONFIG_ROADHOG_SMS_CONTROL 1
+#define ESP_LOGE(tag, message) ((void)(message))
+#define ESP_LOGI(tag, message) ((void)(message))
+#include "sms_start_under_test.inc"
+#undef ESP_LOGI
+#undef ESP_LOGE
+
+static sms_control_t *recovering_sms;
+
+static void recover_during_portal_edit(void)
+{
+    assert(users_locked);
+    modem_t modem = {0};
+    unsigned before = user_store_opens;
+    nvs_handle_t handle = recovering_sms->users_store;
+    recovering_sms->configured = false;
+    sms_control_start(recovering_sms, &modem);
+    assert(recovering_sms->configured && recovering_sms->users_store == handle);
+    assert(user_store_opens == before && users_locked);
+}
+
 
 enum { SMS_TEXT_CAPACITY = 161, PORTAL_SSID_CAPACITY = sizeof("ROADHOG-FFFF") };
 typedef struct { char sender[SMS_NUMBER_CAPACITY], text[SMS_TEXT_CAPACITY]; } sms_request_t;
@@ -370,7 +413,12 @@ static void test_portal_sms_users(void)
     assert(!strcmp(sms_users_request(&sms, true, "remove", "+1234"), "Owner is permanent"));
     assert(writes == before && sms_sender_allowed(&sms, "+1234"));
 
+    recovering_sms = &sms;
+    during_users_commit = recover_during_portal_edit;
     assert(!strcmp(sms_users_request(&sms, true, "add", "+1999"), "User added"));
+    during_users_commit = NULL;
+    recovering_sms = NULL;
+    assert(!users_locked && sms_sender_allowed(&sms, "+1234"));
     assert(sms_sender_allowed(&sms, "+1999"));
     assert(!strcmp(sms_users_request(&sms, true, "add", "+1999"), "User already authorized"));
     char json[512];

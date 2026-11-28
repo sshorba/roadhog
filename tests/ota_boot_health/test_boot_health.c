@@ -70,7 +70,7 @@ esp_err_t esp_ota_mark_app_valid_cancel_rollback(void)
     return mark_status;
 }
 
-esp_err_t esp_ota_mark_app_invalid_rollback_and_reboot(void)
+esp_err_t esp_ota_mark_app_invalid_rollback(void)
 {
     rollbacks++;
     return ESP_FAIL;
@@ -91,7 +91,7 @@ void esp_restart(void)
 int main(void)
 {
     reset_fixture();
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
 #if !defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)
     assert(reads == 0 && marks == 0 && rollbacks == 0);
     return 0;
@@ -102,54 +102,54 @@ int main(void)
 #endif
 
     reset_fixture();
-    ota_boot_health_finish(false);
+    ota_boot_health_finish(false, true);
     assert(marks == 0 && rollbacks == 1);
 
     reset_fixture();
     fallback = false;
-    ota_boot_health_finish(false);
+    assert(ota_boot_health_finish(false, true) == OTA_HEALTH_RETRY);
     assert(marks == 0 && rollbacks == 0);
 
     reset_fixture();
     running = &slot_a;
     running_state = ESP_OTA_IMG_VALID;
-    ota_boot_health_finish(false);
+    ota_boot_health_finish(false, true);
     assert(marks == 0 && rollbacks == 0 && selections == 0);
 
     reset_fixture();
     running_status = ESP_ERR_NOT_SUPPORTED;
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
     assert(marks == 0 && rollbacks == 0 && selections == 0);
 
     reset_fixture();
     running_status = ESP_FAIL;
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
     assert(marks == 0 && rollbacks == 0 && selections == 0);
 
 #if defined(CONFIG_ROADHOG_OTA_BENCH_BOOT_PEER)
     reset_fixture();
     running = &slot_a;
     mark_status = ESP_FAIL;
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
     assert(marks == 1 && selections == 0 && restarts == 0);
 
     reset_fixture();
     running = &slot_a;
     running_state = ESP_OTA_IMG_VALID;
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
     assert(marks == 0 && selections == 1 && restarts == 1);
 
     reset_fixture();
     running = &slot_a;
     running_status = ESP_ERR_NOT_FOUND;
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
     assert(marks == 0 && selections == 0 && restarts == 0);
 
     reset_fixture();
     running = &slot_a;
     running_state = ESP_OTA_IMG_VALID;
     selected_override = &slot_b;
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
     assert(selections == 0 && restarts == 0);
 
     // Returning to A after B was invalidated must not select B again.
@@ -157,14 +157,14 @@ int main(void)
     running = &slot_a;
     running_state = ESP_OTA_IMG_VALID;
     peer_status = ESP_OK;
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
     assert(selections == 0 && restarts == 0);
 
     reset_fixture();
     running = &slot_a;
     running_state = ESP_OTA_IMG_VALID;
     select_status = ESP_FAIL;
-    ota_boot_health_finish(true);
+    ota_boot_health_finish(true, false);
     assert(selections == 1 && restarts == 0);
 #endif
 }

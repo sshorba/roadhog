@@ -185,11 +185,7 @@ void sms_control_start(sms_control_t *sms, modem_t *modem)
     }
     configure_sms(sms, modem);
     if (sms->configured) {
-        unsigned users = 0;
-        for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
-            users += sms->users[i][0] != '\0';
-        }
-        ESP_LOGI(TAG, "SMS commands enabled; loaded %u additional users", users);
+        ESP_LOGI(TAG, "SMS commands enabled");
     } else {
         ESP_LOGE(TAG, "SMS setup failed");
     }

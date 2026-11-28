@@ -431,10 +431,13 @@ static void modem_close(modem_t *modem)
     uart_open = false;
 }
 
+static bool simulated_recovery_allowed;
+
 static esp_err_t modem_open(const modem_config_t *config, modem_t **modem)
 {
     assert(config && !uart_open && !ppp_active);
-    assert(!is_case("pdp-cleanup-failure") && !is_case("session-timeout"));
+    assert(!is_case("pdp-cleanup-failure"));
+    assert(!is_case("session-timeout") || simulated_recovery_allowed);
     if (is_case("uart-reopen-failure")) {
         return ESP_FAIL;
     }
@@ -483,9 +486,14 @@ static SemaphoreHandle_t xSemaphoreCreateBinaryStatic(StaticSemaphore_t *storage
 static void xSemaphoreGive(SemaphoreHandle_t done) { *done = true; }
 static int xSemaphoreTake(SemaphoreHandle_t done, unsigned timeout_ms)
 {
-    assert(*done && timeout_ms == 480000);
-    return !is_case("session-timeout");
+    assert(timeout_ms == 0 || timeout_ms == 480000);
+    bool completed = *done;
+    *done = false;
+    return completed ? pdTRUE : 0;
 }
+
+static void (*delayed_worker)(void *);
+static void *delayed_worker_context;
 
 static int xTaskCreate(void (*worker)(void *), const char *name, unsigned stack_size,
                        void *context, unsigned priority, void *handle)
@@ -495,7 +503,12 @@ static int xTaskCreate(void (*worker)(void *), const char *name, unsigned stack_
     if (is_case("task-allocation-failure")) {
         return 0;
     }
-    worker(context);
+    if (is_case("session-timeout")) {
+        delayed_worker = worker;
+        delayed_worker_context = context;
+    } else {
+        worker(context);
+    }
     return pdPASS;
 }
 static unsigned uxTaskGetStackHighWaterMark(void *task)
@@ -703,6 +716,21 @@ int main(int argc, char **argv)
     bool repeated_check = is_case("dry-run-repeated");
     const char *command = is_case("dry-run") || repeated_check ? "ota check 2" : "ota install powered 2";
     modem_t *result = run_update(&fixture_modem, &config, &sms, command);
+    if (is_case("session-timeout")) {
+        assert(!result && delayed_worker && !uart_open);
+        // Model repeated application recovery iterations while the worker is
+        // held past the caller's deadline.
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            assert(lte_session_owns_uart());
+            assert(!requests && selected == running);
+        }
+        delayed_worker(delayed_worker_context);
+        assert(!lte_session_owns_uart() && !ppp_active && !uart_open);
+        simulated_recovery_allowed = true;
+        modem_t *recovered = NULL;
+        assert(modem_open(&config, &recovered) == ESP_OK);
+        modem_close(recovered);
+    }
     if (repeated_check) {
         assert(result == &fixture_modem && selected == running && touched_sectors == 0);
         assert(at_ready && sms_ready && gps_ready && requests == 4);

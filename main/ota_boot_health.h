@@ -2,7 +2,13 @@
 
 #include <stdbool.h>
 
-bool ota_boot_health_pending(void);
+typedef enum {
+    OTA_HEALTH_WAITING,
+    OTA_HEALTH_RETRY,
+    OTA_HEALTH_COMPLETE,
+    OTA_HEALTH_ROLLBACK,
+} ota_health_result_t;
 
-// Call once after essential startup checks pass or their deadline expires.
-void ota_boot_health_finish(bool healthy);
+// Resolve boot health against persistent metadata. After the deadline a
+// pending candidate can only be rejected, even if initialization now succeeds.
+ota_health_result_t ota_boot_health_finish(bool healthy, bool expired);

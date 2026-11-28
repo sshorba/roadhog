@@ -82,9 +82,18 @@ static bool sms_ready(const sms_control_t *sms)
 #endif
 }
 
+static void check_boot_health(modem_lifecycle_t *lifecycle, int64_t now, bool healthy)
+{
+    bool previously_blocked = lifecycle->health_blocked;
+    modem_lifecycle_check_health(lifecycle, now, healthy);
+    if (!previously_blocked && lifecycle->health_blocked) {
+        ESP_LOGE(TAG, "OTA health unresolved; PPP and OTA are blocked");
+    }
+}
+
 static bool initialize_modem(const modem_config_t *config, modem_t **modem, sms_control_t *sms)
 {
-    esp_err_t error = modem_open(config, modem);
+    esp_err_t error = *modem ? ESP_OK : modem_open(config, modem);
     if (error == ESP_OK) {
         error = modem_poll(*modem, 1000);
     }
@@ -105,14 +114,49 @@ static bool initialize_modem(const modem_config_t *config, modem_t **modem, sms_
 
 static void modem_disconnected(modem_lifecycle_t *lifecycle, modem_t **modem, sms_control_t *sms)
 {
+    bool was_online = lifecycle->phase == MODEM_ONLINE;
     modem_close(*modem);
     *modem = NULL;
     sms_control_disconnect(sms);
     status_led_set_connections(false, false, false);
     portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
     portal_set_sim_number("");
-    modem_lifecycle_result(lifecycle, false, now_ms());
-    ESP_LOGW(TAG, "Modem offline; retrying in %u seconds", MODEM_RETRY_MS / 1000);
+    int64_t now = now_ms();
+    modem_lifecycle_result(lifecycle, false, now);
+    if (was_online) {
+        // Reattach promptly to catch the modem's next startup indication.
+        lifecycle->retry_at = now;
+        ESP_LOGW(TAG, "Modem offline; reconnecting UART");
+    } else {
+        ESP_LOGW(TAG, "Modem offline; retrying in %u seconds", MODEM_RETRY_MS / 1000);
+    }
+}
+
+static bool wait_for_at_boundary(modem_t *modem)
+{
+    return modem_maintenance_ready(modem) ||
+           (modem_poll(modem, 1000) == ESP_OK && modem_maintenance_ready(modem));
+}
+
+static bool sample_modem_status(modem_t *modem, lte_status_t *lte, gps_status_t *gps,
+                                const char **data, bool *gps_running)
+{
+    gps_session_t session = gps_session_state(modem);
+    *gps_running = session == GPS_SESSION_RUNNING ||
+                   (session == GPS_SESSION_STOPPED && start_gps(modem));
+    if (!wait_for_at_boundary(modem)) {
+        return false;
+    }
+
+    probe(modem, "AT+CPIN?", "+CPIN:");
+    *lte = read_lte_registration(modem);
+    *data = lte_data_context(modem);
+    gps_fix_t fix;
+    *gps = *gps_running ? read_gps(modem, &fix) : GPS_UNAVAILABLE;
+    if (!wait_for_at_boundary(modem)) {
+        return false;
+    }
+    return probe(modem, "AT+CSQ", "+CSQ:") != MODEM_FINAL_NONE && wait_for_at_boundary(modem);
 }
 
 void app_main(void)
@@ -121,9 +165,8 @@ void app_main(void)
 #ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
     ota_sms_init();
 #endif
-    const bool pending_image = ota_boot_health_pending();
     modem_lifecycle_t lifecycle = {
-        .health_deadline = pending_image ? now_ms() + MODEM_BOOT_HEALTH_MS : INT64_MAX,
+        .health_deadline = now_ms() + MODEM_BOOT_HEALTH_MS,
     };
     esp_err_t led_error = status_led_start();
     if (led_error != ESP_OK) {
@@ -162,8 +205,8 @@ void app_main(void)
 
     for (;;) {
         int64_t now = now_ms();
-        if (modem_lifecycle_finish_health(&lifecycle, now, false)) {
-            ota_boot_health_finish(false);
+        if (lifecycle.phase != MODEM_ONLINE || now >= lifecycle.health_deadline) {
+            check_boot_health(&lifecycle, now, false);
         }
         if (lifecycle.phase != MODEM_ONLINE) {
 #ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
@@ -181,12 +224,15 @@ void app_main(void)
                 portal_bind_sms(&sms);
             }
             now = now_ms();
-            if (modem_lifecycle_finish_health(&lifecycle, now, online)) {
-                ota_boot_health_finish(online && now < lifecycle.health_deadline &&
-                                       portal_error == ESP_OK);
-            }
+            check_boot_health(&lifecycle, now, online && portal_error == ESP_OK);
             if (!online) {
-                modem_disconnected(&lifecycle, &modem, &sms);
+                if (modem_reconnect_pending(modem)) {
+                    // Keep listening across backoff so a late final or RDY is
+                    // not lost while the UART driver is absent.
+                    modem_lifecycle_result(&lifecycle, false, now);
+                } else {
+                    modem_disconnected(&lifecycle, &modem, &sms);
+                }
                 continue;
             }
             modem_lifecycle_result(&lifecycle, true, now);
@@ -194,22 +240,16 @@ void app_main(void)
             cache_sim_number(modem);
         }
 
-        // Use an AT reply independent of LTE registration, and detect a
-        // silent reset that cleared GPS even if its boot URC was missed.
-        if (!sms_ready(&sms) || !gps_session_running(modem)) {
+        lte_status_t lte;
+        gps_status_t gps;
+        const char *data;
+        bool gps_running;
+        if (!sample_modem_status(modem, &lte, &gps, &data, &gps_running)) {
             modem_disconnected(&lifecycle, &modem, &sms);
             continue;
         }
-        probe(modem, "AT+CPIN?", "+CPIN:");
-        lte_status_t lte = read_lte_registration(modem);
-        const char *data = lte_data_context(modem);
-        gps_fix_t fix;
-        gps_status_t gps = read_gps(modem, &fix);
-        bool csq_answered = probe(modem, "AT+CSQ", "+CSQ:") != MODEM_FINAL_NONE;
-        if (!csq_answered || !modem_maintenance_ready(modem)) {
-            modem_disconnected(&lifecycle, &modem, &sms);
-            continue;
-        }
+        check_boot_health(&lifecycle, now_ms(),
+                          gps_running && sms_ready(&sms) && portal_error == ESP_OK);
         portal_set_status(lte, data, gps);
         ESP_LOGI(TAG, "LTE: %s, data context: %s, GPS: %s",
                  lte_label(lte), data, gps_label(gps));
@@ -220,12 +260,12 @@ void app_main(void)
         if (provisioning_state() == PROVISION_FACTORY && (lte == LTE_HOME || lte == LTE_ROAMING)) {
             sms_owner_verification_service(modem);
         }
-        if (!sms_ready(&sms) || !modem_maintenance_ready(modem)) {
+        if (!wait_for_at_boundary(modem) || !sms_ready(&sms)) {
             modem_disconnected(&lifecycle, &modem, &sms);
             continue;
         }
 #if defined(CONFIG_ROADHOG_LTE_DIAGNOSTIC) && !defined(CONFIG_ROADHOG_OTA_UPDATE_BENCH)
-        if (diagnostic_pending && esp_timer_get_time() >= diagnostic_at) {
+        if (lifecycle.health_finished && diagnostic_pending && esp_timer_get_time() >= diagnostic_at) {
             diagnostic_pending = false;
             if (lte == LTE_HOME || lte == LTE_ROAMING) {
                 ESP_LOGI(TAG, "LTE registration confirmed: %s", lte_label(lte));
@@ -245,7 +285,8 @@ void app_main(void)
         }
 #endif
 #if defined(ROADHOG_SMS_OTA_DESCRIPTOR) || defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
-        if (gps != GPS_UNAVAILABLE && (lte == LTE_HOME || lte == LTE_ROAMING)) {
+        if (lifecycle.health_finished && gps != GPS_UNAVAILABLE &&
+            (lte == LTE_HOME || lte == LTE_ROAMING)) {
             ota_sms_report_boot(&sms, modem);
             if (!modem_maintenance_ready(modem)) {
                 modem_disconnected(&lifecycle, &modem, &sms);
@@ -254,7 +295,7 @@ void app_main(void)
         }
 #endif
 #ifdef CONFIG_ROADHOG_OTA_UPDATE_BENCH
-        if (network_error == ESP_OK) {
+        if (lifecycle.health_finished && network_error == ESP_OK) {
             modem = ota_update_poll(modem, &config, &sms);
             if (!modem) {
                 modem_disconnected(&lifecycle, &modem, &sms);
