@@ -45,8 +45,9 @@ static bool bootloader_write_fails;
 static bool metadata_erase_fails, metadata_write_fails;
 static unsigned restarts;
 
-void selector_finish(bool healthy);
-void reject_finish(bool healthy);
+#include "ota_boot_health.h"
+ota_health_result_t selector_finish(bool healthy, bool expired);
+ota_health_result_t reject_finish(bool healthy, bool expired);
 
 const esp_partition_t *esp_ota_get_running_partition(void)
 {
@@ -187,7 +188,7 @@ int main(void)
     bootloader_write_fails = true;
     boot_slot(slot_a);
     assert(esp_ota_get_state_partition(running, &state) == ESP_ERR_NOT_FOUND);
-    selector_finish(true);
+    selector_finish(true, false);
     assert(restarts == 0);
     assert(esp_ota_get_state_partition(&apps[slot_b], &state) == ESP_ERR_NOT_FOUND);
 
@@ -195,7 +196,7 @@ int main(void)
     boot_slot(slot_a);
     expect_state(slot_a, ESP_OTA_IMG_VALID);
     assert(esp_ota_get_boot_partition() == running);
-    selector_finish(false);
+    selector_finish(false, false);
     assert(restarts == 0);
 
     uint8_t before[sizeof(sectors)];
@@ -215,7 +216,7 @@ int main(void)
     expect_state(slot_a, ESP_OTA_IMG_VALID);
     metadata_write_fails = false;
 
-    selector_finish(true);
+    selector_finish(true, false);
     assert(restarts == 1);
     expect_state(slot_a, ESP_OTA_IMG_VALID);
     expect_state(slot_b, ESP_OTA_IMG_NEW);
@@ -223,13 +224,13 @@ int main(void)
     boot_slot(slot_b);
     expect_state(slot_b, ESP_OTA_IMG_PENDING_VERIFY);
     assert(esp_ota_check_rollback_is_possible());
-    reject_finish(true);
+    reject_finish(true, false);
     assert(restarts == 2);
     expect_state(slot_b, ESP_OTA_IMG_INVALID);
 
     boot_slot(slot_a);
     expect_state(slot_a, ESP_OTA_IMG_VALID);
-    selector_finish(true);
+    selector_finish(true, false);
     assert(restarts == 2);
     puts("ESP-IDF 6.1.1 host lifecycle: metadata failures, VALID A, rejected B, return to A");
 }

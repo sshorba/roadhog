@@ -10,19 +10,36 @@
 
 static const char *TAG = "connection_status";
 
-bool start_gps(modem_t *modem)
+gps_session_t gps_session_state(modem_t *modem)
 {
     char response[64];
     modem_result_t result = {0};
     esp_err_t error = modem_command(modem, "AT+CGPS?", "+CGPS:", 3000,
                                     response, sizeof(response), &result);
-    if (error == ESP_OK && result.final == MODEM_FINAL_OK &&
-        strncmp(response, "+CGPS:", 6) == 0 &&
-        response[strspn(response + 6, " ") + 6] == '1') {
+    if (error != ESP_OK || result.final != MODEM_FINAL_OK ||
+        strncmp(response, "+CGPS:", 6) != 0) {
+        return GPS_SESSION_UNKNOWN;
+    }
+    const char *state = response + 6;
+    state += strspn(state, " \t");
+    if ((state[0] != '0' && state[0] != '1') || (state[1] != ',' && state[1] != '\n')) {
+        return GPS_SESSION_UNKNOWN;
+    }
+    return state[0] == '1' ? GPS_SESSION_RUNNING : GPS_SESSION_STOPPED;
+}
+
+bool start_gps(modem_t *modem)
+{
+    gps_session_t state = gps_session_state(modem);
+    if (state == GPS_SESSION_RUNNING) {
         ESP_LOGI(TAG, "GPS session already running");
         return true;
     }
-    error = modem_command(modem, "AT+CGPS=1", NULL, 5000, NULL, 0, &result);
+    if (state != GPS_SESSION_STOPPED) {
+        return false;
+    }
+    modem_result_t result = {0};
+    esp_err_t error = modem_command(modem, "AT+CGPS=1", NULL, 5000, NULL, 0, &result);
     if (error == ESP_OK && result.final == MODEM_FINAL_OK) {
         ESP_LOGI(TAG, "GPS session started");
         return true;

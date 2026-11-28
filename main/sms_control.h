@@ -26,6 +26,7 @@ typedef struct sms_control {
     bool configured;
 } sms_control_t;
 
+void sms_control_disconnect(sms_control_t *sms);
 void sms_control_start(sms_control_t *sms, modem_t *modem);
 void sms_control_resume(sms_control_t *sms, modem_t *modem);
 bool sms_control_notification(sms_control_t *sms, const char *line);

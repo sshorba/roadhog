@@ -42,11 +42,27 @@ static void run_diagnostic(void *context)
     vTaskDelete(NULL);
 }
 
+// Only the application UART owner accesses this handle. The worker releases
+// cellular resources before signaling and never touches the UART afterward.
+static SemaphoreHandle_t worker_done;
+
+bool lte_session_owns_uart(void)
+{
+    if (worker_done && xSemaphoreTake(worker_done, 0) == pdTRUE) {
+        worker_done = NULL;
+    }
+    return worker_done != NULL;
+}
+
 modem_t *lte_session_run(modem_t *modem, const modem_config_t *config, bool *uart_reopened,
                          cellular_operation_t operation, void *context, esp_err_t *session_result)
 {
     *uart_reopened = false;
     *session_result = ESP_ERR_INVALID_ARG;
+    if (lte_session_owns_uart()) {
+        *session_result = ESP_ERR_INVALID_STATE;
+        return modem;
+    }
     const char *apn = provisioning_apn();
     if (!apn || !cellular_apn_valid(apn)) {
         ESP_LOGE(TAG, "Provision a valid carrier APN");
@@ -76,7 +92,8 @@ modem_t *lte_session_run(modem_t *modem, const modem_config_t *config, bool *uar
     unsigned stack_bytes = operation ? OTA_SESSION_STACK_BYTES : LTE_DIAGNOSTIC_STACK_BYTES;
     if (xTaskCreate(run_diagnostic, worker_name, stack_bytes, &diagnostic, 4, NULL) == pdPASS) {
         if (xSemaphoreTake(diagnostic.done, pdMS_TO_TICKS(operation ? 480000 : 180000)) != pdTRUE) {
-            ESP_LOGE(TAG, "LTE session deadline exceeded; AT UART will stay closed");
+            worker_done = diagnostic.done;
+            ESP_LOGE(TAG, "LTE session deadline exceeded; waiting for worker to release UART");
             return NULL;
         }
     }
@@ -89,10 +106,12 @@ modem_t *lte_session_run(modem_t *modem, const modem_config_t *config, bool *uar
         ESP_LOGE(TAG, "Could not reopen the AT UART");
         return NULL;
     }
+    modem_watch_restart(modem);
     modem_result_t result;
+    char response[32];
     if (modem_poll(modem, 250) != ESP_OK ||
-        modem_command(modem, "AT", NULL, 2000, NULL, 0, &result) != ESP_OK ||
-        result.final != MODEM_FINAL_OK) {
+        modem_command(modem, "AT+CMGF?", "+CMGF:", 2000, response, sizeof(response), &result) != ESP_OK ||
+        result.final != MODEM_FINAL_OK || !response[0]) {
         ESP_LOGE(TAG, "AT UART reopened but AT did not return OK");
         modem_close(modem);
         return NULL;

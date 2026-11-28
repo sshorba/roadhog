@@ -1,3 +1,4 @@
+#include <stdatomic.h>
 #include "portal.h"
 #include "portal_auth.h"
 #include "provisioning.h"
@@ -38,16 +39,16 @@ static gps_status_t gps_status;
 static const char *data_status = "Unknown";
 static char sim_number[SIM_NUMBER_CAPACITY];
 static const char sim_unavailable[] = "Not available from SIM/carrier";
-static sms_control_t *portal_sms;
+static _Atomic(sms_control_t *) portal_sms;
 
 void portal_bind_sms(struct sms_control *sms)
 {
-    portal_sms = sms;
+    atomic_store(&portal_sms, sms);
 }
 
 struct sms_control *portal_bound_sms(void)
 {
-    return portal_sms;
+    return atomic_load(&portal_sms);
 }
 
 void portal_set_sim_number(const char *number)
@@ -91,13 +92,14 @@ static esp_err_t status_response(httpd_req_t *request)
 
 static esp_err_t users_response(httpd_req_t *request)
 {
-    if (!portal_sms || !portal_sms->owner || !portal_sms->users_store) {
+    sms_control_t *sms = portal_bound_sms();
+    if (!sms || !sms->owner || !sms->users_store) {
         httpd_resp_set_status(request, "503 Service Unavailable");
         httpd_resp_set_type(request, "text/plain; charset=utf-8");
         return httpd_resp_sendstr(request, "SMS users are unavailable.");
     }
     char body[512];
-    if (!sms_users_json(portal_sms, body, sizeof(body))) {
+    if (!sms_users_json(sms, body, sizeof(body))) {
         httpd_resp_set_status(request, "500 Internal Server Error");
         httpd_resp_set_type(request, "text/plain; charset=utf-8");
         return httpd_resp_sendstr(request, "Could not read the user list.");

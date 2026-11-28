@@ -13,6 +13,10 @@
 #include "mbedtls/platform_util.h"
 #include "sdkconfig.h"
 
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+#include "ota_update.h"
+#endif
+
 static const char hex[] = "0123456789ABCDEF";
 
 enum { MAX_PDU_BYTES = 190 };
@@ -169,27 +173,52 @@ void sms_control_start(sms_control_t *sms, modem_t *modem)
 {
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
     sms_users_lock_init();
-    sms->owner = provisioning_owner();
+    if (!sms->owner) {
+        sms->owner = provisioning_owner();
+    }
     if (!sms->owner) {
         return;
     }
-    if (!sms_users_load(sms)) {
+    if (!sms->users_store && !sms_users_load(sms)) {
         ESP_LOGE(TAG, "SMS owner or user storage is unavailable");
         return;
     }
     configure_sms(sms, modem);
     if (sms->configured) {
-        unsigned users = 0;
-        for (size_t i = 0; i < SMS_USER_LIMIT; i++) {
-            users += sms->users[i][0] != '\0';
-        }
-        ESP_LOGI(TAG, "SMS commands enabled; loaded %u additional users", users);
+        ESP_LOGI(TAG, "SMS commands enabled");
     } else {
         ESP_LOGE(TAG, "SMS setup failed");
     }
 #else
     (void)sms;
     (void)modem;
+#endif
+}
+
+void sms_control_disconnect(sms_control_t *sms)
+{
+    sms->configured = false;
+    sms->expected_tpdu = 0;
+    sms->pending_acks = 0;
+    sms->request_head = 0;
+    sms->request_count = 0;
+    mbedtls_platform_zeroize(sms->requests, sizeof(sms->requests));
+#if defined(ROADHOG_SMS_OTA_DESCRIPTOR) || defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+    sms->pending_nacks = 0;
+    sms->delivery_fault = false;
+    sms->routing_recovery = true;
+    sms->scanning_inbox = false;
+    sms->inbox_error = false;
+    sms->inbox_found = false;
+    sms->inbox_valid = false;
+    sms->inbox_index = 0;
+    sms->inbox_length = 0;
+    sms->tpdu_deadline = 0;
+    sms->resume_at = 0;
+    mbedtls_platform_zeroize(&sms->inbox_request, sizeof(sms->inbox_request));
+#endif
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+    ota_sms_ack_failed();
 #endif
 }
 
@@ -270,7 +299,7 @@ void sms_control_service(sms_control_t *sms, modem_t *modem)
         sms->pending_acks--;
         if (!command_ok(modem, "AT+CNMA")) {
             ESP_LOGW(TAG, "SMS acknowledgement failed");
-            sms->request_count = 0;
+            sms_control_disconnect(sms);
             return;
         }
     }

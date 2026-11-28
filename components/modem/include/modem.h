@@ -42,7 +42,13 @@ void modem_close(modem_t *modem);
 // Before normal AT/SMS traffic, confirm command mode or attempt one guarded
 // SIM7600 escape and hangup of a stale data call. No modem reset is sent.
 esp_err_t modem_sync_startup(modem_t *modem);
+// Arm after startup synchronization. A reboot/shutdown URC faults this UART session.
+void modem_watch_restart(modem_t *modem);
+
 esp_err_t modem_poll(modem_t *modem, uint32_t duration_ms);
+// True while a reopened UART awaits the old operation's boundary.
+bool modem_reconnect_pending(const modem_t *modem);
+
 // Only the current UART owner may call this. Flushes no outstanding work.
 bool modem_maintenance_ready(modem_t *modem);
 

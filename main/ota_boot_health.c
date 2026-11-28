@@ -6,11 +6,11 @@
 
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "esp_system.h"
 
 static const char *TAG = "ota_health";
 
 #ifdef CONFIG_ROADHOG_OTA_BENCH_BOOT_PEER
-#include "esp_system.h"
 
 static void boot_untried_peer(void)
 {
@@ -33,59 +33,76 @@ static void boot_untried_peer(void)
 }
 #endif
 
-void ota_boot_health_finish(bool healthy)
+static ota_health_result_t restart_after_rollback(const esp_partition_t *running)
+{
+    const esp_partition_t *selected = esp_ota_get_boot_partition();
+    if (!selected || selected->address == running->address) {
+        ESP_LOGE(TAG, "Rollback destination could not be verified");
+        return OTA_HEALTH_RETRY;
+    }
+    esp_restart();
+    return OTA_HEALTH_ROLLBACK;
+}
+
+ota_health_result_t ota_boot_health_finish(bool healthy, bool expired)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (!running) {
         ESP_LOGE(TAG, "Running partition unavailable");
-        return;
+        return OTA_HEALTH_RETRY;
     }
     esp_ota_img_states_t state;
     esp_err_t error = esp_ota_get_state_partition(running, &state);
-    if (error == ESP_ERR_NOT_FOUND) {
-        if (running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
-            ESP_LOGW(TAG, "Slot A has no persisted OTA state; peer selection is blocked");
-        }
-        return;
-    }
     if (error == ESP_ERR_NOT_SUPPORTED) {
-        return;
+        return OTA_HEALTH_COMPLETE;
     }
     if (error != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to read running OTA state: %s", esp_err_to_name(error));
-        return;
+        // The SDK also returns NOT_FOUND when it cannot read otadata.
+        ESP_LOGW(TAG, "Unable to read running OTA state: %s", esp_err_to_name(error));
+        return OTA_HEALTH_RETRY;
     }
-
+    if (state == ESP_OTA_IMG_INVALID) {
+        // A previous rollback write may have worked despite an API/read error.
+        return restart_after_rollback(running);
+    }
     if (state == ESP_OTA_IMG_PENDING_VERIFY) {
-        ESP_LOGI(TAG, "%s pending verification", running->label);
-#ifdef CONFIG_ROADHOG_OTA_BENCH_REJECT_PENDING
-        healthy = false;
-        ESP_LOGW(TAG, "Bench forced health failure");
-#endif
-        if (!healthy) {
-            if (!esp_ota_check_rollback_is_possible()) {
-                ESP_LOGE(TAG, "Startup failed and no rollback image is available; keeping pending state");
-                return;
-            }
-            ESP_LOGW(TAG, "Startup failed; requesting rollback");
-            error = esp_ota_mark_app_invalid_rollback_and_reboot();
-            // A successful request reboots inside esp_ota.
-            ESP_LOGE(TAG, "Rollback API returned: %s", esp_err_to_name(error));
-            return;
+        if (!healthy && !expired) {
+            return OTA_HEALTH_WAITING;
         }
-        error = esp_ota_mark_app_valid_cancel_rollback();
+        bool accept = healthy && !expired;
+#ifdef CONFIG_ROADHOG_OTA_BENCH_REJECT_PENDING
+        accept = false;
+#endif
+        const esp_partition_t *selected = esp_ota_get_boot_partition();
+        if (!selected || selected->address != running->address ||
+            (!accept && !esp_ota_check_rollback_is_possible())) {
+            ESP_LOGE(TAG, "Startup health decision has no safe OTA metadata target");
+            return OTA_HEALTH_RETRY;
+        }
+        error = accept ? esp_ota_mark_app_valid_cancel_rollback() :
+                         esp_ota_mark_app_invalid_rollback();
         if (error != ESP_OK) {
-            ESP_LOGE(TAG, "Could not confirm %s: %s", running->label, esp_err_to_name(error));
-            return;
+            ESP_LOGE(TAG, "OTA health metadata write failed: %s", esp_err_to_name(error));
+            return OTA_HEALTH_RETRY;
+        }
+        error = esp_ota_get_state_partition(running, &state);
+        if (error != ESP_OK || state != (accept ? ESP_OTA_IMG_VALID : ESP_OTA_IMG_INVALID)) {
+            ESP_LOGE(TAG, "OTA health metadata readback failed");
+            return OTA_HEALTH_RETRY;
+        }
+        if (!accept) {
+            return restart_after_rollback(running);
         }
         ESP_LOGI(TAG, "%s marked valid after startup checks", running->label);
-        error = esp_ota_get_state_partition(running, &state);
-        if (error != ESP_OK || state != ESP_OTA_IMG_VALID) {
-            ESP_LOGE(TAG, "Could not read back VALID state for %s", running->label);
-            return;
-        }
     }
-
+    if (state != ESP_OTA_IMG_VALID) {
+        return OTA_HEALTH_RETRY;
+    }
+#ifdef CONFIG_ROADHOG_OTA_BENCH_BOOT_PEER
+    if (!healthy && !expired) {
+        return OTA_HEALTH_WAITING;
+    }
+#endif
     if (healthy && state == ESP_OTA_IMG_VALID &&
         running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0) {
         // A may be running after a bootloader fallback while another slot is
@@ -94,17 +111,20 @@ void ota_boot_health_finish(bool healthy)
         const esp_partition_t *selected = esp_ota_get_boot_partition();
         if (!selected || selected->address != running->address) {
             ESP_LOGW(TAG, "Slot A is running but not selected; peer selection is blocked");
-            return;
+            return OTA_HEALTH_COMPLETE;
         }
         ESP_LOGI(TAG, "Slot A startup checks passed; selected OTA state is VALID");
 #ifdef CONFIG_ROADHOG_OTA_BENCH_BOOT_PEER
         boot_untried_peer();
 #endif
     }
+    return OTA_HEALTH_COMPLETE;
 }
 #else
-void ota_boot_health_finish(bool healthy)
+ota_health_result_t ota_boot_health_finish(bool healthy, bool expired)
 {
     (void)healthy;
+    (void)expired;
+    return OTA_HEALTH_COMPLETE;
 }
 #endif

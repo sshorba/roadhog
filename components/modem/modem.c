@@ -11,6 +11,16 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+typedef enum {
+    BOUNDARY_CLEAR,
+    BOUNDARY_FINAL,
+    BOUNDARY_PROMPT,
+    BOUNDARY_EDITOR,
+} boundary_t;
+
+// The application serializes access to each UART through its sole owner.
+static boundary_t reconnect_boundary[UART_NUM_MAX];
+
 struct modem {
     modem_config_t config;
     QueueHandle_t events;
@@ -20,7 +30,12 @@ struct modem {
     size_t line_length;
     bool discard_line;
     bool waiting_for_final;
+    bool awaiting_sms_prompt;
+    bool ready_session;
+    bool reconnecting;
+    boundary_t boundary;
     bool uart_fault;
+    bool watch_restart;
 };
 
 typedef struct {
@@ -49,8 +64,31 @@ static modem_final_t final_code(const char *line)
 static void handle_line(modem_t *modem, transaction_t *transaction)
 {
     const char *line = modem->line + strspn(modem->line, " \t");
+    bool rebooted = !strcmp(line, "RDY");
     modem_final_t final = final_code(line);
+    if (modem->boundary != BOUNDARY_CLEAR) {
+        // During quarantine no new command is outstanding. A final closes the
+        // previous operation, or RDY proves the modem discarded it on reboot.
+        if (rebooted || (modem->boundary == BOUNDARY_FINAL && final != MODEM_FINAL_NONE) ||
+            ((modem->boundary == BOUNDARY_PROMPT || modem->boundary == BOUNDARY_EDITOR) &&
+             final == MODEM_FINAL_ERROR)) {
+            modem->boundary = BOUNDARY_CLEAR;
+        }
+        return;
+    }
+    if (modem->watch_restart &&
+        (rebooted || !strcmp(line, "NORMAL POWER DOWN") || !strcmp(line, "POWER DOWN"))) {
+        ESP_LOGW("modem", "SIM7600 reboot or shutdown detected");
+        if (rebooted) {
+            modem->waiting_for_final = false;
+        }
+        modem->uart_fault = true;
+        return;
+    }
     if (final != MODEM_FINAL_NONE) {
+        if (modem->waiting_for_final && modem->awaiting_sms_prompt && final == MODEM_FINAL_OK) {
+            return;
+        }
         if (transaction && transaction->ignore_final_before_payload && !transaction->used) {
             return;
         }
@@ -59,6 +97,7 @@ static void handle_line(modem_t *modem, transaction_t *transaction)
             strcpy(transaction->result->final_line, line);
         }
         modem->waiting_for_final = false;
+        modem->awaiting_sms_prompt = false;
         return;
     }
 
@@ -86,18 +125,30 @@ static void handle_line(modem_t *modem, transaction_t *transaction)
         }
     }
 
-    if (modem->config.on_notification) {
+    if (!modem->reconnecting && modem->config.on_notification) {
         modem->config.on_notification(line, modem->config.context);
     }
 }
 
 static void consume_byte(modem_t *modem, uint8_t byte, transaction_t *transaction)
 {
-    if (transaction && transaction->waiting_for_prompt && !modem->discard_line &&
-        modem->line_length == 1 && modem->line[0] == '>' && byte == ' ') {
-        modem->line_length = 0;
-        transaction->prompt_seen = true;
-        return;
+    if (!modem->discard_line && modem->line_length == 1 && modem->line[0] == '>' && byte == ' ') {
+        if (modem->boundary == BOUNDARY_PROMPT) {
+            modem->line_length = 0;
+            modem->boundary = BOUNDARY_EDITOR;
+            return;
+        }
+        if (modem->awaiting_sms_prompt && modem->waiting_for_final) {
+            modem->line_length = 0;
+            modem->awaiting_sms_prompt = false;
+            if (transaction && transaction->waiting_for_prompt) {
+                transaction->prompt_seen = true;
+            } else {
+                modem->boundary = BOUNDARY_EDITOR;
+                modem->waiting_for_final = false;
+            }
+            return;
+        }
     }
     if (byte == '\r' || byte == '\n') {
         if (!modem->discard_line && modem->line_length > 0) {
@@ -163,6 +214,9 @@ static esp_err_t receive(modem_t *modem, transaction_t *transaction, uint32_t du
                 return ESP_ERR_TIMEOUT;
             }
             consume_byte(modem, byte, transaction);
+            if (modem->uart_fault) {
+                return ESP_FAIL;
+            }
             if (transaction && transaction->prompt_seen) {
                 return ESP_OK;
             }
@@ -217,6 +271,8 @@ esp_err_t modem_open(const modem_config_t *config, modem_t **out)
         free(modem);
         return error;
     }
+    modem->boundary = reconnect_boundary[config->port];
+    modem->reconnecting = modem->boundary != BOUNDARY_CLEAR;
     *out = modem;
     return ESP_OK;
 }
@@ -224,9 +280,20 @@ esp_err_t modem_open(const modem_config_t *config, modem_t **out)
 void modem_close(modem_t *modem)
 {
     if (modem) {
+        boundary_t boundary = modem->boundary;
+        if (boundary == BOUNDARY_CLEAR && modem->waiting_for_final && modem->ready_session) {
+            boundary = modem->awaiting_sms_prompt ? BOUNDARY_PROMPT : BOUNDARY_FINAL;
+        }
+        reconnect_boundary[modem->config.port] = boundary;
         uart_driver_delete(modem->config.port);
         free(modem);
     }
+}
+
+void modem_watch_restart(modem_t *modem)
+{
+    modem->ready_session = true;
+    modem->watch_restart = true;
 }
 
 esp_err_t modem_poll(modem_t *modem, uint32_t duration_ms)
@@ -237,10 +304,15 @@ esp_err_t modem_poll(modem_t *modem, uint32_t duration_ms)
     return receive(modem, NULL, duration_ms);
 }
 
+bool modem_reconnect_pending(const modem_t *modem)
+{
+    return modem && !modem->uart_fault && modem->boundary != BOUNDARY_CLEAR;
+}
+
 bool modem_maintenance_ready(modem_t *modem)
 {
     return modem && receive(modem, NULL, 20) == ESP_OK &&
-           !modem->waiting_for_final && !modem->line_length && !modem->discard_line;
+           modem->boundary == BOUNDARY_CLEAR && !modem->waiting_for_final && !modem->line_length && !modem->discard_line;
 }
 
 static esp_err_t run_command(modem_t *modem, const char *command, const char *response_prefix,
@@ -269,7 +341,7 @@ static esp_err_t run_command(modem_t *modem, const char *command, const char *re
     if (error != ESP_OK) {
         return error;
     }
-    if (modem->waiting_for_final || modem->line_length || modem->discard_line) {
+    if (modem->boundary != BOUNDARY_CLEAR || modem->waiting_for_final || modem->line_length || modem->discard_line) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -285,6 +357,7 @@ static esp_err_t run_command(modem_t *modem, const char *command, const char *re
     memcpy(wire, command, length);
     wire[length] = '\r';
     modem->waiting_for_final = true;
+    modem->awaiting_sms_prompt = pdu != NULL;
     if (uart_write_bytes(modem->config.port, wire, length + 1) != (int)(length + 1)) {
         modem->uart_fault = true;
         return ESP_FAIL;
@@ -431,6 +504,7 @@ static esp_err_t sync_startup(modem_t *modem)
         return ESP_ERR_INVALID_STATE;
     }
 
+    modem->ready_session = true;
     // Escape preserves the original data call. End it only after the
     // acknowledged escape and a solicited command-mode payload.
     if (modem_command(modem, "ATH", NULL, 10000, NULL, 0, &result) != ESP_OK ||
@@ -439,6 +513,26 @@ static esp_err_t sync_startup(modem_t *modem)
     }
     ESP_LOGI("modem", "Recovered command mode and ended stale data call");
     return ESP_OK;
+}
+
+static esp_err_t finish_boundary(modem_t *modem)
+{
+    esp_err_t error = receive(modem, NULL, 1000);
+    if (error != ESP_OK) {
+        return error;
+    }
+    if (modem->boundary == BOUNDARY_EDITOR) {
+        // A late prompt opens the old editor. Abort it without sending a TPDU.
+        const char escape = 0x1b;
+        modem->boundary = BOUNDARY_FINAL;
+        if (uart_write_bytes(modem->config.port, &escape, 1) != 1) {
+            modem->uart_fault = true;
+            return ESP_FAIL;
+        }
+        error = receive(modem, NULL, 1000);
+    }
+    return error != ESP_OK ? error :
+           modem->boundary == BOUNDARY_CLEAR ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t modem_sync_startup(modem_t *modem)
@@ -452,8 +546,17 @@ esp_err_t modem_sync_startup(modem_t *modem)
     // Do not deliver PPP fragments or stale notifications during recovery.
     modem_notification_fn notify = modem->config.on_notification;
     modem->config.on_notification = NULL;
-    esp_err_t error = sync_startup(modem);
+    esp_err_t error = ESP_OK;
+    if (modem->boundary != BOUNDARY_CLEAR) {
+        error = finish_boundary(modem);
+    }
+    if (error == ESP_OK) {
+        error = sync_startup(modem);
+    }
     modem->config.on_notification = notify;
+    if (error == ESP_OK) {
+        modem->reconnecting = false;
+    }
     return error;
 }
 

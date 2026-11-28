@@ -98,3 +98,83 @@ On November 20, 2026 the ESP32-S3 and SIM7600NA-H bench setup returned
 `AT final: OK`, `+CPIN: READY`, and `+CEREG: 0,1` on repeated polls.
 This verified SIM readiness and home LTE registration on that setup.
 The modem firmware revision and carrier were unrecorded.
+
+## Automatic SIM7600 recovery
+
+UART0 diagnostics, status LEDs and the setup portal start before modem
+initialization. The application task is the only AT UART owner. It attempts
+one prompt reopen after losing an online modem and pauses five seconds between
+failed attempts. A failed LTE registration or a missing GNSS fix does not
+restart an otherwise responsive AT session. A GNSS query error is reported as
+unavailable and retried on the next sample. A confirmed stopped engine is
+restarted in place. The owner gives a late AT final a bounded chance to
+arrive before reconnecting, while the AT transaction guard stays active.
+
+Reopening UART1 retains the outstanding transaction boundary. The application
+waits for its final or a SIM7600 reboot indication before sending startup
+probes. A delayed SMS prompt is canceled with ESC and the cancellation final
+must arrive before normal commands resume. If the final, prompt or reboot
+indication is lost, the application keeps the UART open when possible and
+waits for positive evidence on later attempts. A timer alone cannot clear the
+boundary. In that case SMS and GNSS remain unavailable while local services
+continue. A PPP worker that outlives its waiter retains ownership until it
+signals completion after cleanup.
+
+A genuine disconnect clears RAM-only SMS deliveries and acknowledgements.
+Recovery reuses the authorization store and configures PDU mode, SMS routing
+and GNSS on the recovered session. Portal bindings remain stable across retries.
+Carrier registration and the data context are sampled again. The LTE session
+code owns temporary PPP contexts.
+
+A pending OTA image has 90 seconds from application startup to complete the
+portal, AT, SMS and GNSS checks. An initialization attempt already in progress
+can finish after the deadline, but its success cannot validate the image.
+Boot-state errors are retried even if the modem is unavailable. Metadata
+errors get up to three attempts, at least a second apart, with a fresh
+rejection budget at the deadline. A successful write is read back before
+completing validation or rebooting for rollback. If metadata remains
+unreadable or no rollback target can be verified, local recovery continues
+with PPP and OTA blocked. No automatic reboot is scheduled in that state.
+
+### Integrating the separate SMS OTA branch
+
+When integrating PR #20, reconcile the overlapping application loop, SMS
+control, component registration and modem/OTA fixture changes together.
+
+1. Keep `sms_control_service` running when direct routing is temporarily
+   disabled and `resume_at` is set. Allow its in-place CNMA recovery to run
+   after the AT boundary clears. Gate PPP, the boot reporter and OTA polling
+   on restored routing and ME reconciliation. Escalate to a full disconnect
+   only if the AT transport cannot re-establish its boundary.
+2. On an actual reconnect, clear transient delivery and scan state, cancel
+   the pending SMS OTA challenge or staged selection, and re-establish and
+   verify direct CNMI routing. Reconcile the ME inbox with the existing
+   consume-before-dispatch rule. Keep the authorization store and durable
+   boot-report journal.
+3. After PPP returns, restart at the top of the service loop so registration,
+   GNSS, SMS routing and boot health are sampled on the returned UART before
+   attempting the boot reporter.
+
+Combined regression cases should inject a late CNMA final during in-place
+routing recovery, a stored cancellation across a genuine reconnect, and a
+PPP handoff followed by a fresh boot-reporter iteration. Assert no stale OTA
+selection, duplicate dispatch or journal consumption before the fresh checks.
+
+### Attended verification
+
+1. After separate hardware approval, start with a provisioned, selected VALID
+   image and capture UART0 logs. Leave modem power off at ESP32 startup. Verify
+   local portal access, unknown LTE and an offline modem indicator. Power the
+   modem and verify the same ESP32 boot reaches online, with SMS commands,
+   LTE status and GNSS startup restored.
+2. Repeat with modem power applied first and with both supplies applied
+   together. During normal operation cycle modem power only. Verify one UART
+   owner, unchanged ESP32 uptime and provisioning, and restored SMS and GNSS.
+3. With AT still responding, induce loss of registration in a controlled bench
+   setup. Verify the portal reports the registration state without repeatedly
+   reinitializing the modem. Restore coverage and verify registration resumes.
+4. On a separate, approved rollback trial with a verified fallback and backup,
+   boot a pending candidate. Verify a modem that becomes ready within the
+   health window permits validation. In a separate run hold the modem offline
+   beyond the window and verify rollback. Restore modem power and verify the
+   previous validated slot recovers without another manual reset.
