@@ -169,33 +169,6 @@ static void configure_sms(sms_control_t *sms, modem_t *modem)
 }
 #endif
 
-void sms_control_disconnect(sms_control_t *sms)
-{
-    sms->configured = false;
-    sms->expected_tpdu = 0;
-    sms->pending_acks = 0;
-    sms->request_head = 0;
-    sms->request_count = 0;
-    mbedtls_platform_zeroize(sms->requests, sizeof(sms->requests));
-#if defined(ROADHOG_SMS_OTA_DESCRIPTOR) || defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
-    sms->pending_nacks = 0;
-    sms->delivery_fault = false;
-    sms->routing_recovery = true;
-    sms->scanning_inbox = false;
-    sms->inbox_error = false;
-    sms->inbox_found = false;
-    sms->inbox_valid = false;
-    sms->inbox_index = 0;
-    sms->inbox_length = 0;
-    sms->tpdu_deadline = 0;
-    sms->resume_at = 0;
-    mbedtls_platform_zeroize(&sms->inbox_request, sizeof(sms->inbox_request));
-#endif
-#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
-    ota_sms_ack_failed();
-#endif
-}
-
 void sms_control_start(sms_control_t *sms, modem_t *modem)
 {
 #ifdef CONFIG_ROADHOG_SMS_CONTROL
@@ -223,6 +196,33 @@ void sms_control_start(sms_control_t *sms, modem_t *modem)
 #else
     (void)sms;
     (void)modem;
+#endif
+}
+
+void sms_control_disconnect(sms_control_t *sms)
+{
+    sms->configured = false;
+    sms->expected_tpdu = 0;
+    sms->pending_acks = 0;
+    sms->request_head = 0;
+    sms->request_count = 0;
+    mbedtls_platform_zeroize(sms->requests, sizeof(sms->requests));
+#if defined(ROADHOG_SMS_OTA_DESCRIPTOR) || defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+    sms->pending_nacks = 0;
+    sms->delivery_fault = false;
+    sms->routing_recovery = true;
+    sms->scanning_inbox = false;
+    sms->inbox_error = false;
+    sms->inbox_found = false;
+    sms->inbox_valid = false;
+    sms->inbox_index = 0;
+    sms->inbox_length = 0;
+    sms->tpdu_deadline = 0;
+    sms->resume_at = 0;
+    mbedtls_platform_zeroize(&sms->inbox_request, sizeof(sms->inbox_request));
+#endif
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+    ota_sms_ack_failed();
 #endif
 }
 

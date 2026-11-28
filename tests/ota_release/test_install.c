@@ -338,12 +338,20 @@ static int mbedtls_pk_get_psa_attributes(mbedtls_pk_context *key, int usage, psa
 }
 static int psa_get_key_type(psa_key_attributes_t *attributes)
 {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
     char group[32];
     return EVP_PKEY_is_a(*attributes, "EC") &&
            EVP_PKEY_get_group_name(*attributes, group, sizeof(group), NULL) == 1 &&
            !strcmp(group, "prime256v1") ? PSA_ECC_FAMILY_SECP_R1 : 0;
+#else
+    if (EVP_PKEY_base_id(*attributes) != EVP_PKEY_EC) {
+        return 0;
+    }
+    const EC_GROUP *group = EC_KEY_get0_group(EVP_PKEY_get0_EC_KEY(*attributes));
+    return EC_GROUP_get_curve_name(group) == NID_X9_62_prime256v1 ? PSA_ECC_FAMILY_SECP_R1 : 0;
+#endif
 }
-static int psa_get_key_bits(psa_key_attributes_t *attributes) { return EVP_PKEY_get_bits(*attributes); }
+static int psa_get_key_bits(psa_key_attributes_t *attributes) { return EVP_PKEY_bits(*attributes); }
 static void psa_reset_key_attributes(psa_key_attributes_t *attributes) { *attributes = NULL; }
 static int mbedtls_pk_verify(mbedtls_pk_context *key, int algorithm, const uint8_t *digest,
                              size_t length, const uint8_t *signature, size_t signature_size)
@@ -435,6 +443,11 @@ static esp_err_t modem_open(const modem_config_t *config, modem_t **modem)
     return ESP_OK;
 }
 
+static void modem_watch_restart(modem_t *modem)
+{
+    assert(modem == &fixture_modem && uart_open && !ppp_active);
+}
+
 static esp_err_t modem_poll(modem_t *modem, unsigned timeout_ms)
 {
     assert(modem == &fixture_modem && uart_open && timeout_ms == 250);
@@ -446,11 +459,13 @@ static esp_err_t modem_command(modem_t *modem, const char *command, const char *
                                modem_result_t *result)
 {
     assert(modem == &fixture_modem && uart_open && !ppp_active);
-    assert(!strcmp(command, "AT") && !prefix && timeout_ms == 2000 && !response && !size);
+    assert(!strcmp(command, "AT+CMGF?") && !strcmp(prefix, "+CMGF:") &&
+           timeout_ms == 2000 && response && size >= 12);
     if (is_case("at-failure")) {
         return ESP_ERR_TIMEOUT;
     }
     at_ready = true;
+    snprintf(response, size, "+CMGF: 0\n");
     result->final = MODEM_FINAL_OK;
     return ESP_OK;
 }
