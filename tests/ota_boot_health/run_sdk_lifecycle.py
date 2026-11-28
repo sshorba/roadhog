@@ -53,6 +53,7 @@ with tempfile.TemporaryDirectory() as directory:
     for role, config in (("selector", "BOOT_PEER"), ("reject", "REJECT_PENDING")):
         subprocess.run([*common, f"-DCONFIG_ROADHOG_OTA_BENCH_{config}=1",
                         f"-Dota_boot_health_finish={role}_finish",
+                        f"-Dota_boot_health_pending={role}_pending",
                         "-c", str(ROOT / "main/ota_boot_health.c"),
                         "-o", str(tmp / f"{role}.o")], check=True)
     executable = tmp / "sdk-lifecycle"
