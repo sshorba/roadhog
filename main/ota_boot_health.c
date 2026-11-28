@@ -33,6 +33,14 @@ static void boot_untried_peer(void)
 }
 #endif
 
+bool ota_boot_health_pending(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    return running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+           state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
 void ota_boot_health_finish(bool healthy)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -103,6 +111,11 @@ void ota_boot_health_finish(bool healthy)
     }
 }
 #else
+bool ota_boot_health_pending(void)
+{
+    return false;
+}
+
 void ota_boot_health_finish(bool healthy)
 {
     (void)healthy;

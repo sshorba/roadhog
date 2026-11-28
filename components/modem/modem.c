@@ -21,6 +21,7 @@ struct modem {
     bool discard_line;
     bool waiting_for_final;
     bool uart_fault;
+    bool watch_restart;
 };
 
 typedef struct {
@@ -49,6 +50,13 @@ static modem_final_t final_code(const char *line)
 static void handle_line(modem_t *modem, transaction_t *transaction)
 {
     const char *line = modem->line + strspn(modem->line, " \t");
+    if (modem->watch_restart &&
+        (!strcmp(line, "RDY") || !strcmp(line, "NORMAL POWER DOWN") ||
+         !strcmp(line, "POWER DOWN"))) {
+        ESP_LOGW("modem", "SIM7600 reboot or shutdown detected");
+        modem->uart_fault = true;
+        return;
+    }
     modem_final_t final = final_code(line);
     if (final != MODEM_FINAL_NONE) {
         if (transaction && transaction->ignore_final_before_payload && !transaction->used) {
@@ -163,6 +171,9 @@ static esp_err_t receive(modem_t *modem, transaction_t *transaction, uint32_t du
                 return ESP_ERR_TIMEOUT;
             }
             consume_byte(modem, byte, transaction);
+            if (modem->uart_fault) {
+                return ESP_FAIL;
+            }
             if (transaction && transaction->prompt_seen) {
                 return ESP_OK;
             }
@@ -227,6 +238,11 @@ void modem_close(modem_t *modem)
         uart_driver_delete(modem->config.port);
         free(modem);
     }
+}
+
+void modem_watch_restart(modem_t *modem)
+{
+    modem->watch_restart = true;
 }
 
 esp_err_t modem_poll(modem_t *modem, uint32_t duration_ms)

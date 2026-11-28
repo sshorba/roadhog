@@ -7,7 +7,13 @@
 #include "esp_timer.h"
 #include "lte_diagnostic.h"
 #include "modem.h"
+#include "modem_lifecycle.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "ota_boot_health.h"
+#if defined(ROADHOG_SMS_OTA_DESCRIPTOR) || defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+#include "ota_report.h"
+#endif
 #include "ota_update.h"
 #include "portal.h"
 #include "provisioning.h"
@@ -28,8 +34,8 @@ static void log_notification(const char *line, void *context)
 
 static modem_final_t probe(modem_t *modem, const char *command, const char *prefix)
 {
-    modem_result_t result;
-    char response[MODEM_LINE_CAPACITY];
+    modem_result_t result = {0};
+    char response[MODEM_LINE_CAPACITY] = {0};
     esp_err_t error = modem_command(modem, command, prefix, 2000,
                                     response, sizeof(response), &result);
     if (error != ESP_OK) {
@@ -61,9 +67,64 @@ static void cache_sim_number(modem_t *modem)
     portal_set_sim_number(number);
 }
 
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+static bool sms_ready(const sms_control_t *sms)
+{
+#ifdef CONFIG_ROADHOG_SMS_CONTROL
+    return provisioning_state() == PROVISION_FACTORY || sms->configured;
+#else
+    (void)sms;
+    return true;
+#endif
+}
+
+static bool initialize_modem(const modem_config_t *config, modem_t **modem, sms_control_t *sms)
+{
+    esp_err_t error = modem_open(config, modem);
+    if (error == ESP_OK) {
+        error = modem_poll(*modem, 1000);
+    }
+    if (error == ESP_OK) {
+        error = modem_sync_startup(*modem);
+    }
+    if (error != ESP_OK) {
+        ESP_LOGW(TAG, "Modem UART or command mode unavailable: %s", esp_err_to_name(error));
+        return false;
+    }
+    modem_watch_restart(*modem);
+    if (probe(*modem, "AT", NULL) != MODEM_FINAL_OK) {
+        return false;
+    }
+    sms_control_start(sms, *modem);
+    return sms_ready(sms) && start_gps(*modem) && modem_maintenance_ready(*modem);
+}
+
+static void modem_disconnected(modem_lifecycle_t *lifecycle, modem_t **modem, sms_control_t *sms)
+{
+    modem_close(*modem);
+    *modem = NULL;
+    sms_control_disconnect(sms);
+    status_led_set_connections(false, false, false);
+    portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
+    portal_set_sim_number("");
+    modem_lifecycle_result(lifecycle, false, now_ms());
+    ESP_LOGW(TAG, "Modem offline; retrying in %u seconds", MODEM_RETRY_MS / 1000);
+}
+
 void app_main(void)
 {
     static sms_control_t sms;
+#ifdef CONFIG_ROADHOG_OTA_SMS_BENCH
+    ota_sms_init();
+#endif
+    const bool pending_image = ota_boot_health_pending();
+    modem_lifecycle_t lifecycle = {
+        .health_deadline = pending_image ? now_ms() + MODEM_BOOT_HEALTH_MS : INT64_MAX,
+    };
     esp_err_t led_error = status_led_start();
     if (led_error != ESP_OK) {
         ESP_LOGW(TAG, "Status LED unavailable: %s", esp_err_to_name(led_error));
@@ -85,48 +146,9 @@ void app_main(void)
         .on_notification = log_notification,
         .context = &sms,
     };
-    modem_t *modem;
-    esp_err_t error = modem_open(&config, &modem);
-    if (error != ESP_OK) {
-        portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
-        ESP_LOGE(TAG, "Cannot open modem UART: %s", esp_err_to_name(error));
-        ota_boot_health_finish(false);
-        return;
-    }
+    modem_t *modem = NULL;
+    portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
     ESP_LOGI(TAG, "SIM7600 UART1 TX=17 RX=18 baud=115200");
-
-    // Let the UART drain boot notifications before the first probe.
-    if (modem_poll(modem, 1000) != ESP_OK) {
-        portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
-        ESP_LOGE(TAG, "Startup UART fault; check modem power and wiring, then restart both devices");
-        modem_close(modem);
-        ota_boot_health_finish(false);
-        return;
-    }
-    if (modem_sync_startup(modem) != ESP_OK) {
-        portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
-        ESP_LOGE(TAG, "Modem command mode unavailable after startup recovery");
-        ota_boot_health_finish(false);
-        modem_close(modem);
-        return;
-    }
-    modem_final_t at = probe(modem, "AT", NULL);
-    status_led_set_connections(at != MODEM_FINAL_NONE, false, false);
-    portal_set_status(read_lte_registration(modem), NULL, GPS_UNAVAILABLE);
-    sms_control_start(&sms, modem);
-    portal_bind_sms(&sms);
-    bool gps_started = start_gps(modem);
-
-#ifdef CONFIG_ROADHOG_SMS_CONTROL
-    bool sms_ready = provisioning_state() == PROVISION_FACTORY || sms.configured;
-#else
-    bool sms_ready = true;
-#endif
-    ota_boot_health_finish(portal_error == ESP_OK && at == MODEM_FINAL_OK &&
-                           sms_ready && gps_started);
-    if (at == MODEM_FINAL_OK) {
-        cache_sim_number(modem);
-    }
 
 #if defined(CONFIG_ROADHOG_LTE_DIAGNOSTIC) && !defined(CONFIG_ROADHOG_OTA_UPDATE_BENCH)
     bool diagnostic_pending = network_error == ESP_OK && provisioning_apn() != NULL;
@@ -139,64 +161,109 @@ void app_main(void)
 #endif
 
     for (;;) {
-        sms_control_service(&sms, modem);
-        bool modem_reachable = probe(modem, "AT+CPIN?", "+CPIN:") != MODEM_FINAL_NONE;
-        lte_status_t lte = read_lte_registration(modem);
-        if (provisioning_state() == PROVISION_FACTORY && (lte == LTE_HOME || lte == LTE_ROAMING)) {
-            sms_owner_verification_service(modem);
+        int64_t now = now_ms();
+        if (modem_lifecycle_finish_health(&lifecycle, now, false)) {
+            ota_boot_health_finish(false);
         }
+        if (lifecycle.phase != MODEM_ONLINE) {
+#ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
+            if (lte_session_owns_uart()) {
+                vTaskDelay(pdMS_TO_TICKS(250));
+                continue;
+            }
+#endif
+            if (!modem_lifecycle_begin(&lifecycle, now)) {
+                vTaskDelay(pdMS_TO_TICKS(250));
+                continue;
+            }
+            bool online = initialize_modem(&config, &modem, &sms);
+            if (sms.users_store && !portal_bound_sms()) {
+                portal_bind_sms(&sms);
+            }
+            now = now_ms();
+            if (modem_lifecycle_finish_health(&lifecycle, now, online)) {
+                ota_boot_health_finish(online && now < lifecycle.health_deadline &&
+                                       portal_error == ESP_OK);
+            }
+            if (!online) {
+                modem_disconnected(&lifecycle, &modem, &sms);
+                continue;
+            }
+            modem_lifecycle_result(&lifecycle, true, now);
+            ESP_LOGI(TAG, "Modem online; SMS and GNSS initialization complete");
+            cache_sim_number(modem);
+        }
+
+        // Use an AT reply independent of LTE registration, and detect a
+        // silent reset that cleared GPS even if its boot URC was missed.
+        if (!sms_ready(&sms) || !gps_session_running(modem)) {
+            modem_disconnected(&lifecycle, &modem, &sms);
+            continue;
+        }
+        probe(modem, "AT+CPIN?", "+CPIN:");
+        lte_status_t lte = read_lte_registration(modem);
         const char *data = lte_data_context(modem);
         gps_fix_t fix;
         gps_status_t gps = read_gps(modem, &fix);
+        bool csq_answered = probe(modem, "AT+CSQ", "+CSQ:") != MODEM_FINAL_NONE;
+        if (!csq_answered || !modem_maintenance_ready(modem)) {
+            modem_disconnected(&lifecycle, &modem, &sms);
+            continue;
+        }
         portal_set_status(lte, data, gps);
         ESP_LOGI(TAG, "LTE: %s, data context: %s, GPS: %s",
                  lte_label(lte), data, gps_label(gps));
-        bool csq_answered = probe(modem, "AT+CSQ", "+CSQ:") != MODEM_FINAL_NONE;
-        modem_reachable |= csq_answered;
-        status_led_set_connections(modem_reachable || lte != LTE_UNKNOWN || gps != GPS_UNAVAILABLE,
+        status_led_set_connections(true,
                                    lte == LTE_HOME || lte == LTE_ROAMING, gps == GPS_FIX);
+
+        sms_control_service(&sms, modem);
+        if (provisioning_state() == PROVISION_FACTORY && (lte == LTE_HOME || lte == LTE_ROAMING)) {
+            sms_owner_verification_service(modem);
+        }
+        if (!sms_ready(&sms) || !modem_maintenance_ready(modem)) {
+            modem_disconnected(&lifecycle, &modem, &sms);
+            continue;
+        }
 #if defined(CONFIG_ROADHOG_LTE_DIAGNOSTIC) && !defined(CONFIG_ROADHOG_OTA_UPDATE_BENCH)
         if (diagnostic_pending && esp_timer_get_time() >= diagnostic_at) {
             diagnostic_pending = false;
-            // A missing final can mean an older AT command still owns the stream.
-            if (!csq_answered) {
-                ESP_LOGW(TAG, "LTE diagnostic skipped: AT command stream is not idle");
-            } else if (lte == LTE_HOME || lte == LTE_ROAMING) {
+            if (lte == LTE_HOME || lte == LTE_ROAMING) {
                 ESP_LOGI(TAG, "LTE registration confirmed: %s", lte_label(lte));
                 bool uart_reopened;
                 modem = lte_diagnostic_run(modem, &config, &uart_reopened);
                 if (!modem) {
-                    status_led_set_connections(false, false, false);
-                    portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
-                    ESP_LOGE(TAG, "Restart both devices to restore SMS and GNSS");
-                    return;
-                }
-                if (uart_reopened) {
+                    modem_disconnected(&lifecycle, &modem, &sms);
+                } else if (uart_reopened) {
                     sms_control_resume(&sms, modem);
-                    start_gps(modem);
+                    if (!start_gps(modem)) {
+                        modem_disconnected(&lifecycle, &modem, &sms);
+                    }
                 }
-            } else {
-                ESP_LOGW(TAG, "LTE diagnostic skipped at deadline: %s", lte_label(lte));
+                continue;
+            }
+            ESP_LOGW(TAG, "LTE diagnostic skipped at deadline: %s", lte_label(lte));
+        }
+#endif
+#if defined(ROADHOG_SMS_OTA_DESCRIPTOR) || defined(CONFIG_ROADHOG_OTA_SMS_BENCH)
+        if (gps != GPS_UNAVAILABLE && (lte == LTE_HOME || lte == LTE_ROAMING)) {
+            ota_sms_report_boot(&sms, modem);
+            if (!modem_maintenance_ready(modem)) {
+                modem_disconnected(&lifecycle, &modem, &sms);
+                continue;
             }
         }
 #endif
 #ifdef CONFIG_ROADHOG_OTA_UPDATE_BENCH
-        // A missing final can mean an earlier command still owns the AT stream.
-        if (network_error == ESP_OK && csq_answered) {
+        if (network_error == ESP_OK) {
             modem = ota_update_poll(modem, &config, &sms);
             if (!modem) {
-                status_led_set_connections(false, false, false);
-                portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
-                return;
+                modem_disconnected(&lifecycle, &modem, &sms);
+                continue;
             }
         }
 #endif
         if (modem_poll(modem, 5000) != ESP_OK) {
-            status_led_set_connections(false, false, false);
-            portal_set_status(LTE_UNKNOWN, NULL, GPS_UNAVAILABLE);
-            ESP_LOGE(TAG, "UART fault; restart both the modem and ESP32 to resynchronize");
-            modem_close(modem);
-            return;
+            modem_disconnected(&lifecycle, &modem, &sms);
         }
     }
 }

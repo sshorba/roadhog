@@ -6,6 +6,7 @@
 
 #include "esp_ota_ops.h"
 #include "ota_boot_health.h"
+#include "modem_lifecycle.h"
 
 typedef int uart_port_t;
 typedef void *QueueHandle_t;
@@ -23,6 +24,7 @@ enum {
 };
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
 #define pdMS_TO_TICKS(ms) (ms)
 
 bool uart_is_driver_installed(uart_port_t port);
@@ -50,6 +52,53 @@ static int64_t elapsed, last_write, response_at;
 static const char *incoming;
 static unsigned queries, escapes, hangups, notifications;
 static bool fault;
+static bool driver_installed, fail_open;
+static unsigned driver_opens, driver_closes;
+
+bool uart_is_driver_installed(uart_port_t port)
+{
+    assert(port == 1);
+    return driver_installed;
+}
+
+esp_err_t uart_param_config(uart_port_t port, const uart_config_t *config)
+{
+    assert(port == 1 && config->baud_rate == 115200);
+    return ESP_OK;
+}
+
+esp_err_t uart_set_pin(uart_port_t port, int tx, int rx, int rts, int cts)
+{
+    assert(port == 1 && tx == 17 && rx == 18 &&
+           rts == UART_PIN_NO_CHANGE && cts == UART_PIN_NO_CHANGE);
+    return ESP_OK;
+}
+
+esp_err_t uart_driver_install(uart_port_t port, int rx, int tx, int count,
+                             QueueHandle_t *queue, int flags)
+{
+    (void)rx;
+    (void)tx;
+    (void)count;
+    (void)queue;
+    (void)flags;
+    assert(port == 1 && !driver_installed);
+    if (fail_open) {
+        return ESP_FAIL;
+    }
+    driver_installed = true;
+    ++driver_opens;
+    return ESP_OK;
+}
+
+esp_err_t uart_driver_delete(uart_port_t port)
+{
+    assert(port == 1 && driver_installed);
+    driver_installed = false;
+    ++driver_closes;
+    return ESP_OK;
+}
+
 static const esp_partition_t boot_slot = {.subtype = ESP_PARTITION_SUBTYPE_APP_OTA_0, .label = "ota_0"};
 static esp_ota_img_states_t boot_state;
 static unsigned marks, rollbacks;
@@ -226,6 +275,97 @@ static void boot_case(esp_ota_img_states_t initial, case_t test, bool other_chec
     assert(boot_state == (expected_marks ? ESP_OTA_IMG_VALID : initial));
 }
 
+typedef bool *SemaphoreHandle_t;
+static int xSemaphoreTake(SemaphoreHandle_t semaphore, unsigned ticks)
+{
+    assert(ticks == 0);
+    if (*semaphore) {
+        *semaphore = false;
+        return pdTRUE;
+    }
+    return 0;
+}
+
+#include "lte_uart_ownership.inc"
+
+static void worker_handoff_case(void)
+{
+    bool completed = false;
+    assert(!lte_session_owns_uart());
+    worker_done = &completed;
+    // A timed-out worker still owns UART until cleanup signals completion.
+    assert(lte_session_owns_uart());
+    assert(lte_session_owns_uart());
+    completed = true;
+    assert(!lte_session_owns_uart());
+    assert(!completed && !lte_session_owns_uart());
+}
+
+static void lifecycle_cases(void)
+{
+    modem_lifecycle_t stable = {.health_deadline = INT64_MAX};
+    // UART open failure / modem absent, then a slow modem becomes responsive.
+    const modem_config_t config = {.port = 1, .tx_pin = 17, .rx_pin = 18, .baud_rate = 115200};
+    modem_t *connection = NULL;
+    fail_open = true;
+    assert(modem_open(&config, &connection) == ESP_FAIL && !connection && !driver_installed);
+    fail_open = false;
+    assert(modem_lifecycle_begin(&stable, 0));
+    assert(!modem_lifecycle_begin(&stable, 0));
+    modem_lifecycle_result(&stable, false, 1000);
+    assert(stable.phase == MODEM_RECOVERING);
+    assert(!modem_lifecycle_begin(&stable, 5999));
+    assert(modem_lifecycle_begin(&stable, 6000));
+    assert(modem_open(&config, &connection) == ESP_OK);
+    assert(run_case(SILENT, ESP_ERR_INVALID_STATE, 2, 0, 0) != ESP_OK);
+    modem_close(connection);
+    modem_lifecycle_result(&stable, false, 12000);
+    assert(modem_lifecycle_begin(&stable, 17000));
+    assert(run_case(HEALTHY, ESP_OK, 1, 0, 0) == ESP_OK);
+    modem_lifecycle_result(&stable, true, 18000);
+    assert(stable.phase == MODEM_ONLINE);
+    assert(modem_lifecycle_finish_health(&stable, 18000, true));
+    // Network registration is not an input to lifecycle decisions.
+    assert(!modem_lifecycle_begin(&stable, 30000));
+
+    assert(modem_open(&config, &connection) == ESP_OK);
+    modem_watch_restart(connection);
+    modem_t *duplicate;
+    assert(modem_open(&config, &duplicate) == ESP_ERR_INVALID_STATE && !duplicate);
+    incoming = "\r\nRDY\r\nOK\r\n";
+    response_at = elapsed;
+    assert(modem_poll(connection, 1000) == ESP_FAIL);
+    assert(!modem_maintenance_ready(connection));
+    assert(!notifications);
+    modem_close(connection);
+    modem_lifecycle_result(&stable, false, 30000);
+    assert(!modem_lifecycle_begin(&stable, 34999));
+    assert(modem_lifecycle_begin(&stable, 35000));
+    assert(modem_open(&config, &connection) == ESP_OK);
+    assert(run_case(LATE, ESP_OK, 2, 0, 0) == ESP_OK);
+    modem_lifecycle_result(&stable, true, 38000);
+    assert(stable.phase == MODEM_ONLINE);
+    assert(!modem_lifecycle_finish_health(&stable, 38000, true));
+    modem_close(connection);
+    assert(!driver_installed && driver_opens == 3 && driver_closes == 3);
+
+    boot_state = ESP_OTA_IMG_PENDING_VERIFY;
+    marks = rollbacks = 0;
+    assert(ota_boot_health_pending());
+    modem_lifecycle_t pending = {.health_deadline = MODEM_BOOT_HEALTH_MS};
+    assert(!modem_lifecycle_finish_health(&pending, MODEM_BOOT_HEALTH_MS - 1, false));
+    assert(modem_lifecycle_finish_health(&pending, MODEM_BOOT_HEALTH_MS, false));
+    ota_boot_health_finish(false);
+    assert(!marks && rollbacks == 1);
+    assert(!modem_lifecycle_finish_health(&pending, MODEM_BOOT_HEALTH_MS + 1, true));
+
+    pending = (modem_lifecycle_t){.health_deadline = MODEM_BOOT_HEALTH_MS};
+    assert(!modem_lifecycle_finish_health(&pending, 1000, false));
+    assert(modem_lifecycle_finish_health(&pending, MODEM_BOOT_HEALTH_MS - 1, true));
+    ota_boot_health_finish(true);
+    assert(marks == 1 && !ota_boot_health_pending());
+}
+
 int main(void)
 {
     run_case(HEALTHY, ESP_OK, 1, 0, 0);
@@ -262,5 +402,7 @@ int main(void)
     modem.waiting_for_final = false;
     assert(modem_command(&modem, "AT+CGSN", "+CGSN:", 1000, identity, sizeof(identity), &result) == ESP_OK);
     assert(!strcmp(identity, "123456789012345\n") && result.final == MODEM_FINAL_OK && !notifications);
-    puts("Modem startup and stale-final regressions, VALID/PENDING health, and private identity capture passed");
+    lifecycle_cases();
+    worker_handoff_case();
+    puts("Modem lifecycle, startup and stale-final regressions, VALID/PENDING health, and private identity capture passed");
 }

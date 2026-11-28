@@ -6,6 +6,9 @@
 #ifdef CONFIG_ROADHOG_LTE_DIAGNOSTIC
 #include "cellular_net.h"
 
+// True while a timed-out worker still owns the UART.
+bool lte_session_owns_uart(void);
+
 // Serial calls only. An operation context must remain valid after a timeout.
 modem_t *lte_session_run(modem_t *, const modem_config_t *, bool *,
                          cellular_operation_t, void *, esp_err_t *);

@@ -25,6 +25,7 @@ typedef enum {
     LTE_ROAMING,
 } lte_status_t;
 
+bool gps_session_running(modem_t *modem);
 bool start_gps(modem_t *modem);
 gps_status_t read_gps(modem_t *modem, gps_fix_t *fix);
 const char *gps_label(gps_status_t status);
